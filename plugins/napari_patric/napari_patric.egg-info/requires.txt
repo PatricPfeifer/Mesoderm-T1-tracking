@@ -1,0 +1,3 @@
+numpy
+napari>=0.4.18
+qtpy

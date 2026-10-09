@@ -1,0 +1,10 @@
+# Ignore everything...
+*
+
+# ...except this file and the allowlisted paths
+!.gitignore
+!scripts/
+!scripts/**
+!plugins/
+!plugins/**
+!start_working.sh

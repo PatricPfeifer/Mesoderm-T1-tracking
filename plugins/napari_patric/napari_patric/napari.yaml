@@ -1,0 +1,10 @@
+name: napari-patric
+display_name: Patric
+contributions:
+  commands:
+    - id: napari-patric.launch
+      title: Launch Patric
+      python_name: napari_patric._widget:PatricWidget
+  widgets:
+    - command: napari-patric.launch
+      display_name: Patric

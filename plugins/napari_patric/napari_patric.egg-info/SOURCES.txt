@@ -1,0 +1,12 @@
+pyproject.toml
+napari_patric/__init__.py
+napari_patric/_widget.py
+napari_patric/napari.yaml
+napari_patric/paths.py
+napari_patric/track_edit.py
+napari_patric.egg-info/PKG-INFO
+napari_patric.egg-info/SOURCES.txt
+napari_patric.egg-info/dependency_links.txt
+napari_patric.egg-info/entry_points.txt
+napari_patric.egg-info/requires.txt
+napari_patric.egg-info/top_level.txt

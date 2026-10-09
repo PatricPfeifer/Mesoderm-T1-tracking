@@ -1,0 +1,2 @@
+[napari.manifest]
+napari-patric = napari_patric:napari.yaml
