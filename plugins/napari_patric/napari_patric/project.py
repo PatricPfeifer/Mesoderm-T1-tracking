@@ -37,6 +37,15 @@ def results_dir_for(movie_path: str | Path) -> Path:
     return p.parent / f"{movie_stem(p)}_results"
 
 
+def find_results_root(path: str | Path) -> Path:
+    """The results folder itself, or the single ``*_results`` folder inside ``path``."""
+    p = Path(path)
+    if (p / "settings.json").is_file() or any((p / s).is_dir() for s in STEPS):
+        return p
+    kids = [k for k in p.glob("*_results") if k.is_dir()]
+    return kids[0] if len(kids) == 1 else p
+
+
 class WorkingFolder:
     """The working folder of the movie that is currently being processed."""
 

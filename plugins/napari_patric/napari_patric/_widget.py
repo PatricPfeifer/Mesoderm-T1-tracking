@@ -39,7 +39,7 @@ from qtpy.QtWidgets import (
 
 from .cell_properties import CellPropertiesWidget
 from .paths import ensure_scripts, repo_root
-from .project import WorkingFolder, movie_stem
+from .project import WorkingFolder, find_results_root, movie_stem
 from .track_edit import (
     CellUndo,
     break_track,
@@ -1324,9 +1324,12 @@ class PatricWidget(QWidget):
     def _choose_folder(self) -> None:
         chosen = self._ask_folder()
         if chosen:
-            self.project.set_manual(chosen)
+            root = self.project.set_manual(find_results_root(chosen))
             self._refresh_folder_label()
-            self.status.setText(f"Results will be saved to {chosen}")
+            if self.project.found():
+                self._load_saved_results()
+            else:
+                self.status.setText(f"Results will be saved to {root}")
 
     def _cell_props_dir(self):
         return self.project.root / "cell_props" if self.project.root is not None else None
@@ -1377,6 +1380,15 @@ class PatricWidget(QWidget):
         import tifffile
 
         loaded = []
+        movie = self.project.read_settings().get("movie")
+        if movie and Path(movie).is_file() and Path(movie).resolve() not in {
+            Path(p).resolve() for p in self._layer_paths(*self.viewer.layers) if p
+        }:
+            try:
+                self.viewer.open(str(movie), plugin="napari")
+            except Exception:
+                self.viewer.add_image(tifffile.imread(movie), name=movie_stem(movie))
+            loaded.append("movie")
         if "segmentation" in found:
             masks = tifffile.imread(found["segmentation"][0])
             self._replace_labels("Segmentation", masks)

@@ -1,7 +1,7 @@
 """Working-folder logic: location, archiving instead of overwriting, settings.json."""
 import json
 
-from napari_patric.project import WorkingFolder, movie_stem, results_dir_for
+from napari_patric.project import WorkingFolder, find_results_root, movie_stem, results_dir_for
 
 
 def test_movie_stem_and_default_folder(tmp_path):
@@ -57,3 +57,12 @@ def test_found_lists_existing_results(tmp_path):
     assert wf.found() == {}
     (wf.step_dir("tracking") / "m_tracked_labels.tif").write_bytes(b"")
     assert list(wf.found()) == ["tracking"]
+
+
+def test_find_results_root_accepts_movie_folder_or_results_folder(tmp_path):
+    res = tmp_path / "m_results"
+    (res / "tracking").mkdir(parents=True)
+    assert find_results_root(res) == res
+    assert find_results_root(tmp_path) == res          # the movie's folder
+    (tmp_path / "other_results").mkdir()
+    assert find_results_root(tmp_path) == tmp_path     # ambiguous: leave as chosen
