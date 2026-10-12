@@ -1,7 +1,7 @@
 """Working-folder logic: location, archiving instead of overwriting, settings.json."""
 import json
 
-from napari_patric.project import WorkingFolder, find_results_root, movie_stem, results_dir_for
+from napari_patric.core.project import WorkingFolder, find_results_root, movie_stem, results_dir_for
 
 
 def test_movie_stem_and_default_folder(tmp_path):
@@ -83,19 +83,10 @@ def test_guess_movie_in_parent_of_results_folder(tmp_path):
     assert wf.guess_movie() == movie
 
 
-def test_plugin_matches_every_mask_and_track_tag_the_scripts_know():
-    """Add a new output tag to scripts/output_names.py -> add it to project.py too."""
-    import sys
-    from pathlib import Path
+def test_project_matches_every_mask_and_track_tag_in_output_names():
+    """Add a new output tag to core/output_names.py -> add it to core/project.py too."""
+    from napari_patric.core import output_names, project
 
-    from napari_patric import project
-
-    scripts = Path(__file__).resolve().parents[2] / "scripts"
-    sys.path.insert(0, str(scripts))
-    try:
-        import output_names
-    finally:
-        sys.path.remove(str(scripts))
     for suffix in project.SEG_MASK_SUFFIXES + project.TRACK_LABEL_SUFFIXES:
         assert suffix[: -len(".tif")] in output_names.STRIP_SUFFIXES, suffix
     scripted = [t for t in output_names.STRIP_SUFFIXES if t.endswith(("_masks", "_tracked_labels"))]

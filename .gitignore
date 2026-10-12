@@ -3,11 +3,13 @@
 
 # ...except this file and the allowlisted paths
 !.gitignore
-!scripts/
-!scripts/**
+!legacy/
+!legacy/**
+!hpc/
+!hpc/**
+!README.md
 !plugins/
 !plugins/**
-!start_working.sh
 !requirements.txt
 !Future-improvement-ideas.md
 !feature-help-*.md

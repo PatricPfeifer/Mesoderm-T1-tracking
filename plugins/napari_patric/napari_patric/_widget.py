@@ -1,7 +1,6 @@
 """Napari dock: Cellpose cpsam, cellpose_track, and the original T1 detector."""
 from __future__ import annotations
 
-import os
 import shutil
 import sys
 import tempfile
@@ -13,7 +12,7 @@ from pathlib import Path
 import napari
 import numpy as np
 from napari.layers import Image, Labels
-from qtpy.QtCore import QObject, QProcess, QProcessEnvironment, QSize, QThread, Qt, Signal
+from qtpy.QtCore import QObject, QProcess, QSize, QThread, Qt, Signal
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
     QButtonGroup,
@@ -38,8 +37,7 @@ from qtpy.QtWidgets import (
 )
 
 from .cell_properties import CellPropertiesWidget
-from .paths import ensure_scripts, repo_root
-from .project import WorkingFolder, find_results_root, movie_stem
+from .core.project import WorkingFolder, find_results_root, movie_stem
 from .track_edit import (
     CellUndo,
     break_track,
@@ -114,7 +112,6 @@ class PatricWidget(QWidget):
         self._track_run: tuple | None = None
         # Mother + daughter track IDs from the last division-aware tracking.
         self._division_ids: set[int] = set()
-        ensure_scripts()
 
         tabs = QTabWidget()
         tabs.addTab(self._segmentation_tab(), "Segmentation")
@@ -340,17 +337,9 @@ class PatricWidget(QWidget):
         np.save(image_path, np.asarray(image))
         self._seg_dir = work
         self._seg_out = out_path
-        root = repo_root()
-        pythonpath = os.pathsep.join(
-            [
-                str(root / "scripts" / "cellpose_seg"),
-                str(root / "scripts"),
-                os.environ.get("PYTHONPATH", ""),
-            ]
-        )
         code = (
             "import numpy as np\n"
-            "from run_cellpose_naima import segment_stack\n"
+            "from napari_patric.core.segmentation import segment_stack\n"
             f"img = np.load({str(image_path)!r})\n"
             "masks = segment_stack(\n"
             "    img,\n"
@@ -360,10 +349,7 @@ class PatricWidget(QWidget):
             f"np.save({str(out_path)!r}, masks)\n"
             "print('SEGMENT_DONE', int(masks.max()), flush=True)\n"
         )
-        env = QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONPATH", pythonpath)
         self._proc = QProcess(self)
-        self._proc.setProcessEnvironment(env)
         self._proc.setProcessChannelMode(QProcess.MergedChannels)
         self._proc.readyReadStandardOutput.connect(self._seg_output)
         self._proc.finished.connect(self._seg_finished)
@@ -426,7 +412,7 @@ class PatricWidget(QWidget):
             self.status.setText("Select an Outlines layer (imported *_cp_outlines.tif).")
             return
         try:
-            from outline_io import rgb_or_labels_to_outline_labels
+            from .core.outline_io import rgb_or_labels_to_outline_labels
         except Exception as exc:
             self.status.setText(f"outline_io import failed: {exc}")
             return
@@ -519,8 +505,8 @@ class PatricWidget(QWidget):
         self._hand_msg = message
 
         def work(progress):
-            from outline_io import hand_stack_to_outline
-            from ta_bond_edit import thin_hand_stack
+            from .core.outline_io import hand_stack_to_outline
+            from .core.ta_bond_edit import thin_hand_stack
 
             hand = thin_hand_stack(masks, progress)
             return hand, hand_stack_to_outline(hand)
@@ -577,7 +563,7 @@ class PatricWidget(QWidget):
             return False
 
         try:
-            from ta_bond_edit import apply_bond_strokes, changed_frames
+            from .core.ta_bond_edit import apply_bond_strokes, changed_frames
         except Exception as exc:
             self.status.setText(f"TA bond edit import failed: {exc}")
             return False
@@ -630,7 +616,7 @@ class PatricWidget(QWidget):
 
     def _commit_seg(self, updated: np.ndarray, frames: list[int], rois: list) -> None:
         """Push changed frames into the Segmentation / Outlines layers in place."""
-        from outline_io import update_outline_roi
+        from .core.outline_io import update_outline_roi
 
         updated = np.asarray(updated)
         if updated.ndim == 2:
@@ -678,7 +664,7 @@ class PatricWidget(QWidget):
             self.status.setText("Select an Image layer for seeded watershed.")
             return
         try:
-            from ta_bond_edit import changed_frames, seeded_local_wshed
+            from .core.ta_bond_edit import changed_frames, seeded_local_wshed
         except Exception as exc:
             self.status.setText(f"TA bond edit import failed: {exc}")
             return
@@ -732,8 +718,8 @@ class PatricWidget(QWidget):
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
         try:
-            from movie_calibration import save_tiff
-            from outline_io import masks_to_outline_rgb, outline_labels_to_rgb
+            from .core.movie_calibration import save_tiff
+            from .core.outline_io import masks_to_outline_rgb, outline_labels_to_rgb
         except Exception as exc:
             self.status.setText(f"Save imports failed: {exc}")
             return
@@ -742,11 +728,10 @@ class PatricWidget(QWidget):
             self._layer(self.seg_image.currentText()),
             self._layer(self.seg_masks.currentText()),
         )
-        if wf is not None:
-            outdir = wf.step_dir("segmentation")
-        else:  # no folder chosen: old behaviour, inside the repo
-            outdir = repo_root() / "output" / "cellpose_seg" / f"{stem}_cp_seg"
-            outdir.mkdir(parents=True, exist_ok=True)
+        if wf is None:
+            self.status.setText("Not saved: no results folder chosen (use Folder...).")
+            return
+        outdir = wf.step_dir("segmentation")
         masks_path = outdir / f"{stem}_cp_masks.tif"
         outlines_path = outdir / f"{stem}_cp_outlines.tif"
         # Keep the raw movie's pixel size / frame interval in the saved files.
@@ -768,7 +753,7 @@ class PatricWidget(QWidget):
         """Pixel size / frame interval from the layers' source files, else
         from ``input/<stem>.tif``; ``None`` if neither has it."""
         try:
-            from movie_calibration import calibration_for
+            from .core.movie_calibration import calibration_for
 
             paths = []
             for ly in layers:
@@ -1115,7 +1100,7 @@ class PatricWidget(QWidget):
         )
 
         def work(progress):
-            from celltrack.pipeline import track_arrays
+            from .core.celltrack.pipeline import track_arrays
             from pathlib import Path
 
             progress(1, "tracking")
@@ -1239,7 +1224,7 @@ class PatricWidget(QWidget):
             kwargs["exclude_ids"] = set(self._division_ids)
 
         def work(progress):
-            from run_tm_t1 import run_t1_stack
+            from .core.t1.run_tm_t1 import run_t1_stack
 
             return run_t1_stack(stack, rgb=rgb, progress=progress, **kwargs)
 
@@ -1250,7 +1235,7 @@ class PatricWidget(QWidget):
         self._autosave_t1(result)
         self._refresh_layers()
         self._apply_t1_filter()
-        note = result.get("cellflow_note", "")
+        note = result.get("swap_note", "")
         if note:
             self.status.setText(f"{self.status.text()} {note}")
 
@@ -1258,7 +1243,7 @@ class PatricWidget(QWidget):
         result = self._t1_result
         if not result:
             return
-        from run_tm_t1 import fourway_counts, paint_t1_filter
+        from .core.t1.run_tm_t1 import fourway_counts, paint_t1_filter
 
         mode = str(self.t1_filter.currentData() or "all")
         overlay, dots, shown = paint_t1_filter(result, mode)

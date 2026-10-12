@@ -1,4 +1,4 @@
-# Core (scripts/ and plugins/napari_patric)
+# Core (napari_patric: GUI + `patric` CLI)
 numpy
 scipy
 pandas
@@ -22,4 +22,4 @@ napari[pyqt5]>=0.4.18
 
 # Not on PyPI / not installed here:
 #  - napariCellFlow: expected at vendor/napariCellFlow (gitignored, not in repo)
-#  - epyseg + tensorflow: only needed by scripts/archive/
+#  - epyseg + tensorflow: only needed by legacy/archive/

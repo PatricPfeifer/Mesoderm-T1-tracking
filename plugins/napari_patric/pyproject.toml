@@ -9,15 +9,29 @@ description = "Napari interface for Cellpose segmentation, cell tracking, and T1
 requires-python = ">=3.9"
 dependencies = [
     "numpy",
-    "napari>=0.4.18",
-    "qtpy",
+    "scipy",
+    "pandas",
+    "networkx",
+    "natsort",
+    "matplotlib",
+    "scikit-image",
+    "tifffile",
+    "opencv-python",
+    "cellpose>=4",
 ]
+
+[project.optional-dependencies]
+# The napari widget. Not needed for `patric` on a headless HPC node.
+gui = ["napari[pyqt5]>=0.4.18", "qtpy"]
+
+[project.scripts]
+patric = "napari_patric.cli:main"
 
 [project.entry-points."napari.manifest"]
 napari-patric = "napari_patric:napari.yaml"
 
-[tool.setuptools]
-packages = ["napari_patric"]
+[tool.setuptools.packages.find]
+include = ["napari_patric*"]
 
 [tool.setuptools.package-data]
 napari_patric = ["napari.yaml", "feature_help/*"]
