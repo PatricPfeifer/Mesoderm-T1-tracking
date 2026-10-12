@@ -8,6 +8,8 @@ import numpy as np
 from skimage.measure import regionprops
 from skimage.segmentation import expand_labels
 
+from .parallel import pmap
+
 
 @dataclass
 class FrameCells:
@@ -118,17 +120,21 @@ def build_all_frames(
     frame_indices: np.ndarray,
     *,
     expand: int = 3,
+    n_jobs: int = 1,
+    on_progress=None,
 ) -> list[FrameCells]:
-    """Build FrameCells for every plane in ``masks``."""
-    frames: list[FrameCells] = []
-    for t in range(masks.shape[0]):
-        fc = build_frame_cells(
+    """Build FrameCells for every plane in ``masks`` (frames are independent)."""
+
+    def one(t: int) -> FrameCells:
+        return build_frame_cells(
             masks[t],
             frame=t,
             original_frame=int(frame_indices[t]),
             expand=expand,
         )
-        frames.append(fc)
+
+    frames = pmap(one, range(masks.shape[0]), n_jobs, on_progress)
+    for t, fc in enumerate(frames):
         if (t + 1) % 20 == 0 or t == 0 or t == masks.shape[0] - 1:
             print(
                 f"  cells frame {t}/{masks.shape[0] - 1}: "

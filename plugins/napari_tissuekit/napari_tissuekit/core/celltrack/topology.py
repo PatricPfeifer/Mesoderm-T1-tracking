@@ -184,6 +184,17 @@ def topology_refined_assignment(
         # candidate pair, where dice is scored as if that pair continued the
         # parent's track into the daughter.
         aug = pair.cost.copy()
+        # A cell is never its own neighbour, so substituting the parent track
+        # for cur_lab does not change cur_lab's neighbour tracks: they depend
+        # only on the current map and are computed once per cell.
+        cur_neigh_tracks = [
+            {
+                best_map[n]
+                for n in cur.adjacency.get(int(cur.original_labels[j + 1]), ())
+                if n in best_map
+            }
+            for j in range(pair.n_cur)
+        ]
         for i in range(pair.n_prev):
             if i in locked_rows:
                 continue
@@ -192,20 +203,10 @@ def topology_refined_assignment(
             if parent_track is None:
                 continue
             parent_prev_neigh = prev_neigh.get(parent_track, set())
-            for j in range(pair.n_cur):
-                if j in locked_cols or not np.isfinite(aug[i, j]):
+            for j in np.flatnonzero(np.isfinite(pair.cost[i])).tolist():
+                if j in locked_cols:
                     continue
-                cur_lab = int(cur.original_labels[j + 1])
-                # Neighbours of cur_lab expressed as tracks under current map,
-                # but substituting parent_track for cur_lab itself.
-                tentative = dict(best_map)
-                tentative[cur_lab] = parent_track
-                cur_lab_neigh_tracks = {
-                    tentative[n]
-                    for n in cur.adjacency.get(cur_lab, set())
-                    if n in tentative
-                }
-                dice = pairwise_score(cur_lab_neigh_tracks, parent_prev_neigh)
+                dice = pairwise_score(cur_neigh_tracks[j], parent_prev_neigh)
                 aug[i, j] = float(pair.cost[i, j]) + w_topo * (1.0 - dice)
 
         aug_pair = PairCosts(

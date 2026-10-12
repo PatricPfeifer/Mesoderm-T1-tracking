@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from timeit import default_timer as timer
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -80,6 +81,8 @@ def track_movie(
     min_daughter_frames: int = 3,
     division_kwargs: dict | None = None,
     max_area_jump: float = 1.35,
+    timings: dict[str, float] | None = None,
+    on_progress=None,
 ) -> TrackingResult:
     """Run forward tracking across all consecutive frame pairs.
 
@@ -129,6 +132,7 @@ def track_movie(
                 elif len(hist) >= 3 and hist[-1] > max_area_jump * float(np.median(hist[:-1])):
                     blocked.add(idx)
         new_parents: dict[int, int] = {}
+        t_assign = timer()
         assignment, cur_map, next_track_id, score, per_score = (
             topology_refined_assignment(
                 prev,
@@ -148,11 +152,17 @@ def track_movie(
                 parents=new_parents,
             )
         )
+        if timings is not None:
+            timings["assignment"] = round(
+                timings.get("assignment", 0.0) + timer() - t_assign, 3
+            )
         parents.update(new_parents)
         for daughter in new_parents:
             born_at[daughter] = t
         label_to_track.append(cur_map)
         scores.append(score / max(cur.n_cells, 1))
+        if on_progress is not None:
+            on_progress(t, len(frames) - 1)
 
         fe = classify_events(
             assignment,
@@ -210,6 +220,7 @@ def track_movie(
             )
 
     if gap_close and max_gap > 0:
+        t_gap = timer()
         label_to_track, links, events, next_track_id = close_gaps(
             frames,
             fields,
@@ -222,6 +233,8 @@ def track_movie(
             verbose=verbose,
             parents=parents,
         )
+        if timings is not None:
+            timings["gap_closing"] = round(timer() - t_gap, 3)
 
     flagged: set[int] = set()
     if lineage and parents:

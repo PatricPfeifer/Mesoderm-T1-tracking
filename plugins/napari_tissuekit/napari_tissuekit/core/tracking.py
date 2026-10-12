@@ -115,6 +115,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         "the image edge (within PX) in any frame (default: 0 = off).",
     )
     p.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="CPU threads for cell tables and motion estimation "
+        "(default: 1 = serial; -1 = all cores). Results are identical.",
+    )
+    p.add_argument(
         "--quiet",
         action="store_true",
         help="Less progress output.",
@@ -165,6 +172,7 @@ def main(argv=None) -> None:
         gap_close=args.max_gap > 0,
         max_distance=args.max_distance,
         run_backward=args.backward,
+        n_jobs=args.n_jobs,
         verbose=not args.quiet,
     )
     if args.exclude_border > 0:

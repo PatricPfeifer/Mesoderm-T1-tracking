@@ -17,11 +17,14 @@ class Movie:
         masks: (T, Y, X) integer labels, labels independent per frame.
         intensity: (T, Y, X) float32 registration images, or None.
         frame_indices: original frame indices into the on-disk stacks.
+        n_frames: length of the original stack before blank frames were dropped.
     """
 
     masks: np.ndarray
     intensity: np.ndarray | None
     frame_indices: np.ndarray
+    n_frames: int | None = None
+
 
 def load_stack(path: Path) -> np.ndarray:
     """Load a TIFF/NPY as T,Y,X. Multichannel stacks keep the first channel."""
@@ -101,4 +104,6 @@ def load_movie(
         f"dtype={masks_kept.dtype}",
         flush=True,
     )
-    return Movie(masks=masks_kept, intensity=intensity_kept, frame_indices=idx)
+    return Movie(
+        masks=masks_kept, intensity=intensity_kept, frame_indices=idx, n_frames=n
+    )

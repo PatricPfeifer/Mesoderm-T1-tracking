@@ -1,6 +1,7 @@
 """Napari dock: Cellpose cpsam, cellpose_track, and the original T1 detector."""
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -86,6 +87,53 @@ def _as_rgb(data: np.ndarray) -> np.ndarray:
     if arr.ndim != 4 or arr.shape[-1] != 3:
         raise ValueError(f"expected T,Y,X,3 RGB, got {arr.shape}")
     return arr
+
+
+TRACK_TIPS = {
+    "expand": (
+        "Pixels each cell is grown before neighbours are looked up. Bridges the "
+        "thin background gap between Cellpose masks so touching cells count as "
+        "neighbours. Too large adds false neighbours."
+    ),
+    "depth": (
+        "Levels of the motion-correction pyramid. The movie shift between frames "
+        "is measured on 256 px tiles, then 128, then 64 (depth 3). Higher is "
+        "finer but slower and noisier; the finest tile is 16 px."
+    ),
+    "w_topo": (
+        "How much a cell must keep the same neighbours as in the previous frame. "
+        "0 = only overlap and distance count; higher = neighbour layout counts more."
+    ),
+    "iter": (
+        "Maximum rounds of re-matching with the neighbour penalty. Stops early "
+        "when the neighbour score no longer improves."
+    ),
+    "appear": (
+        "Cost of starting a new track for a cell with no match in the previous "
+        "frame. Higher forces more matches; lower allows more new tracks."
+    ),
+    "disappear": (
+        "Cost of ending a track whose cell has no match in the next frame. "
+        "Higher keeps tracks alive more; lower ends them sooner."
+    ),
+    "division": (
+        "Extra cost for giving a cell a second daughter. Higher means fewer "
+        "divisions. (1.0 is used when 'Divisions: new daughter IDs' is on.)"
+    ),
+    "gap": (
+        "Maximum number of frames a track may vanish and still be reconnected. "
+        "0 turns gap closing off."
+    ),
+    "jobs": (
+        "CPU threads used for the per-frame steps (cell tables and motion "
+        "estimation). 1 = one core. Results are identical; only speed changes."
+    ),
+    "dist": (
+        "Distance scale in pixels for matching. A cell may only link to cells "
+        "within this distance (unless they overlap strongly); larger distances "
+        "also count less against a link."
+    ),
+}
 
 
 class TissueKitWidget(QWidget):
@@ -785,17 +833,24 @@ class TissueKitWidget(QWidget):
         self.track_division = self._dspin(0.0, 20.0, 0.8, 0.1)
         self.track_gap = self._spin(0, 20, 3)
         self.track_dist = self._dspin(1.0, 500.0, 50.0, 1.0)
+        self.track_jobs = self._spin(1, max(os.cpu_count() or 1, 1), 1)
         self.track_out = QLineEdit()
         self.track_out.setPlaceholderText("optional output folder")
         form.addRow("Labels", self.track_labels)
         form.addRow("Intensity", self.track_intensity)
-        form.addRow("Expand", self.track_expand)
-        form.addRow("Pyramid depth", self.track_depth)
-        form.addRow("Topology weight", self.track_w)
-        form.addRow("Iterations", self.track_iter)
-        form.addRow("Appear cost", self.track_appear)
-        form.addRow("Disappear cost", self.track_disappear)
-        form.addRow("Division penalty", self.track_division)
+        def tipped(label: str, widget: QWidget, key: str) -> None:
+            # Tooltip on the control and on its label text.
+            widget.setToolTip(TRACK_TIPS[key])
+            form.addRow(label, widget)
+            form.labelForField(widget).setToolTip(TRACK_TIPS[key])
+
+        tipped("Expand", self.track_expand, "expand")
+        tipped("Pyramid depth", self.track_depth, "depth")
+        tipped("Topology weight", self.track_w, "w_topo")
+        tipped("Iterations", self.track_iter, "iter")
+        tipped("Appear cost", self.track_appear, "appear")
+        tipped("Disappear cost", self.track_disappear, "disappear")
+        tipped("Division penalty", self.track_division, "division")
         self.track_divisions = QCheckBox("Divisions: new daughter IDs")
         self.track_divisions.setToolTip(
             "Dividing cells end their track; both daughters get new IDs "
@@ -804,8 +859,9 @@ class TissueKitWidget(QWidget):
         )
         self.track_divisions.toggled.connect(self._track_divisions_toggled)
         form.addRow("", self.track_divisions)
-        form.addRow("Max gap", self.track_gap)
-        form.addRow("Max distance", self.track_dist)
+        tipped("Max gap", self.track_gap, "gap")
+        tipped("Max distance", self.track_dist, "dist")
+        tipped("CPU cores", self.track_jobs, "jobs")
         form.addRow("Save to", self.track_out)
         layout.addLayout(form)
         self.track_run = QPushButton("Run tracking")
@@ -1097,6 +1153,7 @@ class TissueKitWidget(QWidget):
             gap_close=int(self.track_gap.value()) > 0,
             max_distance=float(self.track_dist.value()),
             division_mode="lineage" if self.track_divisions.isChecked() else "legacy",
+            n_jobs=int(self.track_jobs.value()),
         )
 
         def work(progress):
@@ -1110,12 +1167,13 @@ class TissueKitWidget(QWidget):
                 out_dir,
                 stem=stem,
                 verbose=True,
+                progress=progress,
                 **kwargs,
             )
 
         self._track_run = (
             wf,
-            {k: v for k, v in kwargs.items() if k != "calibration"},
+            {k: v for k, v in kwargs.items() if k not in ("calibration", "n_jobs")},
             movie_path,
         )
         self._start(work, self._tracking_done)
