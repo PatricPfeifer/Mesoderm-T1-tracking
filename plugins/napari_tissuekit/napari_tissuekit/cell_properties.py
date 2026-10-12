@@ -261,7 +261,11 @@ class CellPropertiesWidget(QWidget):
         remove.clicked.connect(self._remove_highlighted)
         clear = QPushButton("Clear")
         clear.clicked.connect(self._clear)
+        select_all = QPushButton("Select all cells")
+        select_all.setToolTip("Add every track in the tracked labels to the selection")
+        select_all.clicked.connect(self._select_all)
         row = QHBoxLayout()
+        row.addWidget(select_all)
         row.addWidget(remove)
         row.addWidget(clear)
 
@@ -617,6 +621,16 @@ class CellPropertiesWidget(QWidget):
             if i in self._selected:
                 self._selected.remove(i)
         self._changed()
+
+    def _select_all(self) -> None:
+        stack = self._stack()
+        if stack is None:
+            self.status.setText("Select a tracked labels layer first.")
+            return
+        ids = np.unique(stack)
+        self._selected = [int(i) for i in ids if i != 0]
+        self._changed()
+        self.status.setText(f"Selected all {len(self._selected)} tracks.")
 
     def _clear(self) -> None:
         self._selected.clear()
