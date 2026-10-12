@@ -19,6 +19,7 @@ from qtpy.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
@@ -38,6 +39,7 @@ from qtpy.QtWidgets import (
 
 from .cell_properties import CellPropertiesWidget
 from .paths import ensure_scripts, repo_root
+from .project import WorkingFolder, find_results_root, movie_stem
 from .track_edit import (
     CellUndo,
     break_track,
@@ -108,6 +110,8 @@ class PatricWidget(QWidget):
         self._track_undo: deque = deque(maxlen=20)
         self._pick_layer = None
         self._t1_result: dict | None = None
+        self.project = WorkingFolder()
+        self._track_run: tuple | None = None
         # Mother + daughter track IDs from the last division-aware tracking.
         self._division_ids: set[int] = set()
         ensure_scripts()
@@ -117,11 +121,13 @@ class PatricWidget(QWidget):
         tabs.addTab(self._tracking_tab(), "Tracking")
         tabs.addTab(self._t1_tab(), "T1")
         self.cell_props = CellPropertiesWidget(self.viewer)
+        self.cell_props.dir_provider = self._cell_props_dir
         tabs.addTab(self.cell_props, "Export Cell Props")
         self.status = QLabel("Ready")
         self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         layout = QVBoxLayout()
+        layout.addLayout(self._folder_bar())
         layout.addWidget(tabs)
         layout.addWidget(self.status)
         self.setLayout(layout)
@@ -139,6 +145,8 @@ class PatricWidget(QWidget):
         return QSize(240, super().minimumSizeHint().height())
 
     def _refresh_layers(self, *_args) -> None:
+        if hasattr(self, 'folder_label'):
+            self._refresh_folder_label()
         images = [ly.name for ly in self.viewer.layers if isinstance(ly, Image)]
         labels = [ly.name for ly in self.viewer.layers if isinstance(ly, Labels)]
         # Masks: Labels plus non-RGB Images (imported *_cp_masks.tif often opens as Image).
@@ -406,6 +414,7 @@ class PatricWidget(QWidget):
             "Paint/erase yellow Outlines, Enter to Apply, then Save / track.",
         )
         self._refresh_layers()
+        self._autosave_segmentation()
 
     def _start_outline_editing(self) -> None:
         masks_ly = self._layer(self.seg_masks.currentText())
@@ -729,8 +738,15 @@ class PatricWidget(QWidget):
             self.status.setText(f"Save imports failed: {exc}")
             return
         stem = self._seg_stem or "segmentation"
-        outdir = repo_root() / "output" / "cellpose_seg" / f"{stem}_cp_seg"
-        outdir.mkdir(parents=True, exist_ok=True)
+        wf = self._working_folder(
+            self._layer(self.seg_image.currentText()),
+            self._layer(self.seg_masks.currentText()),
+        )
+        if wf is not None:
+            outdir = wf.step_dir("segmentation")
+        else:  # no folder chosen: old behaviour, inside the repo
+            outdir = repo_root() / "output" / "cellpose_seg" / f"{stem}_cp_seg"
+            outdir.mkdir(parents=True, exist_ok=True)
         masks_path = outdir / f"{stem}_cp_masks.tif"
         outlines_path = outdir / f"{stem}_cp_outlines.tif"
         # Keep the raw movie's pixel size / frame interval in the saved files.
@@ -1072,8 +1088,17 @@ class PatricWidget(QWidget):
         if isinstance(intensity_layer, Image):
             intensity = _as_tyx(np.asarray(intensity_layer.data)).copy()
         out_text = self.track_out.text().strip()
-        stem = labels.name
+        movie_path = next(
+            (p for p in self._layer_paths(intensity_layer, labels) if p), None
+        )
+        stem = movie_stem(movie_path) if movie_path else labels.name
         cal = self._calibration(intensity_layer, labels)
+        wf = None
+        out_dir = Path(out_text) if out_text else None
+        if out_dir is None:
+            wf = self._working_folder(intensity_layer, labels)
+            if wf is not None:
+                out_dir = wf.step_dir("tracking")
         kwargs = dict(
             calibration=cal,
             expand=int(self.track_expand.value()),
@@ -1097,12 +1122,17 @@ class PatricWidget(QWidget):
             return track_arrays(
                 masks,
                 intensity,
-                Path(out_text) if out_text else None,
+                out_dir,
                 stem=stem,
                 verbose=True,
                 **kwargs,
             )
 
+        self._track_run = (
+            wf,
+            {k: v for k, v in kwargs.items() if k != "calibration"},
+            movie_path,
+        )
         self._start(work, self._tracking_done)
 
     def _track_divisions_toggled(self, on: bool) -> None:
@@ -1114,6 +1144,12 @@ class PatricWidget(QWidget):
             self.track_division.setValue(0.8)
 
     def _tracking_done(self, result: dict) -> None:
+        saved = ""
+        if self._track_run is not None and self._track_run[0] is not None:
+            wf, params, movie_path = self._track_run
+            wf.write_settings("tracking", params, movie=movie_path)
+            saved = f" Saved to {wf.step_dir('tracking', create=False)}"
+        self._track_run = None
         self._replace_labels("Tracked", result["tracked"])
         if result.get("rgb") is not None:
             self._replace_image("Tracked RGB", result["rgb"])
@@ -1128,7 +1164,7 @@ class PatricWidget(QWidget):
                 f"(flagged {qc.get('n_divide_flagged', 0)})"
             )
         self.status.setText(
-            f"Tracking done. tracks={qc.get('n_tracks', track_result.n_tracks)}{extra}"
+            f"Tracking done. tracks={qc.get('n_tracks', track_result.n_tracks)}{extra}{saved}"
         )
         self._refresh_layers()
 
@@ -1211,6 +1247,7 @@ class PatricWidget(QWidget):
 
     def _t1_done(self, result: dict) -> None:
         self._t1_result = result
+        self._autosave_t1(result)
         self._refresh_layers()
         self._apply_t1_filter()
         note = result.get("cellflow_note", "")
@@ -1234,6 +1271,130 @@ class PatricWidget(QWidget):
             f"showing {len(shown)} of {total}. "
             f"4-cell vertex {n_4v}, no 4-way {n_no4}."
         )
+
+    # ---- working folder ---------------------------------------------------
+    def _folder_bar(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
+        self.folder_label = QLabel("Results: set automatically next to the movie")
+        self.folder_label.setWordWrap(True)
+        self.folder_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
+        choose = QPushButton("Folder...")
+        choose.setToolTip("Choose where results are saved (default: next to the movie)")
+        choose.clicked.connect(self._choose_folder)
+        load = QPushButton("Load results")
+        load.setToolTip("Load segmentation and tracking already saved in the results folder")
+        load.clicked.connect(self._load_saved_results)
+        bar.addWidget(self.folder_label, 1)
+        bar.addWidget(choose)
+        bar.addWidget(load)
+        return bar
+
+    @staticmethod
+    def _layer_paths(*layers) -> list:
+        return [getattr(getattr(ly, "source", None), "path", None) for ly in layers if ly is not None]
+
+    def _ask_folder(self) -> str:
+        return QFileDialog.getExistingDirectory(self, "Choose a folder for the results")
+
+    def _working_folder(self, *layers, ask: bool = True):
+        """The results folder for these layers' movie (asks once if it cannot be derived)."""
+        root = self.project.resolve(self._layer_paths(*layers))
+        if root is None and ask:
+            chosen = self._ask_folder()
+            if chosen:
+                root = self.project.set_manual(chosen)
+        self._refresh_folder_label()
+        return self.project if root is not None else None
+
+    def _refresh_folder_label(self) -> None:
+        layer = self._layer(self.seg_image.currentText()) if hasattr(self, "seg_image") else None
+        root = self.project.resolve(self._layer_paths(layer))
+        self.folder_label.setText(
+            f"Results: {root}" if root is not None
+            else "Results: set automatically next to the movie"
+        )
+        self.folder_label.setToolTip(str(root) if root is not None else "")
+
+    def _choose_folder(self) -> None:
+        chosen = self._ask_folder()
+        if chosen:
+            root = self.project.set_manual(find_results_root(chosen))
+            self._refresh_folder_label()
+            if self.project.found():
+                self._load_saved_results()
+            else:
+                self.status.setText(f"Results will be saved to {root}")
+
+    def _cell_props_dir(self):
+        return self.project.root / "cell_props" if self.project.root is not None else None
+
+    def _autosave_segmentation(self) -> None:
+        wf = self._working_folder(self._layer(self.seg_image.currentText()))
+        if wf is None:
+            self.status.setText(f"{self.status.text()} (not saved: no results folder chosen)")
+            return
+        self._save_segmentation()
+        wf.write_settings(
+            "segmentation",
+            {"model": "cpsam", "batch_size": int(self.seg_batch.value()), "gpu": self.seg_gpu.isChecked()},
+            movie=next((p for p in self._layer_paths(self._layer(self.seg_image.currentText())) if p), None),
+        )
+
+    def _autosave_t1(self, result: dict) -> None:
+        wf = self.project if self.project.root is not None else self._working_folder()
+        events = result.get("events") or []
+        if wf is None or not events:
+            return
+        try:
+            import pandas as pd
+
+            rows = [
+                {k: (v if isinstance(v, (int, float, str, bool)) or v is None else str(v))
+                 for k, v in e.items()}
+                for e in events
+            ]
+            pd.DataFrame(rows).to_csv(wf.step_dir("t1") / "t1_events.csv", index=False)
+            wf.write_settings(
+                "t1",
+                {"expand": int(self.t1_expand.value()), "bond_cutoff": float(self.t1_bond.value()),
+                 "border_rings": int(self.t1_rings.value())},
+            )
+            self.status.setText(f"{self.status.text()} Saved {len(rows)} T1 events to {wf.step_dir('t1', create=False)}")
+        except Exception as exc:  # saving must never break the analysis
+            self.status.setText(f"{self.status.text()} (T1 events not saved: {exc})")
+
+    def _load_saved_results(self) -> None:
+        wf = self._working_folder(self._layer(self.seg_image.currentText()), ask=False)
+        found = wf.found() if wf is not None else {}
+        if not found:
+            self.status.setText("No saved results found in the results folder.")
+            return
+        import tifffile
+
+        loaded = []
+        movie = self.project.read_settings().get("movie")
+        if movie and Path(movie).is_file() and Path(movie).resolve() not in {
+            Path(p).resolve() for p in self._layer_paths(*self.viewer.layers) if p
+        }:
+            try:
+                self.viewer.open(str(movie), plugin="napari")
+            except Exception:
+                self.viewer.add_image(tifffile.imread(movie), name=movie_stem(movie))
+            loaded.append("movie")
+        if "segmentation" in found:
+            masks = tifffile.imread(found["segmentation"][0])
+            self._replace_labels("Segmentation", masks)
+            self._seg_base_masks = np.asarray(masks).copy()
+            loaded.append("segmentation")
+        if "tracking" in found:
+            labels = found["tracking"][0]
+            self._replace_labels("Tracked", tifffile.imread(labels))
+            rgb = labels.with_name(labels.name.replace("_tracked_labels", "_tracked_rgb"))
+            if rgb.is_file():
+                self._replace_image("Tracked RGB", tifffile.imread(rgb))
+            loaded.append("tracking")
+        self._refresh_layers()
+        self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}")
 
     def _replace_labels(self, name: str, data: np.ndarray) -> None:
         layer = self._layer(name)
