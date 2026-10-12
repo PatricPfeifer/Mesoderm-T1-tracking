@@ -112,11 +112,44 @@ def parse_args() -> argparse.Namespace:
         help="Also track reversed movie and report forward/backward agreement.",
     )
     p.add_argument(
+        "--exclude-border",
+        type=int,
+        default=0,
+        metavar="PX",
+        help="After tracking, also write *_interior files without tracks that touch "
+        "the image edge (within PX) in any frame (default: 0 = off).",
+    )
+    p.add_argument(
         "--quiet",
         action="store_true",
         help="Less progress output.",
     )
     return p.parse_args()
+
+
+def write_interior_tracks(out_dir: Path, margin: int) -> None:
+    """Track everything, then drop whole tracks that touch the image edge in any frame."""
+    import numpy as np
+    import pandas as pd
+    from tifffile import imread, imwrite
+
+    lab_path = next(out_dir.glob("*_tracked_labels.tif"))
+    csv_path = next(out_dir.glob("*_tracks.csv"))
+    stack = np.array(imread(lab_path))
+    edge = np.zeros(stack.shape[1:], dtype=bool)
+    edge[:margin], edge[-margin:], edge[:, :margin], edge[:, -margin:] = True, True, True, True
+    border_ids = set(np.unique(stack[:, edge]).tolist()) - {0}
+    stack[np.isin(stack, list(border_ids))] = 0
+    imwrite(out_dir / lab_path.name.replace("_tracked_labels", "_tracked_labels_interior"), stack)
+    df = pd.read_csv(csv_path)
+    df = df[~df["track_id"].isin(border_ids)]
+    df.to_csv(out_dir / csv_path.name.replace("_tracks", "_tracks_interior"), index=False)
+    n_all = len(np.unique(imread(lab_path))) - 1
+    print(
+        f"--exclude-border {margin}px: dropped {len(border_ids)} of {n_all} tracks "
+        f"touching the edge; kept {n_all - len(border_ids)} (*_interior files)",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -139,6 +172,8 @@ def main() -> None:
         run_backward=args.backward,
         verbose=not args.quiet,
     )
+    if args.exclude_border > 0:
+        write_interior_tracks(Path(args.output_dir), args.exclude_border)
 
 
 if __name__ == "__main__":

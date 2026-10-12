@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Headless napariCellFlow / Cellpose segmentation (cyto3 defaults).
+"""Headless napariCellFlow / Cellpose 4 (cpsam) segmentation.
 
-Uses the same Cellpose 3 eval settings as napariCellFlow.SegmentationHandler,
+Cellpose 4 port of the napariCellFlow.SegmentationHandler eval settings (cyto3 -> cpsam),
 without the napari GUI.
 
 Example (tmux on a GPU allocation, conda env cellflow):
@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="napariCellFlow-style Cellpose segmentation.")
     p.add_argument("--input", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--model-type", default="cyto3")
+    p.add_argument("--model-type", default="cpsam")
     p.add_argument("--diameter", type=float, default=95.0)
     p.add_argument(
         "--fixed-diameter",
@@ -78,9 +78,8 @@ def main() -> None:
 
     use_gpu = not args.force_cpu
     print(f"loading Cellpose {args.model_type} gpu={use_gpu}", flush=True)
-    model = models.CellposeModel(model_type=args.model_type, gpu=use_gpu)
+    model = models.CellposeModel(pretrained_model=args.model_type, gpu=use_gpu)
     diameter = None if not args.fixed_diameter else args.diameter
-    channels = [0, 0]
     counts: list[int] = []
 
     for t in range(start, n_frames):
@@ -88,7 +87,6 @@ def main() -> None:
         m, _flows, _styles = model.eval(
             img[t],
             diameter=diameter,
-            channels=channels,
             flow_threshold=args.flow_threshold,
             cellprob_threshold=args.cellprob_threshold,
             min_size=args.min_size,

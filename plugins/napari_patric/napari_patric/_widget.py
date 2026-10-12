@@ -36,6 +36,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from .cell_properties import CellPropertiesWidget
 from .paths import ensure_scripts, repo_root
 from .track_edit import (
     CellUndo,
@@ -115,6 +116,8 @@ class PatricWidget(QWidget):
         tabs.addTab(self._segmentation_tab(), "Segmentation")
         tabs.addTab(self._tracking_tab(), "Tracking")
         tabs.addTab(self._t1_tab(), "T1")
+        self.cell_props = CellPropertiesWidget(self.viewer)
+        tabs.addTab(self.cell_props, "Export Cell Props")
         self.status = QLabel("Ready")
         self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)

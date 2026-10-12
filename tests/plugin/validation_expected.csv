@@ -1,0 +1,5 @@
+track_id,frame,area_px2,perimeter_px,circularity,shape_index,eccentricity,solidity,major_axis_px,minor_axis_px,orientation,centroid_x_px,centroid_y_px,touches_edge
+1,0,100,36,0.9696,3.6,0.0,1.0,11.4891,11.4891,,24.5,24.5,0
+1,1,144,44,0.9347,3.6667,0.0,1.0,13.8082,13.8082,,25.5,25.5,0
+2,0,200,56,0.8014,3.9598,0.8671,1.0,23.0651,11.4891,0.0,4.5,59.5,1
+3,1,300,76,0.6527,4.3879,0.9433,1.0,34.6218,11.4891,1.5708,74.5,64.5,0

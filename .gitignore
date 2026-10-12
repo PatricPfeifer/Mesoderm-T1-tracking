@@ -8,3 +8,11 @@
 !plugins/
 !plugins/**
 !start_working.sh
+!requirements.txt
+!Future-improvement-ideas.md
+!feature-help-*.md
+!pytest.ini
+!tests/
+!tests/**
+__pycache__/
+.pytest_cache/
