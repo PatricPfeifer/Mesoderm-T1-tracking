@@ -68,11 +68,7 @@ Results are saved automatically in a folder **next to the movie**, called
 `<movie name>_results`. To keep the repository clean, first copy the movie somewhere else,
 for example to your Desktop, and open that copy.
 
-A short walkthrough of the steps below (load, segment, track, select cells, colour by feature):
-
-![TissueKit walkthrough](docs/images/tissuekit_walkthrough.gif)
-
-Full video (fullscreen and scrubbing available):
+Walkthrough of the steps below (load, segment, track, select cells, colour by feature; fullscreen and scrubbing available):
 
 https://github.com/user-attachments/assets/eeccd6eb-240b-4ec5-82f8-67aea8ade14d
 
