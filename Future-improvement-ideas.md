@@ -2,7 +2,7 @@
 
 ## Open project folder
 
-A single **Open project folder** button at the top of the Patric widget. The folder holds the raw TIFF, and every step reads its inputs and writes its outputs there by fixed names, so the user never has to pick files.
+A single **Open project folder** button at the top of the TissueKit widget. The folder holds the raw TIFF, and every step reads its inputs and writes its outputs there by fixed names, so the user never has to pick files.
 
 ```
 my_movie/
@@ -30,7 +30,7 @@ Open decisions:
 
 - Tracking tab: "Exclude edge tracks" option (track all cells, then drop tracks touching the image edge), as in `cellpose_track.py --exclude-border`.
 - Tracking tab: warn or default the Intensity field to the raw image when it is `(none)`.
-- Movie export button (see `scripts/cellpose_track/make_track_movie.py`).
+- Movie export button (see `legacy/cellpose_track/make_track_movie.py`).
 - Optional "Solo selected layer" checkbox (hide all other layers on selection). napari's built-in alternative: Alt+click a layer's eye icon.
 
 ## Physical units: read pixel size and time interval from the TIFF

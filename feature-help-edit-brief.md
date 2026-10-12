@@ -1,6 +1,6 @@
 # Edit brief: feature help cards (round 2)
 
-Edits to the existing cards in `plugins/napari_patric/napari_patric/feature_help/` (editable sources in `svg/`, shared spec in `README.md` there, original brief in `feature-help-design-brief.md`). Keep the shared style (same cell polygons, accent #ff563c, dark theme, 320 x 240 px, Archivo, 3 px halo on text). Only the changes below.
+Edits to the existing cards in `plugins/napari_tissuekit/napari_tissuekit/feature_help/` (editable sources in `svg/`, shared spec in `README.md` there, original brief in `feature-help-design-brief.md`). Keep the shared style (same cell polygons, accent #ff563c, dark theme, 320 x 240 px, Archivo, 3 px halo on text). Only the changes below.
 
 ## 0. Layout change for all cards (point 2)
 

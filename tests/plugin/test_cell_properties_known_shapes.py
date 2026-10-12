@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_patric.cell_properties import FEATURES, compute_properties
+from napari_tissuekit.cell_properties import FEATURES, compute_properties
 
 HERE = Path(__file__).parent
 # id -> {frame: (y0, y1, x0, x1)}  (half-open pixel ranges)

@@ -1,0 +1,10 @@
+name: napari-tissuekit
+display_name: TissueKit
+contributions:
+  commands:
+    - id: napari-tissuekit.launch
+      title: Launch TissueKit
+      python_name: napari_tissuekit._widget:TissueKitWidget
+  widgets:
+    - command: napari-tissuekit.launch
+      display_name: TissueKit
