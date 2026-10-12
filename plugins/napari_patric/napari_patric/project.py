@@ -8,14 +8,12 @@ Layout (next to the input movie by default)::
         t1/             T1 events
         cell_props/     exports and selections from "Export Cell Props"
         settings.json   parameters and time of the last run of every step
-        archive/        earlier results, moved here instead of being overwritten
 
 Nothing in here depends on napari or Qt, so it can be tested on its own.
 """
 from __future__ import annotations
 
 import json
-import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -76,42 +74,6 @@ class WorkingFolder:
         if create:
             d.mkdir(parents=True, exist_ok=True)
         return d
-
-    @staticmethod
-    def _stamp() -> str:
-        return datetime.now().strftime("%Y%m%d-%H%M%S")
-
-    def archive_file(self, path: str | Path) -> Path | None:
-        """Move an existing result file into archive/ (never overwrite silently)."""
-        p = Path(path)
-        if not p.is_file():
-            return None
-        assert self.root is not None
-        dest_dir = self.root / "archive"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / f"{p.stem}_{self._stamp()}{p.suffix}"
-        n = 1
-        while dest.exists():
-            dest = dest_dir / f"{p.stem}_{self._stamp()}-{n}{p.suffix}"
-            n += 1
-        shutil.move(str(p), str(dest))
-        return dest
-
-    def archive_step(self, step: str) -> Path | None:
-        """Move a whole step folder with content into archive/<step>_<time>/."""
-        assert self.root is not None
-        d = self.root / step
-        if not d.is_dir() or not any(d.iterdir()):
-            return None
-        dest_dir = self.root / "archive"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / f"{step}_{self._stamp()}"
-        n = 1
-        while dest.exists():
-            dest = dest_dir / f"{step}_{self._stamp()}-{n}"
-            n += 1
-        shutil.move(str(d), str(dest))
-        return dest
 
     # ---- settings.json -----------------------------------------------------
     @property

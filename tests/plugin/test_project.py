@@ -19,27 +19,6 @@ def test_resolve_prefers_manual_choice(tmp_path):
     assert wf.resolve([tmp_path / "other.tif"]) == tmp_path / "mine"
 
 
-def test_archive_file_keeps_old_result(tmp_path):
-    wf = WorkingFolder()
-    wf.set_manual(tmp_path)
-    f = wf.step_dir("segmentation") / "m_cp_masks.tif"
-    f.write_bytes(b"old")
-    moved = wf.archive_file(f)
-    assert not f.exists()
-    assert moved.read_bytes() == b"old" and moved.parent == tmp_path / "archive"
-    assert wf.archive_file(f) is None  # nothing there any more
-
-
-def test_archive_step_moves_whole_folder_and_never_collides(tmp_path):
-    wf = WorkingFolder()
-    wf.set_manual(tmp_path)
-    for _ in range(2):
-        (wf.step_dir("tracking") / "x_tracks.csv").write_text("a")
-        assert wf.archive_step("tracking") is not None
-    assert len(list((tmp_path / "archive").iterdir())) == 2
-    assert wf.archive_step("tracking") is None  # empty or missing folder is skipped
-
-
 def test_settings_accumulate_per_step(tmp_path):
     wf = WorkingFolder()
     wf.set_manual(tmp_path / "res")

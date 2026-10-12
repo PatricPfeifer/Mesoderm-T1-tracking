@@ -111,7 +111,6 @@ class PatricWidget(QWidget):
         self._pick_layer = None
         self._t1_result: dict | None = None
         self.project = WorkingFolder()
-        self._archive_next_seg_save = False
         self._track_run: tuple | None = None
         # Mother + daughter track IDs from the last division-aware tracking.
         self._division_ids: set[int] = set()
@@ -750,10 +749,6 @@ class PatricWidget(QWidget):
             outdir.mkdir(parents=True, exist_ok=True)
         masks_path = outdir / f"{stem}_cp_masks.tif"
         outlines_path = outdir / f"{stem}_cp_outlines.tif"
-        if wf is not None and self._archive_next_seg_save:
-            wf.archive_file(masks_path)
-            wf.archive_file(outlines_path)
-        self._archive_next_seg_save = False
         # Keep the raw movie's pixel size / frame interval in the saved files.
         cal = self._calibration(
             self._layer(self.seg_image.currentText()),
@@ -1103,7 +1098,6 @@ class PatricWidget(QWidget):
         if out_dir is None:
             wf = self._working_folder(intensity_layer, labels)
             if wf is not None:
-                wf.archive_step("tracking")  # keep the previous run, never overwrite
                 out_dir = wf.step_dir("tracking")
         kwargs = dict(
             calibration=cal,
@@ -1339,7 +1333,6 @@ class PatricWidget(QWidget):
         if wf is None:
             self.status.setText(f"{self.status.text()} (not saved: no results folder chosen)")
             return
-        self._archive_next_seg_save = True  # a fresh run: keep any earlier masks in archive/
         self._save_segmentation()
         wf.write_settings(
             "segmentation",
@@ -1360,7 +1353,6 @@ class PatricWidget(QWidget):
                  for k, v in e.items()}
                 for e in events
             ]
-            wf.archive_step("t1")
             pd.DataFrame(rows).to_csv(wf.step_dir("t1") / "t1_events.csv", index=False)
             wf.write_settings(
                 "t1",
