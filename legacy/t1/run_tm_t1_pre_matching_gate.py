@@ -63,12 +63,12 @@ for _p in (_HERE, _TRACK, _SCRIPTS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from napari_patric.core.celltrack.cells import build_adjacency  # noqa: E402
-from napari_patric.core.output_names import input_stem, tagged_path  # noqa: E402
-from napari_patric.core.t1.calibrated_outputs import write_um_files  # noqa: E402
-from napari_patric.core.movie_calibration import calibration_for, save_tiff  # noqa: E402
-from napari_patric.core.t1.t1_picker_ready import write_picker_ready  # noqa: E402
-from napari_patric.core.t1.run_tm_fourway_vertices import (  # noqa: E402
+from napari_tissuekit.core.celltrack.cells import build_adjacency  # noqa: E402
+from napari_tissuekit.core.output_names import input_stem, tagged_path  # noqa: E402
+from napari_tissuekit.core.t1.calibrated_outputs import write_um_files  # noqa: E402
+from napari_tissuekit.core.movie_calibration import calibration_for, save_tiff  # noqa: E402
+from napari_tissuekit.core.t1.t1_picker_ready import write_picker_ready  # noqa: E402
+from napari_tissuekit.core.t1.run_tm_fourway_vertices import (  # noqa: E402
     contact_length_map,
     fmt_ids,
     junctions_one_frame,
@@ -1647,7 +1647,7 @@ def main() -> None:
         )
     exclude_ids: set[int] = set()
     if not args.keep_dividing:
-        from napari_patric.core.t1.run_tm_t1 import load_division_ids
+        from napari_tissuekit.core.t1.run_tm_t1 import load_division_ids
 
         lineage = args.lineage or tagged_path(
             args.labels.expanduser().parent, stem, "lineage.csv"

@@ -26,10 +26,10 @@ def _ensure_numba_shim() -> None:
         return
     except ImportError:
         pass
-    if "numba" in sys.modules and getattr(sys.modules["numba"], "_patric_stub", False):
+    if "numba" in sys.modules and getattr(sys.modules["numba"], "_tissuekit_stub", False):
         return
     stub = types.ModuleType("numba")
-    stub._patric_stub = True
+    stub._tissuekit_stub = True
 
     def njit(*args, **_kwargs):
         if args and callable(args[0]):
@@ -48,16 +48,16 @@ def _ensure_numba_shim() -> None:
 def _ensure_img_stub() -> None:
     """Avoid importing real ``epyseg.img`` (pulls czifile, read_lif, …)."""
     existing = sys.modules.get("epyseg.img")
-    if existing is not None and getattr(existing, "_patric_stub", False):
+    if existing is not None and getattr(existing, "_tissuekit_stub", False):
         return
     # Drop a failed/partial real import if present.
-    if existing is not None and not getattr(existing, "_patric_stub", False):
+    if existing is not None and not getattr(existing, "_tissuekit_stub", False):
         # Keep real module if it already loaded successfully.
         if hasattr(existing, "Img"):
             return
 
     stub = types.ModuleType("epyseg.img")
-    stub._patric_stub = True
+    stub._tissuekit_stub = True
     stub.Img = type("Img", (), {})
     sys.modules["epyseg.img"] = stub
 
@@ -78,7 +78,7 @@ def import_wshed():
     # Import package first so stub attaches cleanly.
     import epyseg  # noqa: F401
 
-    if getattr(sys.modules.get("epyseg.img"), "_patric_stub", False):
+    if getattr(sys.modules.get("epyseg.img"), "_tissuekit_stub", False):
         epyseg.img = sys.modules["epyseg.img"]  # type: ignore[attr-defined]
 
     # Fresh import of neo_wshed if a previous attempt failed mid-import.

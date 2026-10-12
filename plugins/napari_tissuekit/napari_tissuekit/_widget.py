@@ -88,7 +88,7 @@ def _as_rgb(data: np.ndarray) -> np.ndarray:
     return arr
 
 
-class PatricWidget(QWidget):
+class TissueKitWidget(QWidget):
     def __init__(self, napari_viewer: napari.Viewer):
         super().__init__()
         self.viewer = napari_viewer
@@ -331,7 +331,7 @@ class PatricWidget(QWidget):
         image = _as_tyx(np.asarray(layer.data))
         batch = int(self.seg_batch.value())
         use_gpu = self.seg_gpu.isChecked()
-        work = Path(tempfile.mkdtemp(prefix="patric_seg_"))
+        work = Path(tempfile.mkdtemp(prefix="tissuekit_seg_"))
         image_path = work / "image.npy"
         out_path = work / "masks.npy"
         np.save(image_path, np.asarray(image))
@@ -339,7 +339,7 @@ class PatricWidget(QWidget):
         self._seg_out = out_path
         code = (
             "import numpy as np\n"
-            "from napari_patric.core.segmentation import segment_stack\n"
+            "from napari_tissuekit.core.segmentation import segment_stack\n"
             f"img = np.load({str(image_path)!r})\n"
             "masks = segment_stack(\n"
             "    img,\n"

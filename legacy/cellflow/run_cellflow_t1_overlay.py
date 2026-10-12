@@ -25,8 +25,8 @@ for _p in (_T1, _SCRIPTS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from napari_patric.core.t1.run_tm_fourway_vertices import load_labels  # noqa: E402
-from napari_patric.core.t1.run_tm_t1 import (  # noqa: E402
+from napari_tissuekit.core.t1.run_tm_fourway_vertices import load_labels  # noqa: E402
+from napari_tissuekit.core.t1.run_tm_t1 import (  # noqa: E402
     grayscale_rgb,
     labels_gray_rgb,
     load_rgb,

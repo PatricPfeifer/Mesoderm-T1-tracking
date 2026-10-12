@@ -49,7 +49,7 @@ import tifffile
 _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
-from napari_patric.core.output_names import input_stem, tagged, tagged_path  # noqa: E402
+from napari_tissuekit.core.output_names import input_stem, tagged, tagged_path  # noqa: E402
 
 CellSet = frozenset  # frozenset of track IDs around a vertex
 

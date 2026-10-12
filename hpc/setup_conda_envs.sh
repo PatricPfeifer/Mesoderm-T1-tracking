@@ -82,12 +82,12 @@ echo "=== t1_pick (portable picker GUI) ==="
 create_if_missing t1_pick
 pip_in t1_pick numpy tifffile scipy scikit-image matplotlib PySide6
 
-echo "=== cellflow (napariCellFlow + napari-patric) ==="
+echo "=== cellflow (napariCellFlow + napari-tissuekit) ==="
 create_if_missing cellflow
 conda activate cellflow
 python -m pip install --upgrade pip
 [[ -d "${ROOT}/vendor/napariCellFlow" ]] && python -m pip install --no-cache-dir -e "${ROOT}/vendor/napariCellFlow" || echo "NOTE: vendor/napariCellFlow not present (only the legacy cellflow scripts need it)"
-python -m pip install --no-cache-dir -e "${ROOT}/plugins/napari_patric"
+python -m pip install --no-cache-dir -e "${ROOT}/plugins/napari_tissuekit"
 conda deactivate
 
 echo "=== cellpose_ta (PC combined Cellpose+TA; CPU) ==="
@@ -112,7 +112,7 @@ check tissue_miner "import numpy,tifffile,scipy,skimage,PySide6"
 check TA "import numpy,pandas,tifffile,scipy,skimage"
 check cellpose "import numpy,tifffile,cellpose"
 check t1_pick "import numpy,tifffile,scipy,skimage,matplotlib,PySide6"
-check cellflow "import numpy,tifffile,napari,qtpy,napari_patric"
+check cellflow "import numpy,tifffile,napari,qtpy,napari_tissuekit"
 
 echo "=== conda env list ==="
 conda env list

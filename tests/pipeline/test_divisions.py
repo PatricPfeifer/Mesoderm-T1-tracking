@@ -10,10 +10,10 @@ import sys
 
 import numpy as np
 
-from napari_patric.core.celltrack.cells import build_frame_cells  # noqa: E402
-from napari_patric.core.celltrack.motion import MotionField  # noqa: E402
-from napari_patric.core.celltrack.tracks import lineage_rows, mark_divisions, render_tracked_rgb  # noqa: E402
-from napari_patric.core.celltrack.tracks import render_tracked_labels, track_movie  # noqa: E402
+from napari_tissuekit.core.celltrack.cells import build_frame_cells  # noqa: E402
+from napari_tissuekit.core.celltrack.motion import MotionField  # noqa: E402
+from napari_tissuekit.core.celltrack.tracks import lineage_rows, mark_divisions, render_tracked_rgb  # noqa: E402
+from napari_tissuekit.core.celltrack.tracks import render_tracked_labels, track_movie  # noqa: E402
 
 CELL = 16
 GRID = 7

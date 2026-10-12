@@ -16,5 +16,5 @@ else:
     from test_cell_properties_hexagon import make_stack as hexagon
     v.add_labels(tifffile.imread(here / "validation_labels.tif"), name="rectangles (ids 1,2,3)")
     v.add_labels(hexagon(), name="hexagon (id 1)")
-v.window.add_plugin_dock_widget("napari-patric")
+v.window.add_plugin_dock_widget("napari-tissuekit")
 napari.run()

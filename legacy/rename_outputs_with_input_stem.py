@@ -11,7 +11,7 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from napari_patric.core.output_names import input_stem, tagged  # noqa: E402
+from napari_tissuekit.core.output_names import input_stem, tagged  # noqa: E402
 
 ROOT = Path("/home/ho/ho_proana/ho_luchi75/projects/patric")
 OUTPUT = ROOT / "output"

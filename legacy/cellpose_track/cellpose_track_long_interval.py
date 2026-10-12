@@ -25,7 +25,7 @@ for _p in (_HERE, _SCRIPTS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from napari_patric.core.celltrack.pipeline import run_tracking  # noqa: E402
+from napari_tissuekit.core.celltrack.pipeline import run_tracking  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

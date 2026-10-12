@@ -1,15 +1,15 @@
-"""``patric``: run the pipeline steps from the command line (laptop or HPC).
+"""``tissuekit``: run the pipeline steps from the command line (laptop or HPC).
 
 Every step reads and writes the same results folder the napari widget uses, so a
 job run on the HPC can be opened with "Folder..." / "Load results" afterwards::
 
-    patric segment movie.tif --preset cellflow     # -> movie_results/segmentation/
-    patric track   movie.tif                       # -> movie_results/tracking/
-    patric t1      movie.tif                       # -> movie_results/t1/
+    tissuekit segment movie.tif --preset cellflow     # -> movie_results/segmentation/
+    tissuekit track   movie.tif                       # -> movie_results/tracking/
+    tissuekit t1      movie.tif                       # -> movie_results/t1/
 
 ``TARGET`` is the movie (results folder = ``<movie_dir>/<movie_stem>_results``) or an
 existing results folder. Options this wrapper does not know are passed on to the step
-(see ``python -m napari_patric.core.tracking --help`` and ``...core.t1.run_tm_t1 --help``).
+(see ``python -m napari_tissuekit.core.tracking --help`` and ``...core.t1.run_tm_t1 --help``).
 No napari or Qt is imported here.
 """
 from __future__ import annotations
@@ -79,7 +79,7 @@ def cmd_track(args, extra) -> None:
     from .core import tracking
 
     wf, movie = _folder(args.target, args.results)
-    masks = _need(wf, "segmentation", f"patric segment {args.target}")
+    masks = _need(wf, "segmentation", f"tissuekit segment {args.target}")
     movie = _movie(wf, movie)
     argv = ["--masks", str(masks), "--output-dir", str(wf.step_dir("tracking"))]
     if movie is not None:
@@ -92,7 +92,7 @@ def cmd_t1(args, extra) -> None:
     from .core.t1 import run_tm_t1
 
     wf, _ = _folder(args.target, args.results)
-    labels = _need(wf, "tracking", f"patric track {args.target}")
+    labels = _need(wf, "tracking", f"tissuekit track {args.target}")
     argv = ["--labels", str(labels), "--output-dir", str(wf.step_dir("t1"))]
     rgb = labels.with_name(labels.name.replace("_tracked_labels", "_tracked_rgb"))
     if rgb.is_file():
@@ -102,7 +102,7 @@ def cmd_t1(args, extra) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="patric", description=__doc__.split("\n\n")[0])
+    p = argparse.ArgumentParser(prog="tissuekit", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="command", required=True)
 
     def add(name, func, help_):

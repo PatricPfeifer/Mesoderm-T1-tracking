@@ -29,7 +29,7 @@ def run_script(*args):
 
 def track(masks, outdir):
     run_script(
-        "-m", "napari_patric.core.tracking",
+        "-m", "napari_tissuekit.core.tracking",
         "--masks", masks, "--intensity", MOVIE, "--output-dir", outdir,
         "--exclude-border", 2, "--quiet",
     )
@@ -56,7 +56,7 @@ def test_tracking_on_stored_masks(tmp_path):
 
 def test_registration_needs_intensity():
     """Without the raw image the tracker cannot undo the frame jumps (see README notes)."""
-    from napari_patric.core.celltrack.pipeline import track_arrays
+    from napari_tissuekit.core.celltrack.pipeline import track_arrays
 
     masks = imread(MASKS)
     kw = dict(stem="x", verbose=False, expand=3, pyramidal_depth=3, w_topo=0.75,
@@ -70,7 +70,7 @@ def test_registration_needs_intensity():
 @pytest.mark.slow
 def test_segmentation_then_tracking(tmp_path):
     results = tmp_path / "results"
-    run_script("-m", "napari_patric.cli", "segment", MOVIE, "--results", results,
+    run_script("-m", "napari_tissuekit.cli", "segment", MOVIE, "--results", results,
                "--preset", "cellflow", "--force-cpu")
     masks_path = next((results / "segmentation").glob("*_cp_masks.tif"))
     masks = imread(masks_path)

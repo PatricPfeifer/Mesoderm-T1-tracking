@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "napari-patric"
+name = "napari-tissuekit"
 version = "0.1.0"
 description = "Napari interface for Cellpose segmentation, cell tracking, and T1 detection"
 requires-python = ">=3.9"
@@ -21,17 +21,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The napari widget. Not needed for `patric` on a headless HPC node.
+# The napari widget. Not needed for `tissuekit` on a headless HPC node.
 gui = ["napari[pyqt5]>=0.4.18", "qtpy"]
 
 [project.scripts]
-patric = "napari_patric.cli:main"
+tissuekit = "napari_tissuekit.cli:main"
 
 [project.entry-points."napari.manifest"]
-napari-patric = "napari_patric:napari.yaml"
+napari-tissuekit = "napari_tissuekit:napari.yaml"
 
 [tool.setuptools.packages.find]
-include = ["napari_patric*"]
+include = ["napari_tissuekit*"]
 
 [tool.setuptools.package-data]
-napari_patric = ["napari.yaml", "feature_help/*"]
+napari_tissuekit = ["napari.yaml", "feature_help/*"]

@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from napari_patric.core.t1.calibrated_outputs import write_um_files  # noqa: E402
-from napari_patric.core.movie_calibration import calibration_for  # noqa: E402
+from napari_tissuekit.core.t1.calibrated_outputs import write_um_files  # noqa: E402
+from napari_tissuekit.core.movie_calibration import calibration_for  # noqa: E402
 
 
 def main() -> None:

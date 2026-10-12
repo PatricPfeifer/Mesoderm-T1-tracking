@@ -28,8 +28,8 @@ for _p in (_HERE, _SCRIPTS):
         sys.path.insert(0, str(_p))
 
 import run_tm_t1_pre_matching_gate as preg  # noqa: E402
-from napari_patric.core.output_names import input_stem, tagged_path  # noqa: E402
-from napari_patric.core.t1.run_tm_fourway_vertices import fmt_ids, load_labels  # noqa: E402
+from napari_tissuekit.core.output_names import input_stem, tagged_path  # noqa: E402
+from napari_tissuekit.core.t1.run_tm_fourway_vertices import fmt_ids, load_labels  # noqa: E402
 
 
 def parse_ids(text: str) -> frozenset[int]:

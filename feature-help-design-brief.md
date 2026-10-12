@@ -15,7 +15,7 @@ The audience is biologists looking at epithelial cell shapes in a time-lapse mov
 | Theme | napari is **dark** (background about #262930, text about #d6d0ce). Design for dark, and make sure it stays readable on light too if possible |
 | Text | Feature name as a title, **one short line** of definition, optionally the formula. Min font about 12 px. No paragraphs |
 | Files | One file per feature, named exactly with the key below, e.g. `area.png` |
-| Where | `plugins/napari_patric/napari_patric/feature_help/` (they load automatically on the next napari start) |
+| Where | `plugins/napari_tissuekit/napari_tissuekit/feature_help/` (they load automatically on the next napari start) |
 
 Keys and display names (use exactly these file names):
 

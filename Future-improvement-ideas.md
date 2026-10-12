@@ -2,7 +2,7 @@
 
 ## Open project folder
 
-A single **Open project folder** button at the top of the Patric widget. The folder holds the raw TIFF, and every step reads its inputs and writes its outputs there by fixed names, so the user never has to pick files.
+A single **Open project folder** button at the top of the TissueKit widget. The folder holds the raw TIFF, and every step reads its inputs and writes its outputs there by fixed names, so the user never has to pick files.
 
 ```
 my_movie/

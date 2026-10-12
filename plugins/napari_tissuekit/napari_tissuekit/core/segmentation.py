@@ -3,8 +3,8 @@
 
 Saves progress after every frame so a short Slurm walltime can be resumed.
 
-Example (``patric segment`` wraps this with the results-folder layout):
-  python -m napari_patric.core.segmentation \
+Example (``tissuekit segment`` wraps this with the results-folder layout):
+  python -m napari_tissuekit.core.segmentation \
     --input movie.tif --output-dir movie_results/segmentation
 """
 from __future__ import annotations

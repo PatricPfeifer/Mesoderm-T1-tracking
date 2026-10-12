@@ -43,8 +43,8 @@ for _p in (_HERE, _TRACK, _SCRIPTS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from napari_patric.core.celltrack.cells import build_adjacency  # noqa: E402
-from napari_patric.core.output_names import input_stem, tagged_path  # noqa: E402
+from napari_tissuekit.core.celltrack.cells import build_adjacency  # noqa: E402
+from napari_tissuekit.core.output_names import input_stem, tagged_path  # noqa: E402
 
 
 def load_labels(path: Path) -> np.ndarray:
@@ -316,7 +316,7 @@ def main() -> None:
     print("Building neighbour graphs (TissueMiner CountT1)...", flush=True)
     neigh = neighbor_maps(stack, expand=args.expand)
     if not args.keep_dividing:
-        from napari_patric.core.t1.run_tm_t1 import load_division_ids
+        from napari_tissuekit.core.t1.run_tm_t1 import load_division_ids
 
         lineage = args.lineage or tagged_path(
             args.labels.expanduser().parent, stem, "lineage.csv"

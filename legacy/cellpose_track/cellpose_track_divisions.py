@@ -30,7 +30,7 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from napari_patric.core.celltrack.pipeline import run_tracking  # noqa: E402
+from napari_tissuekit.core.celltrack.pipeline import run_tracking  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
