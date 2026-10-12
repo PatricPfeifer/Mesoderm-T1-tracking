@@ -17,6 +17,8 @@ from .motion import estimate_all_motion, registration_images
 from .qc import compute_qc, write_qc
 from .tracks import (
     TrackingResult,
+    lineage_rows,
+    mark_divisions,
     render_tracked_labels,
     render_tracked_rgb,
     track_movie,
@@ -26,6 +28,7 @@ _SCRIPTS = Path(__file__).resolve().parents[2]  # .../scripts
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 from output_names import input_stem, tagged_path  # noqa: E402
+from movie_calibration import Calibration, calibration_for, save_tiff  # noqa: E402
 
 
 def movie_from_arrays(
@@ -91,8 +94,20 @@ def track_loaded(
     run_backward: bool = False,
     write_rgb: bool = True,
     verbose: bool = True,
+    division_mode: str = "legacy",
+    division_refractory: int = 10,
+    min_daughter_frames: int = 3,
+    calibration: Calibration | None = None,
 ) -> dict[str, Any]:
-    """Track a loaded movie. Writes files when ``output_dir`` is set."""
+    """Track a loaded movie. Writes files when ``output_dir`` is set.
+
+    ``calibration`` (pixel size, frame interval) is written into the output
+    TIFFs and qc.json; when not given it is read from the intensity / masks
+    files, else from the raw movie of the same stem.
+    """
+    cal = calibration
+    if cal is None and (intensity_path or masks_path):
+        cal = calibration_for(intensity_path, masks_path, stem=stem)
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -124,6 +139,9 @@ def track_loaded(
         gap_close=gap_close,
         cost_kwargs=cost_kwargs,
         verbose=verbose,
+        division_mode=division_mode,
+        division_refractory=division_refractory,
+        min_daughter_frames=min_daughter_frames,
     )
 
     backward_result = None
@@ -147,20 +165,25 @@ def track_loaded(
             gap_close=gap_close,
             cost_kwargs=cost_kwargs,
             verbose=verbose,
+            division_mode=division_mode,
+            division_refractory=division_refractory,
+            min_daughter_frames=min_daughter_frames,
         )
 
     tracked = render_tracked_labels(
         movie.masks, result.frames, result.label_to_track
     )
     rgb = render_tracked_rgb(tracked) if write_rgb else None
+    if rgb is not None and division_mode == "lineage":
+        mark_divisions(rgb, result)
     labels_out = None
     rgb_out = None
     if output_dir is not None:
         labels_out = tagged_path(output_dir, stem, "tracked_labels.tif")
-        tifffile.imwrite(labels_out, tracked)
+        save_tiff(labels_out, tracked, cal)
         if rgb is not None:
             rgb_out = tagged_path(output_dir, stem, "tracked_rgb.tif")
-            tifffile.imwrite(rgb_out, rgb)
+            save_tiff(rgb_out, rgb, cal)
             if verbose:
                 print(f"RGB tracks: {rgb_out}", flush=True)
         _write_tables(result, output_dir, stem)
@@ -172,6 +195,7 @@ def track_loaded(
         str(Path(intensity_path).resolve()) if intensity_path else None
     )
     qc["frame_indices"] = movie.frame_indices.tolist()
+    qc["calibration"] = cal.as_dict() if cal else None
     if output_dir is not None:
         write_qc(qc, tagged_path(output_dir, stem, "qc.json"))
 
@@ -217,6 +241,10 @@ def track_arrays(
     run_backward: bool = False,
     write_rgb: bool = True,
     verbose: bool = True,
+    division_mode: str = "legacy",
+    division_refractory: int = 10,
+    min_daughter_frames: int = 3,
+    calibration: Calibration | None = None,
 ) -> dict[str, Any]:
     """Track in-memory label (and optional intensity) stacks."""
     movie = movie_from_arrays(masks, intensity, drop_blank=True)
@@ -237,6 +265,10 @@ def track_arrays(
         run_backward=run_backward,
         write_rgb=write_rgb,
         verbose=verbose,
+        division_mode=division_mode,
+        division_refractory=division_refractory,
+        min_daughter_frames=min_daughter_frames,
+        calibration=calibration,
     )
 
 
@@ -259,6 +291,9 @@ def run_tracking(
     run_backward: bool = False,
     write_rgb: bool = True,
     verbose: bool = True,
+    division_mode: str = "legacy",
+    division_refractory: int = 10,
+    min_daughter_frames: int = 3,
 ) -> dict[str, Any]:
     """Track a Cellpose movie and write all outputs under ``output_dir``."""
     movie = load_movie(
@@ -287,6 +322,9 @@ def run_tracking(
         run_backward=run_backward,
         write_rgb=write_rgb,
         verbose=verbose,
+        division_mode=division_mode,
+        division_refractory=division_refractory,
+        min_daughter_frames=min_daughter_frames,
     )
 
 
@@ -345,6 +383,7 @@ def _write_tables(result: TrackingResult, output_dir: Path, stem: str) -> None:
             "label_to": e.label_to,
             "track_id": e.track_id,
             "track_id_b": e.track_id_b,
+            "track_id_c": e.track_id_c,
             "cost": e.cost,
             "topology_score": e.topology_score,
             "flagged": e.flagged,
@@ -355,3 +394,16 @@ def _write_tables(result: TrackingResult, output_dir: Path, stem: str) -> None:
     pd.DataFrame(event_rows).to_csv(
         tagged_path(output_dir, stem, "track_events.csv"), index=False
     )
+
+    if result.division_mode == "lineage":
+        pd.DataFrame(
+            lineage_rows(result),
+            columns=[
+                "track_id",
+                "start_frame",
+                "end_frame",
+                "parent_track_id",
+                "divides",
+                "flagged",
+            ],
+        ).to_csv(tagged_path(output_dir, stem, "lineage.csv"), index=False)

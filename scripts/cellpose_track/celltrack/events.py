@@ -17,6 +17,7 @@ class Event:
     label_to: int | None
     track_id: int | None = None
     track_id_b: int | None = None  # second daughter / merge partner
+    track_id_c: int | None = None  # lineage divide: second daughter track
     cost: float | None = None
     topology_score: float | None = None
     flagged: bool = False
@@ -77,6 +78,26 @@ def classify_events(
                     note=f"daughters={daughter_labs}",
                 )
             )
+
+    # Lineage-mode divisions: parent track ends, both daughters are new.
+    for p, d1, d2, union_cost in assignment.split_divisions:
+        prev_lab = int(prev.original_labels[p + 1])
+        lab1 = int(cur.original_labels[d1 + 1])
+        lab2 = int(cur.original_labels[d2 + 1])
+        events.append(
+            Event(
+                kind="divide",
+                frame_from=f0,
+                frame_to=f1,
+                label_from=prev_lab,
+                label_to=lab1,
+                track_id=prev_label_to_track.get(prev_lab),
+                track_id_b=cur_label_to_track.get(lab1),
+                track_id_c=cur_label_to_track.get(lab2),
+                cost=union_cost,
+                note=f"daughters={[lab1, lab2]}",
+            )
+        )
 
     for p in assignment.disappeared:
         prev_lab = int(prev.original_labels[p + 1])

@@ -21,6 +21,12 @@ class PairCosts:
     cost: np.ndarray  # (n_prev, n_cur) float64
     n_prev: int
     n_cur: int
+    # Supporting matrices (n_prev, n_cur) and the weights used for ``cost``;
+    # filled by build_pair_costs, used to score division candidates.
+    iou: np.ndarray | None = None
+    inter: np.ndarray | None = None
+    dist: np.ndarray | None = None
+    weights: dict | None = None
 
 
 def warp_labels(labels: np.ndarray, field: MotionField) -> np.ndarray:
@@ -110,12 +116,21 @@ def build_pair_costs(
     Non-candidates get cost = inf.
     """
     n_prev, n_cur = prev.n_cells, cur.n_cells
-    iou, _ = overlap_matrix(prev, cur, field)
+    iou, inter = overlap_matrix(prev, cur, field)
     dist = centroid_distance_matrix(prev, cur, field)
+    weights = {
+        "w_iou": w_iou,
+        "w_dist": w_dist,
+        "w_area": w_area,
+        "max_distance": max_distance,
+    }
 
     cost = np.full((n_prev, n_cur), np.inf, dtype=np.float64)
     if n_prev == 0 or n_cur == 0:
-        return PairCosts(cost=cost, n_prev=n_prev, n_cur=n_cur)
+        return PairCosts(
+            cost=cost, n_prev=n_prev, n_cur=n_cur,
+            iou=iou, inter=inter, dist=dist, weights=weights,
+        )
 
     with np.errstate(divide="ignore", invalid="ignore"):
         area_ratio = np.abs(
@@ -135,4 +150,7 @@ def build_pair_costs(
         + w_area * area_ratio
     )
     cost[candidate] = raw[candidate]
-    return PairCosts(cost=cost, n_prev=n_prev, n_cur=n_cur)
+    return PairCosts(
+        cost=cost, n_prev=n_prev, n_cur=n_cur,
+        iou=iou, inter=inter, dist=dist, weights=weights,
+    )

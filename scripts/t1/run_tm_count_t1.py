@@ -7,8 +7,10 @@ without a TA sqlite file.
 
 A TissueMiner T1 (often called a half-T1) is a neighbour relationship that
 appears or disappears between two consecutive frames while BOTH cells still
-exist. Divisions are not modelled here: celltrack IDs already persist the
-parent on the better daughter.
+exist. Divisions: with the default tracker (cellpose_track.py) the parent ID
+persists on the better daughter. With cellpose_track_divisions.py, a
+``{stem}_lineage.csv`` sits next to the labels; mothers and daughters listed
+there are left out of the count (``--keep-dividing`` keeps them).
 
 Input: T,Y,X tracked_labels.tif (stable track IDs). Optional RGB overlay.
 RGB-only stacks are rejected — they have no identity.
@@ -284,6 +286,20 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Grow labels by N px before adjacency (Cellpose gaps; default 3).",
     )
+    p.add_argument(
+        "--lineage",
+        type=Path,
+        default=None,
+        help=(
+            "Lineage CSV from cellpose_track_divisions.py (default: "
+            "{stem}_lineage.csv next to --labels, if present)."
+        ),
+    )
+    p.add_argument(
+        "--keep-dividing",
+        action="store_true",
+        help="Do not exclude dividing cells even if a lineage CSV exists.",
+    )
     return p.parse_args()
 
 
@@ -299,6 +315,21 @@ def main() -> None:
 
     print("Building neighbour graphs (TissueMiner CountT1)...", flush=True)
     neigh = neighbor_maps(stack, expand=args.expand)
+    if not args.keep_dividing:
+        from run_tm_t1 import load_division_ids
+
+        lineage = args.lineage or tagged_path(
+            args.labels.expanduser().parent, stem, "lineage.csv"
+        )
+        if lineage.expanduser().is_file():
+            excl = load_division_ids(lineage.expanduser())
+            neigh = [
+                {c: nb - excl for c, nb in adj.items() if c not in excl}
+                for adj in neigh
+            ]
+            print(f"Lineage {lineage}: excluded {len(excl)} dividing track IDs", flush=True)
+        elif args.lineage is not None:
+            raise SystemExit(f"--lineage not found: {args.lineage}")
     events, summaries = count_t1s(neigh, frame_indices)
     pairs = pair_t1_events(events)
 

@@ -35,6 +35,9 @@ def compute_qc(
     appear = sum(1 for e in result.events if e.kind == "appear")
     disappear = sum(1 for e in result.events if e.kind == "disappear")
     divide = sum(1 for e in result.events if e.kind == "divide")
+    divide_flagged = sum(
+        1 for e in result.events if e.kind == "divide" and e.flagged
+    )
     gap_close = sum(1 for e in result.events if "gap_close" in (e.note or ""))
 
     qc: dict[str, Any] = {
@@ -48,6 +51,8 @@ def compute_qc(
         "n_appear": appear,
         "n_disappear": disappear,
         "n_divide": divide,
+        "n_divide_flagged": divide_flagged,
+        "division_mode": result.division_mode,
         "n_gap_close": gap_close,
         "track_length_histogram": {str(k): int(v) for k, v in sorted(hist.items())},
         "cells_per_frame": [fc.n_cells for fc in result.frames],

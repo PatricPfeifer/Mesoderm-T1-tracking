@@ -219,6 +219,163 @@ def pair_outline_mask(labels: np.ndarray, a: int, b: int, reach: int) -> np.ndar
     return (oa & near_b) | (ob & near_a) | gap
 
 
+# ---------------------------------------------------------------------------
+# Calibration (pixel size in um, frame interval in s). Standalone on purpose:
+# this script runs on a Mac/PC without the rest of the repo. The values come
+# from calibration.json next to the inputs (written by the T1 run), else from
+# the tracked-labels TIFF tags, else from --um-per-px / --s-per-frame.
+# ---------------------------------------------------------------------------
+
+_CAL: dict | None = None  # {"um_per_px": float|None, "s_per_frame": float|None, "source": str}
+
+
+def _cal_from_tiff(path: Path) -> dict | None:
+    try:
+        with tifffile.TiffFile(path) as tif:
+            page = tif.pages[0]
+            ij = dict(tif.imagej_metadata or {}) if tif.is_imagej else {}
+            desc = page.description or ""
+            meta: dict = {}
+            if desc.lstrip().startswith("{"):
+                try:
+                    meta = json.loads(desc)
+                except ValueError:
+                    meta = {}
+            unit = str(ij.get("unit", meta.get("unit", ""))).lower()
+            res_unit = ""
+            if "ResolutionUnit" in page.tags:
+                v = page.tags["ResolutionUnit"].value
+                res_unit = getattr(v, "name", str(v)).upper()
+            um = None
+            if "XResolution" in page.tags:
+                num, den = page.tags["XResolution"].value
+                px_per_unit = float(num) / float(den)
+                if px_per_unit > 0 and (
+                    unit in ("micron", "microns", "um", "\u00b5m", "\u03bcm", "micrometer")
+                    or res_unit == "MICROMETER"
+                ):
+                    um = 1.0 / px_per_unit
+            interval = ij.get("finterval", meta.get("finterval"))
+            seconds = float(interval) if interval else None
+    except Exception:
+        return None
+    if um is None and seconds is None:
+        return None
+    return {"um_per_px": um, "s_per_frame": seconds, "source": str(path)}
+
+
+def load_calibration(labels_path: Path, events_path: Path) -> dict | None:
+    for folder in (labels_path.parent, events_path.parent, Path.cwd(), _SCRIPTS):
+        cand = folder / "calibration.json"
+        if cand.is_file():
+            try:
+                data = json.loads(cand.read_text())
+            except ValueError:
+                continue
+            um, sec = data.get("um_per_px"), data.get("s_per_frame")
+            if um or sec:
+                return {
+                    "um_per_px": float(um) if um else None,
+                    "s_per_frame": float(sec) if sec else None,
+                    "source": str(cand),
+                }
+    return _cal_from_tiff(labels_path)
+
+
+def _cal_ok(cal: dict | None) -> bool:
+    return bool(cal and (cal.get("um_per_px") or cal.get("s_per_frame")))
+
+
+def _save_tif(path: Path, stack: np.ndarray) -> None:
+    """Write a TIFF; with a calibration, as ImageJ TIFF carrying scale and interval."""
+    cal = _CAL
+    if not _cal_ok(cal):
+        tifffile.imwrite(path, stack)
+        return
+    arr = np.asarray(stack)
+    meta: dict = {"unit": "micron"}
+    extra: dict = {}
+    if cal.get("s_per_frame"):
+        meta["finterval"] = float(cal["s_per_frame"])
+    if cal.get("um_per_px"):
+        extra["resolution"] = (1.0 / cal["um_per_px"], 1.0 / cal["um_per_px"])
+    if arr.dtype in (np.uint8, np.uint16, np.float32) and arr.ndim in (3, 4):
+        if arr.ndim == 4 and arr.shape[-1] == 3:
+            meta["axes"] = "TYXS"
+            extra["photometric"] = "rgb"
+        elif arr.ndim == 3:
+            meta["axes"] = "TYX"
+        tifffile.imwrite(path, arr, imagej=True, metadata=meta, **extra)
+    else:
+        tifffile.imwrite(path, arr)
+
+
+def _fmt_de(value: float, digits: int) -> str:
+    return (f"{value:.{digits}f}".rstrip("0").rstrip(".") or "0").replace(".", ",")
+
+
+def _scale_cell(text: str, factor: float | None, digits: int) -> str:
+    """Scale one comma-decimal table cell; blanks and flags pass through."""
+    if factor is None or text == "":
+        return text
+    try:
+        value = float(text.replace(",", "."))
+    except ValueError:
+        return text
+    return _fmt_de(value * factor, digits)
+
+
+def write_wide_um(src: Path, dst: Path, cal: dict, *, scale_values: bool = True) -> None:
+    """Twin of a wide ``sep=;`` table: dt column -> seconds, values -> um
+    (``scale_values=False`` keeps the values, e.g. angles in degrees)."""
+    um, sec = cal.get("um_per_px"), cal.get("s_per_frame")
+    lines = src.read_text(encoding="utf-8").splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        if i < 3:  # sep=;  event_id  event_type
+            out.append(line)
+            continue
+        cells = line.split(";")
+        cells[0] = _scale_cell(cells[0], sec, 2)
+        if scale_values:
+            cells[1:] = [_scale_cell(c, um, 3) for c in cells[1:]]
+        out.append(";".join(cells))
+    dst.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def write_events_um(src: Path, dst: Path, cal: dict) -> None:
+    """Twin of selected_t1s.csv: frames -> seconds, y/x -> um."""
+    um, sec = cal.get("um_per_px"), cal.get("s_per_frame")
+    with src.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    def new_name(col: str) -> str | None:
+        if col.startswith("frame_"):
+            return f"time_{col[6:]}_s" if sec else None
+        if col in ("y", "x"):
+            return f"{col}_um" if um else None
+        if col in ("persist_pre", "persist_post"):
+            return f"{col}_s" if sec else None
+        return col
+
+    names = [new_name(c) for c in fields]
+    with dst.open("w", newline="") as handle:
+        w = csv.writer(handle)
+        w.writerow([n for n in names if n])
+        for row in rows:
+            cells = []
+            for col, name in zip(fields, names):
+                if not name:
+                    continue
+                val = row[col]
+                if name != col and val != "":
+                    val = f"{float(val) * (um if col in ('y', 'x') else sec):.3f}".rstrip("0").rstrip(".")
+                cells.append(val)
+            w.writerow(cells)
+
+
 def _search_dirs() -> list[Path]:
     dirs: list[Path] = []
     for d in (Path.cwd(), _SCRIPTS):
@@ -945,6 +1102,15 @@ def write_traces_wide_csv(
     _write_dt_first(contact_path, contact_map)
     _write_dt_first(contact_signed_path, contact_signed_map)
     _write_dt_first(ang_path, ang_map)
+    if _cal_ok(_CAL):
+        for path, scale_values in (
+            (len_path, True),
+            (len_signed_path, True),
+            (contact_path, True),
+            (contact_signed_path, True),
+            (ang_path, False),  # angles stay in degrees; dt becomes seconds
+        ):
+            write_wide_um(path, path.with_name(f"{path.stem}_um{path.suffix}"), _CAL, scale_values=scale_values)
     return len_path, ang_path
 
 
@@ -1144,7 +1310,7 @@ def _overwrite_tif(path: Path, stack: np.ndarray) -> None:
                 f"Cannot overwrite {path} (file in use?). "
                 "Close it in ImageJ/Fiji or another viewer, then Confirm again."
             ) from exc
-    tifffile.imwrite(path, stack)
+    _save_tif(path, stack)
 
 
 def export_selection(
@@ -1219,6 +1385,16 @@ def export_selection(
                 }
             )
     print(f"Wrote {sel_path}", flush=True)
+    if _cal_ok(_CAL):
+        sel_um = sel_path.with_name(f"{sel_path.stem}_um{sel_path.suffix}")
+        write_events_um(sel_path, sel_um, _CAL)
+        print(f"Wrote {sel_um}", flush=True)
+    else:
+        print(
+            "No calibration found: only pixel/frame tables written "
+            "(put calibration.json next to the inputs or use --um-per-px / --s-per-frame).",
+            flush=True,
+        )
 
     print(
         f"Measuring {len(selected)} event(s), window=±{window} ...",
@@ -1260,6 +1436,7 @@ def export_selection(
         "n_dt_rows": n_dt,
         "window": window,
         "expand": expand,
+        "calibration": _CAL if _cal_ok(_CAL) else None,
         "event_ids": [e.event_id for e in selected],
         "traces_length": str(len_path),
         "traces_angle": str(ang_path),
@@ -1852,6 +2029,18 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--expand", type=int, default=3)
     p.add_argument(
+        "--um-per-px",
+        type=float,
+        default=None,
+        help="Pixel size in um (default: from calibration.json / the labels TIFF).",
+    )
+    p.add_argument(
+        "--s-per-frame",
+        type=float,
+        default=None,
+        help="Frame interval in seconds (default: from calibration.json / the labels TIFF).",
+    )
+    p.add_argument(
         "--headless",
         action="store_true",
         help="No GUI; export without Qt/DISPLAY (implies --select-all).",
@@ -1928,6 +2117,21 @@ def main() -> None:
         args.events, args.labels, args.rgb
     )
     stem = _input_stem(labels_path) or _input_stem(events_path)
+
+    global _CAL
+    _CAL = load_calibration(labels_path, events_path)
+    if args.um_per_px or args.s_per_frame:
+        base = dict(_CAL or {"um_per_px": None, "s_per_frame": None, "source": "command line"})
+        if args.um_per_px:
+            base["um_per_px"] = float(args.um_per_px)
+        if args.s_per_frame:
+            base["s_per_frame"] = float(args.s_per_frame)
+        _CAL = base
+    print(
+        f"Calibration: {_CAL}" if _cal_ok(_CAL)
+        else "Calibration: none found (pixel/frame output only)",
+        flush=True,
+    )
 
     print(f"Loading events {events_path}", flush=True)
     events = load_events(events_path)

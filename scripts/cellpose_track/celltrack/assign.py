@@ -25,6 +25,60 @@ class Assignment:
     appeared: list[int] = field(default_factory=list)
     divisions: list[tuple[int, tuple[int, int]]] = field(default_factory=list)
     costs: dict[tuple[int, int], float] = field(default_factory=dict)
+    # Lineage-mode divisions: (prev_idx, cur_a, cur_b, union_cost). The parent
+    # track ends and both daughters start new tracks (not in ``matches``).
+    split_divisions: list[tuple[int, int, int, float]] = field(default_factory=list)
+
+
+def solve_lap(
+    cost: np.ndarray,
+    *,
+    appear_cost: float,
+    disappear_cost: float,
+    drop_rows: set[int] | frozenset[int] = frozenset(),
+    drop_cols: set[int] | frozenset[int] = frozenset(),
+) -> tuple[list[tuple[int, int]], float]:
+    """Padded appear/disappear LAP on ``cost`` (inf = not allowed).
+
+    Rows / cols in ``drop_*`` are left out. Returns (matches, objective) where
+    matches are (row, col) in the original indexing and objective is the sum
+    of match costs plus appear/disappear costs of unmatched kept cells.
+    """
+    n_prev_all, n_cur_all = cost.shape
+    rows = [i for i in range(n_prev_all) if i not in drop_rows]
+    cols = [j for j in range(n_cur_all) if j not in drop_cols]
+    n_prev, n_cur = len(rows), len(cols)
+    if n_prev == 0 or n_cur == 0:
+        return [], n_prev * disappear_cost + n_cur * appear_cost
+    sub = cost[np.ix_(rows, cols)]
+
+    # Padded square matrix of size (n_prev + n_cur):
+    #   [ real (n_prev x n_cur) | diag(disappear) ]
+    #   [ diag(appear)          | zeros           ]
+    n = n_prev + n_cur
+    big = np.full((n, n), 0.0, dtype=np.float64)
+    # Replace inf with a large finite value so LAP still works, then filter.
+    large = appear_cost + disappear_cost + 10.0
+    big[:n_prev, :n_cur] = np.where(np.isfinite(sub), sub, large)
+    big[:n_prev, n_cur:] = large
+    np.fill_diagonal(big[:n_prev, n_cur : n_cur + n_prev], disappear_cost)
+    big[n_prev:, :n_cur] = large
+    np.fill_diagonal(big[n_prev : n_prev + n_cur, :n_cur], appear_cost)
+
+    row_ind, col_ind = linear_sum_assignment(big)
+    matches: list[tuple[int, int]] = []
+    objective = 0.0
+    for r, c in zip(row_ind.tolist(), col_ind.tolist()):
+        if r < n_prev and c < n_cur:
+            value = float(sub[r, c])
+            if not np.isfinite(value):
+                # Forced match via large filler — treat as unmatched.
+                continue
+            matches.append((rows[r], cols[c]))
+            objective += value
+    objective += (n_prev - len(matches)) * disappear_cost
+    objective += (n_cur - len(matches)) * appear_cost
+    return matches, objective
 
 
 def solve_assignment(
@@ -34,6 +88,7 @@ def solve_assignment(
     disappear_cost: float = 1.5,
     division_penalty: float = 0.8,
     allow_division: bool = True,
+    locked_divisions: list[tuple[int, int, int, float]] | None = None,
 ) -> Assignment:
     """Solve padded LAP for one frame pair.
 
@@ -53,6 +108,11 @@ def solve_assignment(
     solve the standard appear/disappear padding first, then for each unmatched
     current cell, try attaching it as a second daughter of the nearest matched
     previous cell if the division cost beats appear_cost.
+
+    ``locked_divisions`` (lineage mode): (prev, cur_a, cur_b, union_cost)
+    divisions found beforehand; their rows/cols are left out of the LAP and
+    they are returned in ``split_divisions``. Pass ``allow_division=False``
+    with it to skip the legacy second-daughter attachment.
     """
     n_prev, n_cur = pair.n_prev, pair.n_cur
     result = Assignment()
@@ -64,42 +124,26 @@ def solve_assignment(
         result.disappeared = list(range(n_prev))
         return result
 
-    # Build padded square cost matrix of size (n_prev + n_cur).
-    n = n_prev + n_cur
-    big = np.full((n, n), 0.0, dtype=np.float64)
-
-    # Top-left: real costs (inf for non-candidates).
-    real = pair.cost.copy()
-    # Replace inf with a large finite value so LAP still works, then filter.
-    large = appear_cost + disappear_cost + 10.0
-    real_finite = np.where(np.isfinite(real), real, large)
-    big[:n_prev, :n_cur] = real_finite
-
-    # Top-right: disappear diagonal.
-    big[:n_prev, n_cur:] = large
-    np.fill_diagonal(big[:n_prev, n_cur : n_cur + n_prev], disappear_cost)
-
-    # Bottom-left: appear diagonal.
-    big[n_prev:, :n_cur] = large
-    np.fill_diagonal(big[n_prev : n_prev + n_cur, :n_cur], appear_cost)
-
-    # Bottom-right: zeros (dummy-dummy).
-    # already 0
-
-    row_ind, col_ind = linear_sum_assignment(big)
-
-    matched_prev: set[int] = set()
-    matched_cur: set[int] = set()
-    for r, c in zip(row_ind.tolist(), col_ind.tolist()):
-        if r < n_prev and c < n_cur:
-            cost = float(pair.cost[r, c])
-            if not np.isfinite(cost):
-                # Forced match via large filler — treat as unmatched.
-                continue
-            result.matches.append((r, c))
-            result.costs[(r, c)] = cost
-            matched_prev.add(r)
-            matched_cur.add(c)
+    locked = list(locked_divisions or [])
+    drop_rows = {d[0] for d in locked}
+    drop_cols = {d[1] for d in locked} | {d[2] for d in locked}
+    matches, _ = solve_lap(
+        pair.cost,
+        appear_cost=appear_cost,
+        disappear_cost=disappear_cost,
+        drop_rows=drop_rows,
+        drop_cols=drop_cols,
+    )
+    matched_prev: set[int] = set(drop_rows)
+    matched_cur: set[int] = set(drop_cols)
+    for r, c in matches:
+        result.matches.append((r, c))
+        result.costs[(r, c)] = float(pair.cost[r, c])
+        matched_prev.add(r)
+        matched_cur.add(c)
+    result.split_divisions = [
+        (int(d[0]), int(d[1]), int(d[2]), float(d[3])) for d in locked
+    ]
 
     result.disappeared = [i for i in range(n_prev) if i not in matched_prev]
     result.appeared = [j for j in range(n_cur) if j not in matched_cur]

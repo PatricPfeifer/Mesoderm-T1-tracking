@@ -55,12 +55,79 @@ def masks_to_outline_labels(masks: np.ndarray) -> np.ndarray:
     return (rgb.max(axis=-1) > 0).astype(np.uint8)
 
 
+_CROSS = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+
+def hand_to_outline(hand: np.ndarray) -> np.ndarray:
+    """TA handCorrection (255 = bond/background) → 0/1 outline, 1 px wide.
+
+    Bond pixels that touch a cell (4-neighbourhood); the empty background
+    outside the tissue is not drawn.
+    """
+    hand = np.asarray(hand)
+    cells = hand != 255
+    near_cell = ndi.binary_dilation(cells, structure=_CROSS)
+    return (near_cell & ~cells).astype(np.uint8)
+
+
+def hand_stack_to_outline(hand: np.ndarray) -> np.ndarray:
+    """T,Y,X handCorrection → T,Y,X 0/1 outlines (see :func:`hand_to_outline`)."""
+    stack = as_label_stack(hand)
+    out = np.empty(stack.shape, dtype=np.uint8)
+    for t in range(stack.shape[0]):
+        out[t] = hand_to_outline(stack[t])
+    return out
+
+
+def update_outline_roi(
+    outlines_t: np.ndarray,
+    hand_t: np.ndarray,
+    ys: slice,
+    xs: slice,
+    *,
+    grow: int = 1,
+) -> None:
+    """Recompute 0/1 outlines of one frame in place around ``ys, xs``.
+
+    Outlines depend on the 4-neighbourhood, so the ROI is grown by ``grow``
+    px and computed on one more pixel of context.
+    """
+    h, w = hand_t.shape
+    y0, y1, _ = ys.indices(h)
+    x0, x1, _ = xs.indices(w)
+    y0, y1 = max(0, y0 - grow), min(h, y1 + grow)
+    x0, x1 = max(0, x0 - grow), min(w, x1 + grow)
+    cy0, cy1 = max(0, y0 - 1), min(h, y1 + 1)
+    cx0, cx1 = max(0, x0 - 1), min(w, x1 + 1)
+    border = hand_to_outline(hand_t[cy0:cy1, cx0:cx1])
+    outlines_t[y0:y1, x0:x1] = border[y0 - cy0 : y1 - cy0, x0 - cx0 : x1 - cx0]
+
+
 def outline_labels_to_rgb(outline_labels: np.ndarray) -> np.ndarray:
     """Convert 0/1 outline labels to yellow-on-black RGB."""
     lab = as_label_stack(outline_labels)
     rgb = np.zeros((*lab.shape, 3), dtype=np.uint8)
     rgb[lab > 0] = YELLOW
     return rgb
+
+
+def rgb_or_labels_to_outline_labels(data: np.ndarray) -> np.ndarray:
+    """Normalize imported outlines (RGB Image or Labels) → T,Y,X uint8 0/1.
+
+    RGB: any nonzero channel counts as outline (yellow-on-black TIFs).
+    Labels / binary: nonzero pixels count as outline.
+    """
+    arr = np.asarray(data)
+    if arr.ndim == 4 and arr.shape[-1] == 3:
+        return (arr.max(axis=-1) > 0).astype(np.uint8)
+    if arr.ndim == 3 and arr.shape[-1] == 3:
+        return (arr.max(axis=-1) > 0).astype(np.uint8)[np.newaxis, ...]
+    # Channel-first RGB: T,3,Y,X or 3,Y,X
+    if arr.ndim == 4 and arr.shape[1] == 3 and arr.shape[-1] != 3:
+        return (arr.max(axis=1) > 0).astype(np.uint8)
+    if arr.ndim == 3 and arr.shape[0] == 3:
+        return (arr.max(axis=0) > 0).astype(np.uint8)[np.newaxis, ...]
+    return (as_label_stack(arr) > 0).astype(np.uint8)
 
 
 def outlines_rgb_to_masks(rgb: np.ndarray) -> np.ndarray:

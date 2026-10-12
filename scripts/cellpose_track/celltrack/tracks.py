@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -36,6 +36,11 @@ class TrackingResult:
     per_frame_scores: list[float]
     frames: list[FrameCells]
     n_tracks: int
+    # Lineage mode: daughter track -> parent track; flagged parent tracks
+    # (a daughter lived < min_daughter_frames, likely an over-split).
+    parents: dict[int, int] = field(default_factory=dict)
+    flagged_divisions: set[int] = field(default_factory=set)
+    division_mode: str = "legacy"
 
 
 class UnionFind:
@@ -70,8 +75,24 @@ def track_movie(
     gap_close: bool = True,
     cost_kwargs: dict | None = None,
     verbose: bool = True,
+    division_mode: str = "legacy",
+    division_refractory: int = 10,
+    min_daughter_frames: int = 3,
+    division_kwargs: dict | None = None,
+    max_area_jump: float = 1.35,
 ) -> TrackingResult:
-    """Run forward tracking across all consecutive frame pairs."""
+    """Run forward tracking across all consecutive frame pairs.
+
+    ``division_mode="lineage"``: divisions end the parent track and start two
+    daughter tracks (see topology.topology_refined_assignment). A track born
+    by division cannot divide again within ``division_refractory`` frames,
+    and a cell whose area just jumped above ``max_area_jump`` x its recent
+    median (a segmentation merge, not growth) cannot divide on that frame.
+    """
+    lineage = division_mode == "lineage"
+    parents: dict[int, int] = {}
+    born_at: dict[int, int] = {}  # daughter track -> movie frame index
+    area_hist: dict[int, list[float]] = {}  # track -> recent areas (lineage)
     if len(frames) < 2:
         raise ValueError("Need at least 2 frames")
     if len(fields) != len(frames) - 1:
@@ -94,6 +115,20 @@ def track_movie(
 
     for t in range(1, len(frames)):
         prev, cur, field = frames[t - 1], frames[t], fields[t - 1]
+        blocked: set[int] = set()
+        if lineage:
+            for lab, track in label_to_track[t - 1].items():
+                idx = prev.index_of(lab)
+                if idx is None:
+                    continue
+                hist = area_hist.setdefault(track, [])
+                hist.append(float(prev.areas[idx]))
+                del hist[:-6]
+                if track in born_at and (t - 1) - born_at[track] < division_refractory:
+                    blocked.add(idx)
+                elif len(hist) >= 3 and hist[-1] > max_area_jump * float(np.median(hist[:-1])):
+                    blocked.add(idx)
+        new_parents: dict[int, int] = {}
         assignment, cur_map, next_track_id, score, per_score = (
             topology_refined_assignment(
                 prev,
@@ -107,8 +142,15 @@ def track_movie(
                 disappear_cost=disappear_cost,
                 division_penalty=division_penalty,
                 cost_kwargs=cost_kwargs,
+                division_mode=division_mode,
+                blocked_parents=blocked,
+                division_kwargs=division_kwargs,
+                parents=new_parents,
             )
         )
+        parents.update(new_parents)
+        for daughter in new_parents:
+            born_at[daughter] = t
         label_to_track.append(cur_map)
         scores.append(score / max(cur.n_cells, 1))
 
@@ -122,7 +164,24 @@ def track_movie(
         )
         events.extend(fe)
 
+        for p, d1, d2, union_cost in assignment.split_divisions:
+            prev_lab = int(prev.original_labels[p + 1])
+            for c in (d1, d2):
+                lab = int(cur.original_labels[c + 1])
+                links.append(
+                    Link(
+                        frame_from=prev.original_frame,
+                        label_from=prev_lab,
+                        frame_to=cur.original_frame,
+                        label_to=lab,
+                        kind="divide",
+                        cost=union_cost,
+                        track_id=cur_map.get(lab),
+                    )
+                )
         for e in fe:
+            if e.kind == "divide" and e.track_id_c is not None:
+                continue  # lineage divide: links added above
             if e.kind in ("continue", "divide") and e.label_from and e.label_to:
                 links.append(
                     Link(
@@ -161,7 +220,33 @@ def track_movie(
             max_gap=max_gap,
             appear_cost=appear_cost,
             verbose=verbose,
+            parents=parents,
         )
+
+    flagged: set[int] = set()
+    if lineage and parents:
+        lengths: dict[int, int] = {}
+        for mapping in label_to_track:
+            for track in set(mapping.values()):
+                lengths[track] = lengths.get(track, 0) + 1
+        for e in events:
+            if e.kind != "divide" or e.track_id_c is None:
+                continue
+            # Daughters cut off by the end of the movie are not "short".
+            last = len(label_to_track) - 1
+            short = [
+                d for d in (e.track_id_b, e.track_id_c)
+                if lengths.get(d, 0) < min_daughter_frames
+                and d not in label_to_track[last].values()
+            ]
+            if short:
+                e.flagged = True
+                e.note += f"; short daughter(s) {short} (< {min_daughter_frames} frames)"
+                if e.track_id is not None:
+                    flagged.add(e.track_id)
+        if verbose:
+            n_div = sum(1 for e in events if e.kind == "divide")
+            print(f"Divisions: {n_div} ({len(flagged)} flagged)", flush=True)
 
     return TrackingResult(
         label_to_track=label_to_track,
@@ -170,6 +255,9 @@ def track_movie(
         per_frame_scores=scores,
         frames=frames,
         n_tracks=next_track_id - 1,
+        parents=parents,
+        flagged_divisions=flagged,
+        division_mode=division_mode,
     )
 
 
@@ -186,13 +274,21 @@ def close_gaps(
     max_distance: float = 40.0,
     min_dice: float = 0.3,
     verbose: bool = True,
+    parents: dict[int, int] | None = None,
 ) -> tuple[list[dict[int, int]], list[Link], list[Event], int]:
     """Reconnect tracks that disappear and reappear within max_gap frames.
 
     For each gap size k=1..max_gap, find tracks ending at t and tracks starting
     at t+k+1 (i.e. appeared at that frame with no prior history), score by
     warped centroid distance + neighbour Dice, solve LAP, merge track IDs.
+
+    ``parents`` (daughter -> parent track, lineage mode): parent tracks are
+    never extended and daughter tracks never joined onto an earlier track.
+    It is updated in place to the renumbered IDs.
     """
+    parents = parents if parents is not None else {}
+    no_end = set(parents.values())
+    no_start = set(parents)
     # Build track lifespan: track_id -> (start_frame_idx, end_frame_idx, ...)
     track_start: dict[int, int] = {}
     track_end: dict[int, int] = {}
@@ -236,12 +332,12 @@ def close_gaps(
             endings = [
                 tr
                 for tr, end in track_end.items()
-                if end == t_end and track_start[tr] <= t_end
+                if end == t_end and track_start[tr] <= t_end and tr not in no_end
             ]
             beginnings = [
                 tr
                 for tr, start in track_start.items()
-                if start == t_start
+                if start == t_start and tr not in no_start
             ]
             # Only close tracks that currently look terminated / newborn.
             endings = [
@@ -347,11 +443,21 @@ def close_gaps(
                 new_map[lab] = canon_ids[root]
             remapped.append(new_map)
         label_to_track = remapped
-        # Update link track ids.
+        def canon(track: int | None) -> int | None:
+            if track is None or track not in uf.parent:
+                return track
+            return canon_ids.get(uf.find(track), track)
+
+        # Update link, event and lineage track ids.
         for link in links:
-            if link.track_id is not None and link.track_id in uf.parent:
-                root = uf.find(link.track_id)
-                link.track_id = canon_ids.get(root, link.track_id)
+            link.track_id = canon(link.track_id)
+        for event in events:
+            event.track_id = canon(event.track_id)
+            event.track_id_b = canon(event.track_id_b)
+            event.track_id_c = canon(event.track_id_c)
+        remapped_parents = {canon(d): canon(p) for d, p in parents.items()}
+        parents.clear()
+        parents.update(remapped_parents)
         next_track_id = new_id
 
     if verbose:
@@ -390,3 +496,63 @@ def render_tracked_rgb(tracked: np.ndarray, seed: int = 1) -> np.ndarray:
     lut = rng.integers(40, 256, size=(max_id + 1, 3), dtype=np.uint8)
     lut[0] = 0
     return lut[tracked]
+
+
+MAGENTA = (255, 0, 255)
+
+
+def mark_divisions(rgb: np.ndarray, result: TrackingResult) -> np.ndarray:
+    """Draw a 3 px magenta dot on dividing cells (in place, returns ``rgb``).
+
+    Lineage-mode divisions only: the mother on its last frame and both
+    daughters on their first frame, at the cell centroids.
+    """
+    frame_of = {fc.original_frame: t for t, fc in enumerate(result.frames)}
+    height, width = rgb.shape[1:3]
+    for e in result.events:
+        if e.kind != "divide" or e.track_id_c is None:
+            continue
+        spots = [(e.frame_from, e.label_from)]
+        daughter_tracks = {e.track_id_b, e.track_id_c}
+        t1 = frame_of.get(e.frame_to)
+        if t1 is not None:
+            spots += [
+                (e.frame_to, lab)
+                for lab, track in result.label_to_track[t1].items()
+                if track in daughter_tracks
+            ]
+        for frame, lab in spots:
+            t = frame_of.get(frame)
+            if t is None or lab is None:
+                continue
+            idx = result.frames[t].index_of(int(lab))
+            if idx is None:
+                continue
+            cy, cx = np.rint(result.frames[t].centroids[idx]).astype(int)
+            y0, y1 = max(0, cy - 1), min(height, cy + 2)
+            x0, x1 = max(0, cx - 1), min(width, cx + 2)
+            rgb[t, y0:y1, x0:x1] = MAGENTA
+    return rgb
+
+
+def lineage_rows(result: TrackingResult) -> list[dict]:
+    """Cell Tracking Challenge style lineage table, one row per track."""
+    start: dict[int, int] = {}
+    end: dict[int, int] = {}
+    for t, mapping in enumerate(result.label_to_track):
+        frame = result.frames[t].original_frame
+        for track in set(mapping.values()):
+            start.setdefault(track, frame)
+            end[track] = frame
+    dividing = set(result.parents.values())
+    return [
+        {
+            "track_id": track,
+            "start_frame": start[track],
+            "end_frame": end[track],
+            "parent_track_id": result.parents.get(track, 0),
+            "divides": track in dividing,
+            "flagged": track in result.flagged_divisions,
+        }
+        for track in sorted(start)
+    ]

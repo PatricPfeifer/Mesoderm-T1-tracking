@@ -65,6 +65,8 @@ for _p in (_HERE, _TRACK, _SCRIPTS):
 
 from celltrack.cells import build_adjacency  # noqa: E402
 from output_names import input_stem, tagged_path  # noqa: E402
+from calibrated_outputs import write_um_files  # noqa: E402
+from movie_calibration import calibration_for, save_tiff  # noqa: E402
 from t1_picker_ready import write_picker_ready  # noqa: E402
 from run_tm_fourway_vertices import (  # noqa: E402
     contact_length_map,
@@ -1254,8 +1256,12 @@ def run_t1_stack(
     post: int = 3,
     include_cellflow: bool = True,
     progress: Callable[[int, str], None] | None = None,
+    exclude_ids: set[int] | None = None,
 ) -> dict:
     """Detect T1s on a label stack. Same rules as the CLI.
+
+    ``exclude_ids``: track IDs left out of T1 detection (dividing mothers and
+    daughters from ``{stem}_lineage.csv``); see run_tm_t1.run_t1_stack.
 
     ``stack`` is T,Y,X. Blank frames are dropped. ``rgb``, when given, must
     match ``stack`` before that drop (T,Y,X,3). ``frame_base`` is added to
@@ -1264,6 +1270,7 @@ def run_t1_stack(
     ``include_cellflow`` (compat name) adds neighbour-swap extras that are
     not already the same quartet as a TM 4-way event.
     """
+    exclude_ids = {int(i) for i in (exclude_ids or ())}
     stack = np.asarray(stack)
     if stack.ndim != 3:
         raise ValueError(f"expected T,Y,X labels, got {stack.shape}")
@@ -1310,7 +1317,9 @@ def run_t1_stack(
         verts_3_by_t.append(verts_3)
         a = build_adjacency(stack[t], expand=expand)
         adj.append(a)
-        present.append({int(v) for v in np.unique(stack[t]) if v != 0})
+        present.append(
+            {int(v) for v in np.unique(stack[t]) if v != 0} - exclude_ids
+        )
         excluded = (
             border_plus_rings(stack[t], a, border_rings) if border_rings > 0 else set()
         )
@@ -1429,6 +1438,14 @@ def run_t1_stack(
             f"Completed T1s={sum(1 for e in events if e['kind']=='completed')} "
             f"(dropped {dropped} lacking ±{length_window} "
             f"measurable lengths; swap-ok={n_swap})",
+            flush=True,
+        )
+    if exclude_ids:
+        before = len(events)
+        events = [e for e in events if not (set(e["quartet"]) & exclude_ids)]
+        print(
+            f"Excluded dividing cells: {len(exclude_ids)} track IDs "
+            f"(dropped {before - len(events)} remaining events with them)",
             flush=True,
         )
     shown = filter_t1_events(events, "all")
@@ -1566,6 +1583,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip neighbour-swap extras (compat alias; TM 4-ways only).",
     )
+    p.add_argument(
+        "--lineage",
+        type=Path,
+        default=None,
+        help=(
+            "Lineage CSV from cellpose_track_divisions.py. Default: "
+            "{stem}_lineage.csv next to --labels, if present. Mothers and "
+            "daughters of every division are excluded from T1s."
+        ),
+    )
+    p.add_argument(
+        "--keep-dividing",
+        action="store_true",
+        help="Do not exclude dividing cells even if a lineage CSV exists.",
+    )
     return p.parse_args()
 
 
@@ -1595,6 +1627,9 @@ def main() -> None:
     out = args.output_dir.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     stem = input_stem(args.labels)
+    # Pixel size / frame interval: from the labels TIFF, else the raw movie.
+    cal = calibration_for(args.labels.expanduser(), stem=stem)
+    print(f"Calibration: {cal.as_dict() if cal else 'none found (pixel/frame output only)'}", flush=True)
 
     print(f"Loading {args.labels}", flush=True)
     full = load_labels(args.labels.expanduser())
@@ -1610,8 +1645,25 @@ def main() -> None:
             stack.shape[1],
             stack.shape[2],
         )
+    exclude_ids: set[int] = set()
+    if not args.keep_dividing:
+        from run_tm_t1 import load_division_ids
+
+        lineage = args.lineage or tagged_path(
+            args.labels.expanduser().parent, stem, "lineage.csv"
+        )
+        if lineage.expanduser().is_file():
+            exclude_ids = load_division_ids(lineage.expanduser())
+            print(
+                f"Lineage {lineage}: excluding {len(exclude_ids)} dividing "
+                "track IDs from T1 detection",
+                flush=True,
+            )
+        elif args.lineage is not None:
+            raise SystemExit(f"--lineage not found: {args.lineage}")
     result = run_t1_stack(
         stack,
+        exclude_ids=exclude_ids,
         rgb=rgb,
         frame_base=f0,
         expand=args.expand,
@@ -1839,13 +1891,15 @@ def main() -> None:
     print(f"Wrote {ev_path}", flush=True)
     print(f"Wrote {fw_path}", flush=True)
     print(f"Wrote {len_path}", flush=True)
+    # Second set of tables in µm and seconds, next to the pixel/frame ones.
+    write_um_files(out, stem, cal)
 
     print(
         "Writing t1_fourways.tif (grayscale + type-colored event pixels)...",
         flush=True,
     )
     dots_path = tagged_path(out, stem, "t1_fourways.tif")
-    tifffile.imwrite(dots_path, result["dots"])
+    save_tiff(dots_path, result["dots"], cal)
     print(f"Wrote {dots_path}", flush=True)
 
     if rgb is not None:
@@ -1854,7 +1908,7 @@ def main() -> None:
             flush=True,
         )
         ov_path = tagged_path(out, stem, "t1_overlay.tif")
-        tifffile.imwrite(ov_path, result["overlay"])
+        save_tiff(ov_path, result["overlay"], cal)
         print(f"Wrote {ov_path}", flush=True)
 
     write_picker_ready(
@@ -1868,6 +1922,7 @@ def main() -> None:
             else None
         ),
         fourways=dots_path,
+        calibration=cal.as_dict() if cal else None,
     )
     print("Done.", flush=True)
 

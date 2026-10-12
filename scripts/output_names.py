@@ -9,6 +9,12 @@ from pathlib import Path
 
 # Longest suffixes first so stripping is greedy and order-stable.
 STRIP_SUFFIXES = (
+    "_junction_contact_lengths_signed_um",
+    "_junction_contact_lengths_um",
+    "_junction_lengths_signed_um",
+    "_junction_lengths_um",
+    "_fourway_vertices_um",
+    "_t1_events_um",
     "_cp_masks_partial",
     "_selected_traces_length_signed",
     "_selected_traces_length",

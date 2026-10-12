@@ -12,6 +12,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -20,6 +21,9 @@ from cellpose import models
 from tifffile import imread, imwrite
 
 from outline_io import masks_to_outline_rgb
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from movie_calibration import read_calibration, save_tiff  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,6 +103,9 @@ def main() -> None:
     partial = outdir / f"{inp.stem}_cp_masks_partial.npy"
     prog = outdir / "progress.txt"
 
+    # Pixel size / frame interval of the raw movie, written into the outputs.
+    cal = read_calibration(inp)
+    print("calibration:", cal.as_dict() if cal else "none found", flush=True)
     print("loading", inp, flush=True)
     img = as_stack(np.asarray(imread(inp)))
     print("shape", img.shape, img.dtype, flush=True)
@@ -127,10 +134,10 @@ def main() -> None:
         masks=masks,
         on_frame=_checkpoint,
     )
-    imwrite(out, masks)
+    save_tiff(out, masks, cal)
     outlines_path = outdir / f"{inp.stem}_cp_outlines.tif"
     outlines = masks_to_outline_rgb(masks)
-    imwrite(outlines_path, outlines)
+    save_tiff(outlines_path, outlines, cal)
     partial.unlink(missing_ok=True)
     prog.unlink(missing_ok=True)
     print("wrote", out, "max_label", int(masks.max()), flush=True)

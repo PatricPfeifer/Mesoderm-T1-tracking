@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 from collections import deque
 from pathlib import Path
@@ -12,7 +13,8 @@ from pathlib import Path
 import napari
 import numpy as np
 from napari.layers import Image, Labels
-from qtpy.QtCore import QObject, QProcess, QProcessEnvironment, QSize, QThread, Signal
+from qtpy.QtCore import QObject, QProcess, QProcessEnvironment, QSize, QThread, Qt, Signal
+from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -26,6 +28,7 @@ from qtpy.QtWidgets import (
     QLineEdit,
     QPushButton,
     QRadioButton,
+    QShortcut,
     QSizePolicy,
     QSpinBox,
     QTabWidget,
@@ -94,11 +97,18 @@ class PatricWidget(QWidget):
         self._seg_dir: Path | None = None
         self._seg_out: Path | None = None
         self._seg_base_masks: np.ndarray | None = None
+        self._seg_base_outlines: np.ndarray | None = None
+        # TA handCorrection stack (255 = 1 px bond / background): the bonds
+        # shown in Outlines and used by the watershed.
+        self._seg_base_hand: np.ndarray | None = None
+        self._hand_msg = ""
         self._seg_stem: str = "segmentation"
         self._track_pick: tuple[int, int, int, int] | None = None
         self._track_undo: deque = deque(maxlen=20)
         self._pick_layer = None
         self._t1_result: dict | None = None
+        # Mother + daughter track IDs from the last division-aware tracking.
+        self._division_ids: set[int] = set()
         ensure_scripts()
 
         tabs = QTabWidget()
@@ -116,6 +126,7 @@ class PatricWidget(QWidget):
         self.viewer.layers.events.inserted.connect(self._refresh_layers)
         self.viewer.layers.events.removed.connect(self._refresh_layers)
         self.viewer.mouse_drag_callbacks.append(self._on_track_click)
+        self._install_bond_shortcuts()
         self._refresh_layers()
 
     def sizeHint(self) -> QSize:
@@ -127,7 +138,17 @@ class PatricWidget(QWidget):
     def _refresh_layers(self, *_args) -> None:
         images = [ly.name for ly in self.viewer.layers if isinstance(ly, Image)]
         labels = [ly.name for ly in self.viewer.layers if isinstance(ly, Labels)]
+        # Masks: Labels plus non-RGB Images (imported *_cp_masks.tif often opens as Image).
+        mask_candidates = list(labels)
+        for ly in self.viewer.layers:
+            if isinstance(ly, Image) and ly.name not in mask_candidates:
+                # Use layer metadata; np.asarray(ly.data) would load lazy data.
+                if not ly.rgb and ly.ndim in (2, 3):
+                    mask_candidates.append(ly.name)
+        outline_candidates = list(dict.fromkeys([*images, *labels]))
         self._fill(self.seg_image, images, keep=True)
+        self._fill(self.seg_masks, mask_candidates, keep=True)
+        self._fill(self.seg_outlines, outline_candidates, keep=True)
         self._fill(self.track_labels, labels, keep=True)
         self._fill(self.track_intensity, ["(none)", *images], keep=True)
         self._fill(self.t1_labels, labels, keep=True)
@@ -213,20 +234,49 @@ class PatricWidget(QWidget):
         self.seg_run.clicked.connect(self._run_segmentation)
         layout.addWidget(self.seg_run)
 
-        outline_box = QGroupBox("Outline correction")
+        outline_box = QGroupBox("Outline correction (Tissue Analyzer style)")
         outline_inner = QVBoxLayout()
         outline_inner.addWidget(
             QLabel(
-                "Edit the yellow Outlines layer (paint=1, erase=0). "
-                "Commit applies only your outline changes onto the base masks. "
-                "Save writes *_cp_masks.tif and *_cp_outlines.tif."
+                "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines. "
+                "Enter = Apply (local watershed, like TA). "
+                "Shift+Enter = Apply + drop small cells. "
+                "Ctrl+M = seeded local watershed (paint ≥2 seed dots first). "
+                "M = toggle Outlines. Ctrl+S / Save writes masks+outlines."
             )
         )
-        self.seg_commit = QPushButton("Commit outlines → masks")
-        self.seg_commit.clicked.connect(self._commit_outlines_to_masks)
+        import_form = QFormLayout()
+        self.seg_masks = QComboBox()
+        self.seg_outlines = QComboBox()
+        self.seg_min_area = QSpinBox()
+        self.seg_min_area.setRange(0, 100000)
+        self.seg_min_area.setValue(10)
+        import_form.addRow("Masks", self.seg_masks)
+        import_form.addRow("Outlines", self.seg_outlines)
+        import_form.addRow("Min cell area", self.seg_min_area)
+        self.seg_pad = QSpinBox()
+        self.seg_pad.setRange(8, 512)
+        self.seg_pad.setValue(128)
+        self.seg_pad.setToolTip(
+            "Context margin (px) around each edit for the local watershed. "
+            "TA uses 128; smaller is faster."
+        )
+        import_form.addRow("Watershed pad", self.seg_pad)
+        outline_inner.addLayout(import_form)
+        self.seg_start_edit = QPushButton("Start outline editing")
+        self.seg_start_edit.clicked.connect(self._start_outline_editing)
+        outline_inner.addWidget(self.seg_start_edit)
+        self.seg_commit = QPushButton("Apply bond edits (Enter)")
+        self.seg_commit.clicked.connect(lambda: self._apply_bond_edits(False))
+        self.seg_apply_shift = QPushButton("Apply + drop small cells (Shift+Enter)")
+        self.seg_apply_shift.clicked.connect(lambda: self._apply_bond_edits(True))
+        self.seg_seeded = QPushButton("Seeded local watershed (Ctrl+M)")
+        self.seg_seeded.clicked.connect(self._seeded_local_watershed)
         self.seg_save = QPushButton("Save segmentation")
         self.seg_save.clicked.connect(self._save_segmentation)
         outline_inner.addWidget(self.seg_commit)
+        outline_inner.addWidget(self.seg_apply_shift)
+        outline_inner.addWidget(self.seg_seeded)
         outline_inner.addWidget(self.seg_save)
         outline_box.setLayout(outline_inner)
         layout.addWidget(outline_box)
@@ -347,32 +397,128 @@ class PatricWidget(QWidget):
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
         self._seg_base_masks = masks.copy()
-        self._show_segmentation_layers(masks)
-        self.status.setText(
+        self._show_segmentation_layers(
+            masks,
             f"Segmentation done. max label {int(np.max(masks))}. "
-            "Edit yellow Outlines (label 1), Commit or Save, then track Segmentation."
+            "Paint/erase yellow Outlines, Enter to Apply, then Save / track.",
         )
         self._refresh_layers()
 
-    def _show_segmentation_layers(self, masks: np.ndarray) -> None:
-        from outline_io import masks_to_outline_labels
+    def _start_outline_editing(self) -> None:
+        masks_ly = self._layer(self.seg_masks.currentText())
+        outlines_ly = self._layer(self.seg_outlines.currentText())
+        if masks_ly is None:
+            self.status.setText("Select a Masks layer (imported *_cp_masks.tif).")
+            return
+        if outlines_ly is None:
+            self.status.setText("Select an Outlines layer (imported *_cp_outlines.tif).")
+            return
+        try:
+            from outline_io import rgb_or_labels_to_outline_labels
+        except Exception as exc:
+            self.status.setText(f"outline_io import failed: {exc}")
+            return
+        try:
+            masks = _as_tyx(np.asarray(masks_ly.data))
+        except ValueError as exc:
+            self.status.setText(f"Masks layer must be T,Y,X labels: {exc}")
+            return
+        try:
+            outlines = rgb_or_labels_to_outline_labels(np.asarray(outlines_ly.data))
+        except Exception as exc:
+            self.status.setText(f"Could not read outlines: {exc}")
+            return
+        if outlines.shape != masks.shape:
+            self.status.setText(
+                f"Outlines shape {outlines.shape} != masks shape {masks.shape}."
+            )
+            return
+        self._seg_stem = self._safe_stem(masks_ly.name)
+        # Prefer raw image name for save stem when selected.
+        img_ly = self._layer(self.seg_image.currentText())
+        if img_ly is not None:
+            self._seg_stem = self._safe_stem(img_ly.name)
+        self._seg_base_masks = masks.copy()
+        # Bonds are rebuilt as 1 px TA bonds from the masks; the imported
+        # outlines are only shape-checked.
+        self._show_segmentation_layers(
+            masks,
+            f"Outline editing ready (max label {int(masks.max())}). "
+            "Paint/erase bonds, Enter to Apply (TA watershed), then Save.",
+        )
+        self._refresh_layers()
 
+    def _install_bond_shortcuts(self) -> None:
+        # ApplicationShortcut so Enter works while the canvas has focus (TA-like).
+        sc_enter = QShortcut(QKeySequence(Qt.Key_Return), self)
+        sc_enter.setContext(Qt.ApplicationShortcut)
+        sc_enter.activated.connect(lambda: self._apply_bond_edits(False))
+        sc_pad = QShortcut(QKeySequence(Qt.Key_Enter), self)
+        sc_pad.setContext(Qt.ApplicationShortcut)
+        sc_pad.activated.connect(lambda: self._apply_bond_edits(False))
+        sc_shift = QShortcut(QKeySequence("Shift+Return"), self)
+        sc_shift.setContext(Qt.ApplicationShortcut)
+        sc_shift.activated.connect(lambda: self._apply_bond_edits(True))
+        sc_shift2 = QShortcut(QKeySequence("Shift+Enter"), self)
+        sc_shift2.setContext(Qt.ApplicationShortcut)
+        sc_shift2.activated.connect(lambda: self._apply_bond_edits(True))
+        sc_m = QShortcut(QKeySequence("Ctrl+M"), self)
+        sc_m.setContext(Qt.ApplicationShortcut)
+        sc_m.activated.connect(self._seeded_local_watershed)
+        sc_toggle = QShortcut(QKeySequence(Qt.Key_M), self)
+        sc_toggle.setContext(Qt.ApplicationShortcut)
+        sc_toggle.activated.connect(self._toggle_outlines_visibility)
+        sc_save = QShortcut(QKeySequence("Ctrl+S"), self)
+        sc_save.setContext(Qt.ApplicationShortcut)
+        sc_save.activated.connect(self._save_segmentation)
+        self._bond_shortcuts = (sc_enter, sc_pad, sc_shift, sc_shift2, sc_m, sc_toggle, sc_save)
+
+    def _toggle_outlines_visibility(self) -> None:
+        ol = self._layer("Outlines")
+        if isinstance(ol, Labels):
+            ol.visible = not ol.visible
+            self.status.setText(
+                f"Outlines {'shown' if ol.visible else 'hidden'} (M)."
+            )
+
+    def _show_segmentation_layers(self, masks: np.ndarray, message: str) -> None:
+        """Show masks, then build 1 px TA bonds in the background for Outlines."""
         masks = np.asarray(masks)
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
-        outlines = masks_to_outline_labels(masks)
+        if self._job_running():
+            self.status.setText("A job is already running.")
+            return
+        self._seg_base_hand = None
+        self._seg_base_outlines = None
 
         if self.correction is not None:
             self._data_manager.initialize_stack(int(masks.shape[0]))
             self._data_manager.segmentation_data = masks
             self.correction.set_masks_layer(masks)
 
-        self._replace_labels("Segmentation", masks)
+        # Own copy: edits are written in place and must not touch the input layer.
+        self._replace_labels("Segmentation", masks.copy())
         seg = self._layer("Segmentation")
         if isinstance(seg, Labels):
             seg.opacity = 0.25
             seg.visible = False
 
+        self._hand_msg = message
+
+        def work(progress):
+            from outline_io import hand_stack_to_outline
+            from ta_bond_edit import thin_hand_stack
+
+            hand = thin_hand_stack(masks, progress)
+            return hand, hand_stack_to_outline(hand)
+
+        self._start(work, self._hand_ready)
+
+    def _hand_ready(self, result: tuple) -> None:
+        hand, outlines = result
+        self._seg_base_hand = hand
+        self._seg_base_outlines = outlines.copy()
         self._replace_labels("Outlines", outlines)
         ol = self._layer("Outlines")
         if isinstance(ol, Labels):
@@ -393,54 +539,179 @@ class PatricWidget(QWidget):
                 self.viewer.layers.selection.clear()
                 self.viewer.layers.selection.add(ol)
                 ol.mode = "paint"
-                ol.brush_size = 2
+                ol.brush_size = 3
             except Exception:
                 pass
+        self.status.setText(self._hand_msg)
 
-    def _commit_outlines_to_masks(self) -> None:
+    def _bonds_ready(self) -> bool:
         if self._seg_base_masks is None:
-            self.status.setText("Run segmentation first (no base masks).")
-            return
+            self.status.setText(
+                "No base masks — run segmentation or Start outline editing first."
+            )
+            return False
+        if self._seg_base_hand is None or self._seg_base_outlines is None:
+            self.status.setText("Bonds are still being prepared — wait for 100%.")
+            return False
+        return True
+
+    def _apply_bond_edits(self, drop_small: bool) -> bool:
+        """Apply painted bond strokes. Returns True if any frame changed."""
+        if not self._bonds_ready():
+            return False
         ol = self._layer("Outlines")
         if not isinstance(ol, Labels):
             self.status.setText("Missing Outlines layer.")
-            return
+            return False
+
         try:
-            from outline_io import (
-                outline_labels_to_rgb,
-                outlines_rgb_to_masks_local,
-                masks_to_outline_labels,
+            from ta_bond_edit import apply_bond_strokes, changed_frames
+        except Exception as exc:
+            self.status.setText(f"TA bond edit import failed: {exc}")
+            return False
+
+        t0 = time.perf_counter()
+        edited = np.asarray(ol.data)
+        if edited.ndim == 2:
+            edited = edited[np.newaxis, ...]
+        frames = changed_frames(self._seg_base_outlines, edited)
+        min_area = int(self.seg_min_area.value()) if drop_small else 0
+        if min_area and not frames:
+            # Drop small cells on the frame being viewed, not the whole movie.
+            frames = [self._current_frame(self._seg_base_masks.shape[0])]
+        if not frames:
+            self.status.setText("No bond edits to apply.")
+            return False
+        try:
+            updated, rois = apply_bond_strokes(
+                self._seg_base_masks,
+                self._seg_base_hand,
+                self._seg_base_outlines,
+                edited,
+                frames=frames,
+                min_seed_area=min_area,
+                pad=int(self.seg_pad.value()),
             )
         except Exception as exc:
-            self.status.setText(f"outline_io import failed: {exc}")
-            return
-        edited_rgb = outline_labels_to_rgb(np.asarray(ol.data))
-        updated = outlines_rgb_to_masks_local(
-            self._seg_base_masks, edited_rgb, dilate=3
+            self.status.setText(f"Apply bond edits failed: {exc}")
+            print(traceback.format_exc(), flush=True)
+            return False
+
+        self._commit_seg(updated, frames, rois)
+        if not rois:
+            self.status.setText(
+                "No cells changed. A stroke outside the tissue must enclose "
+                "an area (closed loop, or closed against the tissue edge)."
+            )
+            return False
+        extra = f", min_area={min_area}" if drop_small else ""
+        self.status.setText(
+            f"Applied bond edits on {len(frames)} frame(s) (TA wshed{extra}) "
+            f"in {time.perf_counter() - t0:.2f}s. max label "
+            f"{int(self._seg_base_masks.max())}."
         )
-        self._seg_base_masks = np.asarray(updated).copy()
-        self._replace_labels("Segmentation", self._seg_base_masks)
-        refreshed = masks_to_outline_labels(self._seg_base_masks)
-        self._replace_labels("Outlines", refreshed)
+        return True
+
+    def _current_frame(self, n_frames: int) -> int:
+        frame = int(round(float(self.viewer.dims.point[0]))) if n_frames > 1 else 0
+        return int(np.clip(frame, 0, n_frames - 1))
+
+    def _commit_seg(self, updated: np.ndarray, frames: list[int], rois: list) -> None:
+        """Push changed frames into the Segmentation / Outlines layers in place."""
+        from outline_io import update_outline_roi
+
+        updated = np.asarray(updated)
+        if updated.ndim == 2:
+            updated = updated[np.newaxis, ...]
+        reallocated = updated is not self._seg_base_masks
+        self._seg_base_masks = updated
+        outlines = self._seg_base_outlines
+        for t, ys, xs in rois:
+            update_outline_roi(outlines[t], self._seg_base_hand[t], ys, xs)
+
+        seg = self._layer("Segmentation")
+        ol = self._layer("Outlines")
+        if reallocated or not isinstance(seg, Labels):
+            # Labels outgrew the dtype: fall back to a full layer replace.
+            self._replace_labels("Segmentation", updated.copy())
+        else:
+            seg_data = self._writable_stack(seg)
+            for t in frames:
+                seg_data[t] = updated[t]
+            seg.refresh()
+        if isinstance(ol, Labels):
+            ol_data = self._writable_stack(ol)
+            # Whole frame: also resets stray painted pixels outside any ROI.
+            for t in frames:
+                ol_data[t] = outlines[t]
+            ol.refresh()
+        else:
+            self._replace_labels("Outlines", outlines.copy())
         if self.correction is not None:
             self._data_manager.segmentation_data = self._seg_base_masks
             try:
                 self.correction.set_masks_layer(self._seg_base_masks)
             except Exception:
                 pass
+
+    def _seeded_local_watershed(self) -> None:
+        if not self._bonds_ready():
+            return
+        ol = self._layer("Outlines")
+        img_ly = self._layer(self.seg_image.currentText())
+        if not isinstance(ol, Labels):
+            self.status.setText("Missing Outlines layer.")
+            return
+        if img_ly is None:
+            self.status.setText("Select an Image layer for seeded watershed.")
+            return
+        try:
+            from ta_bond_edit import changed_frames, seeded_local_wshed
+        except Exception as exc:
+            self.status.setText(f"TA bond edit import failed: {exc}")
+            return
+        t0 = time.perf_counter()
+        try:
+            image = _as_tyx(np.asarray(img_ly.data))
+            seeds = np.asarray(ol.data)
+            if seeds.ndim == 2:
+                seeds = seeds[np.newaxis, ...]
+            frames = changed_frames(self._seg_base_outlines, seeds)
+            if not frames:
+                self.status.setText("Paint seed dots first (Ctrl+M).")
+                return
+            updated, rois = seeded_local_wshed(
+                image,
+                self._seg_base_masks,
+                self._seg_base_hand,
+                seeds,
+                self._seg_base_outlines,
+                frames=frames,
+            )
+        except Exception as exc:
+            self.status.setText(f"Seeded watershed failed: {exc}")
+            print(traceback.format_exc(), flush=True)
+            return
+
+        self._commit_seg(updated, frames, rois)
         self.status.setText(
-            f"Committed outline edits into masks. max label "
+            f"Seeded local watershed done on {len(frames)} frame(s) in "
+            f"{time.perf_counter() - t0:.2f}s. max label "
             f"{int(self._seg_base_masks.max())}."
         )
-        self._refresh_layers()
 
     def _save_segmentation(self) -> None:
         if self._seg_base_masks is None and self._layer("Segmentation") is None:
-            self.status.setText("Nothing to save — run segmentation first.")
+            self.status.setText(
+                "Nothing to save — run segmentation or Start outline editing first."
+            )
             return
-        # Auto-commit outline edits before writing.
-        if isinstance(self._layer("Outlines"), Labels) and self._seg_base_masks is not None:
-            self._commit_outlines_to_masks()
+        # Auto-apply pending bond edits before writing (no-op when none).
+        if (
+            isinstance(self._layer("Outlines"), Labels)
+            and self._seg_base_hand is not None
+        ):
+            self._apply_bond_edits(False)
         seg = self._layer("Segmentation")
         if not isinstance(seg, Labels):
             self.status.setText("Missing Segmentation labels layer.")
@@ -449,8 +720,8 @@ class PatricWidget(QWidget):
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
         try:
-            from outline_io import masks_to_outline_rgb
-            from tifffile import imwrite
+            from movie_calibration import save_tiff
+            from outline_io import masks_to_outline_rgb, outline_labels_to_rgb
         except Exception as exc:
             self.status.setText(f"Save imports failed: {exc}")
             return
@@ -459,10 +730,35 @@ class PatricWidget(QWidget):
         outdir.mkdir(parents=True, exist_ok=True)
         masks_path = outdir / f"{stem}_cp_masks.tif"
         outlines_path = outdir / f"{stem}_cp_outlines.tif"
-        imwrite(masks_path, masks.astype(np.uint16, copy=False))
-        imwrite(outlines_path, masks_to_outline_rgb(masks))
+        # Keep the raw movie's pixel size / frame interval in the saved files.
+        cal = self._calibration(
+            self._layer(self.seg_image.currentText()),
+            self._layer(self.seg_masks.currentText()),
+            stem=self._seg_stem,
+        )
+        save_tiff(masks_path, masks.astype(np.uint16, copy=False), cal)
+        bonds = self._seg_base_outlines
+        if self._seg_base_hand is not None and bonds is not None and bonds.shape == masks.shape:
+            save_tiff(outlines_path, outline_labels_to_rgb(bonds), cal)  # 1 px TA bonds
+        else:
+            save_tiff(outlines_path, masks_to_outline_rgb(masks), cal)
         self._seg_base_masks = masks.copy()
         self.status.setText(f"Saved {masks_path.name} and {outlines_path.name} → {outdir}")
+
+    def _calibration(self, *layers, stem: str | None = None):
+        """Pixel size / frame interval from the layers' source files, else
+        from ``input/<stem>.tif``; ``None`` if neither has it."""
+        try:
+            from movie_calibration import calibration_for
+
+            paths = []
+            for ly in layers:
+                path = getattr(getattr(ly, "source", None), "path", None)
+                if path:
+                    paths.append(path)
+            return calibration_for(*paths, stem=stem)
+        except Exception:
+            return None
 
     @staticmethod
     def _safe_stem(name: str) -> str:
@@ -496,6 +792,14 @@ class PatricWidget(QWidget):
         form.addRow("Appear cost", self.track_appear)
         form.addRow("Disappear cost", self.track_disappear)
         form.addRow("Division penalty", self.track_division)
+        self.track_divisions = QCheckBox("Divisions: new daughter IDs")
+        self.track_divisions.setToolTip(
+            "Dividing cells end their track; both daughters get new IDs "
+            "(magenta dots in Tracked RGB). The T1 tab can then exclude "
+            "mothers and daughters."
+        )
+        self.track_divisions.toggled.connect(self._track_divisions_toggled)
+        form.addRow("", self.track_divisions)
         form.addRow("Max gap", self.track_gap)
         form.addRow("Max distance", self.track_dist)
         form.addRow("Save to", self.track_out)
@@ -766,7 +1070,9 @@ class PatricWidget(QWidget):
             intensity = _as_tyx(np.asarray(intensity_layer.data)).copy()
         out_text = self.track_out.text().strip()
         stem = labels.name
+        cal = self._calibration(intensity_layer, labels)
         kwargs = dict(
+            calibration=cal,
             expand=int(self.track_expand.value()),
             pyramidal_depth=int(self.track_depth.value()),
             w_topo=float(self.track_w.value()),
@@ -777,6 +1083,7 @@ class PatricWidget(QWidget):
             max_gap=int(self.track_gap.value()),
             gap_close=int(self.track_gap.value()) > 0,
             max_distance=float(self.track_dist.value()),
+            division_mode="lineage" if self.track_divisions.isChecked() else "legacy",
         )
 
         def work(progress):
@@ -795,13 +1102,30 @@ class PatricWidget(QWidget):
 
         self._start(work, self._tracking_done)
 
+    def _track_divisions_toggled(self, on: bool) -> None:
+        # Lineage mode uses a different penalty scale (see cellpose_track_divisions).
+        value = self.track_division.value()
+        if on and abs(value - 0.8) < 1e-9:
+            self.track_division.setValue(1.0)
+        elif not on and abs(value - 1.0) < 1e-9:
+            self.track_division.setValue(0.8)
+
     def _tracking_done(self, result: dict) -> None:
         self._replace_labels("Tracked", result["tracked"])
         if result.get("rgb") is not None:
             self._replace_image("Tracked RGB", result["rgb"])
         qc = result.get("qc") or {}
+        track_result = result["result"]
+        parents = getattr(track_result, "parents", {}) or {}
+        self._division_ids = set(parents) | set(parents.values())
+        extra = ""
+        if getattr(track_result, "division_mode", "legacy") == "lineage":
+            extra = (
+                f" divisions={qc.get('n_divide', 0)} "
+                f"(flagged {qc.get('n_divide_flagged', 0)})"
+            )
         self.status.setText(
-            f"Tracking done. tracks={qc.get('n_tracks', result['result'].n_tracks)}"
+            f"Tracking done. tracks={qc.get('n_tracks', track_result.n_tracks)}{extra}"
         )
         self._refresh_layers()
 
@@ -832,6 +1156,14 @@ class PatricWidget(QWidget):
         form.addRow("T1 filter", self.t1_filter)
         form.addRow("Overlay pre", self.t1_pre)
         form.addRow("Overlay post", self.t1_post)
+        self.t1_exclude_div = QCheckBox("Exclude dividing cells")
+        self.t1_exclude_div.setChecked(True)
+        self.t1_exclude_div.setToolTip(
+            "Leave mothers and daughters out of T1 detection. Uses the "
+            "divisions from the last Tracking run (Divisions on) on the "
+            "Tracked layer; manual track edits do not update it."
+        )
+        form.addRow("", self.t1_exclude_div)
         layout.addLayout(form)
         row = QHBoxLayout()
         self.t1_run = QPushButton("Run T1")
@@ -860,6 +1192,12 @@ class PatricWidget(QWidget):
             post=int(self.t1_post.value()),
             length_window=0,
         )
+        if (
+            self.t1_exclude_div.isChecked()
+            and self._division_ids
+            and labels.name == "Tracked"
+        ):
+            kwargs["exclude_ids"] = set(self._division_ids)
 
         def work(progress):
             from run_tm_t1 import run_t1_stack
