@@ -20,4 +20,4 @@ napari-patric = "napari_patric:napari.yaml"
 packages = ["napari_patric"]
 
 [tool.setuptools.package-data]
-napari_patric = ["napari.yaml"]
+napari_patric = ["napari.yaml", "feature_help/*"]
