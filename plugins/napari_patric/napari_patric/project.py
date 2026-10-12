@@ -19,6 +19,25 @@ from pathlib import Path
 
 STEPS = ("segmentation", "tracking", "t1", "cell_props")
 
+# Naming contract with the pipeline scripts (scripts/, HPC runs). Anything a script
+# writes must be matched here, or "Load results" will not see it (tests/plugin/test_project.py
+# checks this against scripts/output_names.py). Longest suffix first.
+SEG_MASK_SUFFIXES = ("_cp_masks.tif", "_cf_masks.tif")
+TRACK_LABEL_SUFFIXES = ("_cf_tracked_labels.tif", "_tracked_labels.tif")
+T1_PATTERN = "*.csv"
+# Folder names a step may live in: the plugin's own first, then HPC/script layouts.
+STEP_FOLDERS = {
+    "segmentation": ("segmentation", "cellflow_seg", "cellpose_seg"),
+    "tracking": ("tracking", "cellpose_track", "cellflow_track"),
+    "t1": ("t1",),
+}
+# Per-movie folders written by scripts/output_names.step_dir (``<stem>_cp_seg`` ...).
+LEGACY_FOLDER_GLOBS = {
+    "segmentation": ("*_cp_seg", "*_cf_seg"),
+    "tracking": ("*_cp_track", "*_cf_track"),
+}
+MOVIE_EXTENSIONS = (".ome.tif", ".ome.tiff", ".tif", ".tiff", ".czi", ".nd2", ".lif")
+
 
 def movie_stem(path: str | Path) -> str:
     """File name without its image extension (handles .ome.tif / .tiff)."""
@@ -38,10 +57,29 @@ def results_dir_for(movie_path: str | Path) -> Path:
 def find_results_root(path: str | Path) -> Path:
     """The results folder itself, or the single ``*_results`` folder inside ``path``."""
     p = Path(path)
-    if (p / "settings.json").is_file() or any((p / s).is_dir() for s in STEPS):
+    if (
+        (p / "settings.json").is_file()
+        or any((p / s).is_dir() for s in STEPS)
+        or any(_step_dirs(p, step) for step in STEP_FOLDERS)
+    ):
         return p
     kids = [k for k in p.glob("*_results") if k.is_dir()]
     return kids[0] if len(kids) == 1 else p
+
+
+def _step_dirs(root: Path, step: str) -> list[Path]:
+    """Existing folders of ``step`` under ``root`` (own layout first, then script layouts)."""
+    dirs = [root / name for name in STEP_FOLDERS.get(step, (step,)) if (root / name).is_dir()]
+    for pat in LEGACY_FOLDER_GLOBS.get(step, ()):
+        dirs += sorted(k for k in root.glob(pat) if k.is_dir())
+    return dirs
+
+
+def _strip_suffix(name: str, suffixes) -> str | None:
+    for suf in sorted(suffixes, key=len, reverse=True):
+        if name.endswith(suf):
+            return name[: -len(suf)]
+    return None
 
 
 class WorkingFolder:
@@ -105,12 +143,33 @@ class WorkingFolder:
         if self.root is None or not self.root.is_dir():
             return out
         patterns = {
-            "segmentation": "*_cp_masks.tif",
-            "tracking": "*_tracked_labels.tif",
-            "t1": "*.csv",
+            "segmentation": tuple(f"*{s}" for s in SEG_MASK_SUFFIXES),
+            "tracking": tuple(f"*{s}" for s in TRACK_LABEL_SUFFIXES),
+            "t1": (T1_PATTERN,),
         }
-        for step, pat in patterns.items():
-            files = sorted((self.root / step).glob(pat)) if (self.root / step).is_dir() else []
+        for step, pats in patterns.items():
+            files = sorted(
+                {f for d in _step_dirs(self.root, step) for pat in pats for f in d.glob(pat)}
+            )
             if files:
                 out[step] = files
         return out
+
+    def guess_movie(self) -> Path | None:
+        """The movie behind saved results when ``settings.json`` does not name it.
+
+        Derived from a mask / tracked-label file name; looked up in the results
+        folder and the folder above it.
+        """
+        found = self.found()
+        for step, suffixes in (("segmentation", SEG_MASK_SUFFIXES), ("tracking", TRACK_LABEL_SUFFIXES)):
+            for f in found.get(step, []):
+                stem = _strip_suffix(f.name, suffixes)
+                if not stem:
+                    continue
+                for folder in (self.root, self.root.parent):
+                    for ext in MOVIE_EXTENSIONS:
+                        cand = folder / f"{stem}{ext}"
+                        if cand.is_file():
+                            return cand
+        return None

@@ -45,3 +45,59 @@ def test_find_results_root_accepts_movie_folder_or_results_folder(tmp_path):
     assert find_results_root(tmp_path) == res          # the movie's folder
     (tmp_path / "other_results").mkdir()
     assert find_results_root(tmp_path) == tmp_path     # ambiguous: leave as chosen
+
+
+# ---- naming contract with the pipeline scripts / HPC layouts -----------------
+def _touch(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    return path
+
+
+def test_found_reads_hpc_cellflow_layout_and_guesses_movie(tmp_path):
+    """Egg1: movie next to a ``cellflow_seg`` folder holding ``*_cf_masks.tif``, no settings.json."""
+    movie = _touch(tmp_path / "egg1_pos3.tif")
+    mask = _touch(tmp_path / "cellflow_seg" / "egg1_pos3_cf_masks.tif")
+    _touch(tmp_path / "cellflow_seg" / "egg1_pos3_cf_seg_qc.json")
+    root = find_results_root(tmp_path)
+    assert root == tmp_path
+    wf = WorkingFolder()
+    wf.set_manual(root)
+    assert wf.found() == {"segmentation": [mask]}
+    assert wf.guess_movie() == movie
+
+
+def test_found_reads_cf_tracked_labels_and_legacy_per_movie_folders(tmp_path):
+    seg = _touch(tmp_path / "m_cp_seg" / "m_cp_masks.tif")
+    trk = _touch(tmp_path / "tracking" / "m_cf_tracked_labels.tif")
+    wf = WorkingFolder()
+    wf.set_manual(tmp_path)
+    assert wf.found() == {"segmentation": [seg], "tracking": [trk]}
+
+
+def test_guess_movie_in_parent_of_results_folder(tmp_path):
+    movie = _touch(tmp_path / "m.ome.tif")
+    _touch(tmp_path / "m_results" / "segmentation" / "m_cp_masks.tif")
+    wf = WorkingFolder()
+    wf.set_manual(tmp_path / "m_results")
+    assert wf.guess_movie() == movie
+
+
+def test_plugin_matches_every_mask_and_track_tag_the_scripts_know():
+    """Add a new output tag to scripts/output_names.py -> add it to project.py too."""
+    import sys
+    from pathlib import Path
+
+    from napari_patric import project
+
+    scripts = Path(__file__).resolve().parents[2] / "scripts"
+    sys.path.insert(0, str(scripts))
+    try:
+        import output_names
+    finally:
+        sys.path.remove(str(scripts))
+    for suffix in project.SEG_MASK_SUFFIXES + project.TRACK_LABEL_SUFFIXES:
+        assert suffix[: -len(".tif")] in output_names.STRIP_SUFFIXES, suffix
+    scripted = [t for t in output_names.STRIP_SUFFIXES if t.endswith(("_masks", "_tracked_labels"))]
+    for tag in scripted:
+        assert f"{tag}.tif" in project.SEG_MASK_SUFFIXES + project.TRACK_LABEL_SUFFIXES, tag
