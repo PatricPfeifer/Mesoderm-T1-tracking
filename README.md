@@ -68,6 +68,10 @@ Results are saved automatically in a folder **next to the movie**, called
 `<movie name>_results`. To keep the repository clean, first copy the movie somewhere else,
 for example to your Desktop, and open that copy.
 
+A short walkthrough of the steps below (load, segment, track, select cells, colour by feature):
+
+![TissueKit walkthrough](docs/images/tissuekit_walkthrough.gif)
+
 1. **Open the movie** (File > Open File(s)...), then **Plugins > TissueKit**.
 2. **Segmentation** tab: *Image* = `movie_cut`, press **Run segmentation**.
    The status line at the bottom shows progress. When done, the layers `Segmentation` and

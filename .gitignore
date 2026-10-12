@@ -14,6 +14,11 @@
 !Future-improvement-ideas.md
 !feature-help-*.md
 !pytest.ini
+!docs/
+docs/*
+!docs/images/
+docs/images/*
+!docs/images/tissuekit_walkthrough.gif
 !tests/
 !tests/**
 __pycache__/
