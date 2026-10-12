@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from contextlib import contextmanager
 from timeit import default_timer as timer
 from typing import Any
 
@@ -26,6 +27,16 @@ from .tracks import (
 
 from ..output_names import input_stem, tagged_path  # noqa: E402
 from ..movie_calibration import Calibration, calibration_for, save_tiff  # noqa: E402
+
+
+@contextmanager
+def _stage(timings: dict[str, float], name: str):
+    """Add the wall time of the ``with`` body to ``timings[name]``."""
+    t0 = timer()
+    try:
+        yield
+    finally:
+        timings[name] = round(timings.get(name, 0.0) + timer() - t0, 3)
 
 
 def movie_from_arrays(
@@ -95,6 +106,7 @@ def track_loaded(
     division_refractory: int = 10,
     min_daughter_frames: int = 3,
     calibration: Calibration | None = None,
+    n_jobs: int = 1,
 ) -> dict[str, Any]:
     """Track a loaded movie. Writes files when ``output_dir`` is set.
 
@@ -110,49 +122,27 @@ def track_loaded(
         output_dir.mkdir(parents=True, exist_ok=True)
 
     start = timer()
+    timings: dict[str, float] = {}
     if verbose:
         print("Building cell tables...", flush=True)
-    frames = build_all_frames(
-        movie.masks, movie.frame_indices, expand=expand
-    )
+    with _stage(timings, "cell_tables"):
+        frames = build_all_frames(
+            movie.masks, movie.frame_indices, expand=expand, n_jobs=n_jobs
+        )
 
     if verbose:
         print("Estimating motion...", flush=True)
-    reg = registration_images(movie.masks, movie.intensity)
-    fields = estimate_all_motion(reg, depth=pyramidal_depth)
+    with _stage(timings, "motion"):
+        reg = registration_images(movie.masks, movie.intensity)
+        fields = estimate_all_motion(reg, depth=pyramidal_depth, n_jobs=n_jobs)
 
     cost_kwargs = {"max_distance": max_distance}
     if verbose:
         print("Tracking (forward)...", flush=True)
-    result = track_movie(
-        frames,
-        fields,
-        w_topo=w_topo,
-        max_iter=max_iter,
-        appear_cost=appear_cost,
-        disappear_cost=disappear_cost,
-        division_penalty=division_penalty,
-        max_gap=max_gap,
-        gap_close=gap_close,
-        cost_kwargs=cost_kwargs,
-        verbose=verbose,
-        division_mode=division_mode,
-        division_refractory=division_refractory,
-        min_daughter_frames=min_daughter_frames,
-    )
-
-    backward_result = None
-    if run_backward:
-        if verbose:
-            print("Tracking (backward)...", flush=True)
-        rev_masks = movie.masks[::-1]
-        rev_idx = movie.frame_indices[::-1]
-        rev_frames = build_all_frames(rev_masks, rev_idx, expand=expand)
-        rev_reg = reg[::-1]
-        rev_fields = estimate_all_motion(rev_reg, depth=pyramidal_depth)
-        backward_result = track_movie(
-            rev_frames,
-            rev_fields,
+    with _stage(timings, "tracking_forward"):
+        result = track_movie(
+            frames,
+            fields,
             w_topo=w_topo,
             max_iter=max_iter,
             appear_cost=appear_cost,
@@ -165,17 +155,51 @@ def track_loaded(
             division_mode=division_mode,
             division_refractory=division_refractory,
             min_daughter_frames=min_daughter_frames,
+            timings=timings,
         )
 
-    tracked = render_tracked_labels(
-        movie.masks, result.frames, result.label_to_track
-    )
-    rgb = render_tracked_rgb(tracked) if write_rgb else None
-    if rgb is not None and division_mode == "lineage":
-        mark_divisions(rgb, result)
+    backward_result = None
+    if run_backward:
+        if verbose:
+            print("Tracking (backward)...", flush=True)
+        with _stage(timings, "tracking_backward"):
+            rev_masks = movie.masks[::-1]
+            rev_idx = movie.frame_indices[::-1]
+            rev_frames = build_all_frames(
+                rev_masks, rev_idx, expand=expand, n_jobs=n_jobs
+            )
+            rev_reg = reg[::-1]
+            rev_fields = estimate_all_motion(
+                rev_reg, depth=pyramidal_depth, n_jobs=n_jobs
+            )
+            backward_result = track_movie(
+                rev_frames,
+                rev_fields,
+                w_topo=w_topo,
+                max_iter=max_iter,
+                appear_cost=appear_cost,
+                disappear_cost=disappear_cost,
+                division_penalty=division_penalty,
+                max_gap=max_gap,
+                gap_close=gap_close,
+                cost_kwargs=cost_kwargs,
+                verbose=verbose,
+                division_mode=division_mode,
+                division_refractory=division_refractory,
+                min_daughter_frames=min_daughter_frames,
+            )
+
+    with _stage(timings, "render"):
+        tracked = render_tracked_labels(
+            movie.masks, result.frames, result.label_to_track
+        )
+        rgb = render_tracked_rgb(tracked) if write_rgb else None
+        if rgb is not None and division_mode == "lineage":
+            mark_divisions(rgb, result)
     labels_out = None
     rgb_out = None
     if output_dir is not None:
+        write_timer = timer()
         labels_out = tagged_path(output_dir, stem, "tracked_labels.tif")
         save_tiff(labels_out, tracked, cal)
         if rgb is not None:
@@ -184,9 +208,11 @@ def track_loaded(
             if verbose:
                 print(f"RGB tracks: {rgb_out}", flush=True)
         _write_tables(result, output_dir, stem)
+        timings["write"] = round(timer() - write_timer, 3)
 
     qc = compute_qc(result, backward=backward_result)
     qc["elapsed_s"] = round(timer() - start, 2)
+    qc["timings_s"] = timings
     qc["masks"] = str(Path(masks_path).resolve()) if masks_path else None
     qc["intensity"] = (
         str(Path(intensity_path).resolve()) if intensity_path else None
@@ -201,6 +227,11 @@ def track_loaded(
             f"Done in {qc['elapsed_s']}s. tracks={result.n_tracks} "
             f"full_length={qc['full_length_tracks']} "
             f"mean_topo={qc['mean_topology_score']:.3f}",
+            flush=True,
+        )
+        print(
+            "Timings: "
+            + ", ".join(f"{k}={v:.1f}s" for k, v in timings.items()),
             flush=True,
         )
         if labels_out is not None:
@@ -242,6 +273,7 @@ def track_arrays(
     division_refractory: int = 10,
     min_daughter_frames: int = 3,
     calibration: Calibration | None = None,
+    n_jobs: int = 1,
 ) -> dict[str, Any]:
     """Track in-memory label (and optional intensity) stacks."""
     movie = movie_from_arrays(masks, intensity, drop_blank=True)
@@ -266,6 +298,7 @@ def track_arrays(
         division_refractory=division_refractory,
         min_daughter_frames=min_daughter_frames,
         calibration=calibration,
+        n_jobs=n_jobs,
     )
 
 
@@ -291,6 +324,7 @@ def run_tracking(
     division_mode: str = "legacy",
     division_refractory: int = 10,
     min_daughter_frames: int = 3,
+    n_jobs: int = 1,
 ) -> dict[str, Any]:
     """Track a Cellpose movie and write all outputs under ``output_dir``."""
     movie = load_movie(
@@ -322,6 +356,7 @@ def run_tracking(
         division_mode=division_mode,
         division_refractory=division_refractory,
         min_daughter_frames=min_daughter_frames,
+        n_jobs=n_jobs,
     )
 
 

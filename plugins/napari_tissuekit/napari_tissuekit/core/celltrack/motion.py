@@ -8,6 +8,8 @@ import numpy as np
 from scipy.ndimage import median_filter
 from skimage.registration import phase_cross_correlation
 
+from .parallel import pmap
+
 
 def _phase_shift(ref: np.ndarray, mov: np.ndarray) -> tuple[float, float]:
     """Sub-pixel translation from ref to mov."""
@@ -186,18 +188,25 @@ def estimate_all_motion(
     depth: int = 3,
     block_size: int = 256,
     median_size: int = 3,
+    n_jobs: int = 1,
 ) -> list[MotionField]:
-    """Motion fields for consecutive pairs: fields[t] maps frame t -> t+1."""
-    fields: list[MotionField] = []
-    for t in range(reg_images.shape[0] - 1):
-        field = estimate_motion(
+    """Motion fields for consecutive pairs: fields[t] maps frame t -> t+1.
+
+    Pairs are independent, so ``n_jobs`` > 1 (or -1 for all cores) runs them
+    in parallel with identical results.
+    """
+
+    def one(t: int) -> MotionField:
+        return estimate_motion(
             reg_images[t],
             reg_images[t + 1],
             depth=depth,
             block_size=block_size,
             median_size=median_size,
         )
-        fields.append(field)
+
+    fields = pmap(one, range(reg_images.shape[0] - 1), n_jobs)
+    for t, field in enumerate(fields):
         if (t + 1) % 20 == 0 or t == 0:
             print(
                 f"  motion {t}->{t + 1}: "
