@@ -229,6 +229,7 @@ class CellPropertiesWidget(QWidget):
         self._selected: list[int] = []
         self._state_path: Path | None = None
         self._cb_added = False
+        self.dir_provider = None  # callable -> Path | None (the results folder)
         self.color_feature: str | None = None
         self._hover_id = 0
         self._dimmed: tuple[Labels, float] | None = None
@@ -635,6 +636,11 @@ class CellPropertiesWidget(QWidget):
         return [k for k, cb in self.feature_boxes.items() if cb.isChecked()]
 
     def _default_dir(self) -> Path:
+        if self.dir_provider is not None:
+            d = self.dir_provider()
+            if d is not None:
+                d.mkdir(parents=True, exist_ok=True)
+                return d
         layer = self._labels_layer()
         src = getattr(getattr(layer, "source", None), "path", None) if layer else None
         if src:
