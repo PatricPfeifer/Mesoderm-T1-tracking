@@ -72,6 +72,10 @@ A short walkthrough of the steps below (load, segment, track, select cells, colo
 
 ![TissueKit walkthrough](docs/images/tissuekit_walkthrough.gif)
 
+Full video (fullscreen and scrubbing available):
+
+https://github.com/user-attachments/assets/eeccd6eb-240b-4ec5-82f8-67aea8ade14d
+
 1. **Open the movie** (File > Open File(s)...), then **Plugins > TissueKit**.
 2. **Segmentation** tab: *Image* = `movie_cut`, press **Run segmentation**.
    The status line at the bottom shows progress. When done, the layers `Segmentation` and
