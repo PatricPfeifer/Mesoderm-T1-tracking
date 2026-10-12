@@ -1373,6 +1373,8 @@ class PatricWidget(QWidget):
 
         loaded = []
         movie = self.project.read_settings().get("movie")
+        if not (movie and Path(movie).is_file()):
+            movie = self.project.guess_movie()  # e.g. results made on the HPC: no settings.json
         if movie and Path(movie).is_file() and Path(movie).resolve() not in {
             Path(p).resolve() for p in self._layer_paths(*self.viewer.layers) if p
         }:

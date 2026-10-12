@@ -16,6 +16,9 @@ STRIP_SUFFIXES = (
     "_fourway_vertices_um",
     "_t1_events_um",
     "_cp_masks_partial",
+    "_cf_masks_partial",
+    "_cf_tracked_labels",
+    "_cf_seg_qc",
     "_selected_traces_length_signed",
     "_selected_traces_length",
     "_selected_traces_contact_signed",
@@ -46,6 +49,7 @@ STRIP_SUFFIXES = (
     "_track_qc",
     "_cp_outlines",
     "_cp_masks",
+    "_cf_masks",
 )
 
 
