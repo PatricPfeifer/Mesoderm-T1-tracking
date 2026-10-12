@@ -189,6 +189,7 @@ def estimate_all_motion(
     block_size: int = 256,
     median_size: int = 3,
     n_jobs: int = 1,
+    on_progress=None,
 ) -> list[MotionField]:
     """Motion fields for consecutive pairs: fields[t] maps frame t -> t+1.
 
@@ -205,7 +206,7 @@ def estimate_all_motion(
             median_size=median_size,
         )
 
-    fields = pmap(one, range(reg_images.shape[0] - 1), n_jobs)
+    fields = pmap(one, range(reg_images.shape[0] - 1), n_jobs, on_progress)
     for t, field in enumerate(fields):
         if (t + 1) % 20 == 0 or t == 0:
             print(

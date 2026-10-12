@@ -29,6 +29,30 @@ from ..output_names import input_stem, tagged_path  # noqa: E402
 from ..movie_calibration import Calibration, calibration_for, save_tiff  # noqa: E402
 
 
+def _stage_progress(progress, lo: int, hi: int, message: str):
+    """Map a stage's (done, total) onto the overall ``lo``..``hi`` percent."""
+    if progress is None:
+        return None
+
+    def report(done: int, total: int) -> None:
+        progress(lo + int((hi - lo) * done / max(total, 1)), message)
+
+    return report
+
+
+def _restore_blank_frames(stack: np.ndarray, movie: Movie) -> np.ndarray:
+    """Scatter a kept-frames stack back to the original length (blanks = 0).
+
+    Keeps the output frame-aligned with the raw movie in the viewer.
+    """
+    n = movie.n_frames
+    if n is None or n == stack.shape[0]:
+        return stack
+    full = np.zeros((n,) + stack.shape[1:], dtype=stack.dtype)
+    full[movie.frame_indices] = stack
+    return full
+
+
 @contextmanager
 def _stage(timings: dict[str, float], name: str):
     """Add the wall time of the ``with`` body to ``timings[name]``."""
@@ -79,6 +103,7 @@ def movie_from_arrays(
         masks=masks[idx],
         intensity=None if intensity_arr is None else intensity_arr[idx],
         frame_indices=idx,
+        n_frames=masks.shape[0],
     )
 
 
@@ -107,6 +132,7 @@ def track_loaded(
     min_daughter_frames: int = 3,
     calibration: Calibration | None = None,
     n_jobs: int = 1,
+    progress=None,
 ) -> dict[str, Any]:
     """Track a loaded movie. Writes files when ``output_dir`` is set.
 
@@ -127,14 +153,20 @@ def track_loaded(
         print("Building cell tables...", flush=True)
     with _stage(timings, "cell_tables"):
         frames = build_all_frames(
-            movie.masks, movie.frame_indices, expand=expand, n_jobs=n_jobs
+            movie.masks, movie.frame_indices, expand=expand, n_jobs=n_jobs,
+            on_progress=_stage_progress(progress, 0, 15, "cell tables"),
         )
 
     if verbose:
         print("Estimating motion...", flush=True)
     with _stage(timings, "motion"):
         reg = registration_images(movie.masks, movie.intensity)
-        fields = estimate_all_motion(reg, depth=pyramidal_depth, n_jobs=n_jobs)
+        fields = estimate_all_motion(
+            reg,
+            depth=pyramidal_depth,
+            n_jobs=n_jobs,
+            on_progress=_stage_progress(progress, 15, 30, "motion"),
+        )
 
     cost_kwargs = {"max_distance": max_distance}
     if verbose:
@@ -156,6 +188,7 @@ def track_loaded(
             division_refractory=division_refractory,
             min_daughter_frames=min_daughter_frames,
             timings=timings,
+            on_progress=_stage_progress(progress, 30, 90, "tracking"),
         )
 
     backward_result = None
@@ -189,6 +222,8 @@ def track_loaded(
                 min_daughter_frames=min_daughter_frames,
             )
 
+    if progress is not None:
+        progress(93, "rendering")
     with _stage(timings, "render"):
         tracked = render_tracked_labels(
             movie.masks, result.frames, result.label_to_track
@@ -196,10 +231,15 @@ def track_loaded(
         rgb = render_tracked_rgb(tracked) if write_rgb else None
         if rgb is not None and division_mode == "lineage":
             mark_divisions(rgb, result)
+        tracked = _restore_blank_frames(tracked, movie)
+        if rgb is not None:
+            rgb = _restore_blank_frames(rgb, movie)
     labels_out = None
     rgb_out = None
     if output_dir is not None:
         write_timer = timer()
+        if progress is not None:
+            progress(96, "saving")
         labels_out = tagged_path(output_dir, stem, "tracked_labels.tif")
         save_tiff(labels_out, tracked, cal)
         if rgb is not None:
@@ -274,6 +314,7 @@ def track_arrays(
     min_daughter_frames: int = 3,
     calibration: Calibration | None = None,
     n_jobs: int = 1,
+    progress=None,
 ) -> dict[str, Any]:
     """Track in-memory label (and optional intensity) stacks."""
     movie = movie_from_arrays(masks, intensity, drop_blank=True)
@@ -299,6 +340,7 @@ def track_arrays(
         min_daughter_frames=min_daughter_frames,
         calibration=calibration,
         n_jobs=n_jobs,
+        progress=progress,
     )
 
 
@@ -325,6 +367,7 @@ def run_tracking(
     division_refractory: int = 10,
     min_daughter_frames: int = 3,
     n_jobs: int = 1,
+    progress=None,
 ) -> dict[str, Any]:
     """Track a Cellpose movie and write all outputs under ``output_dir``."""
     movie = load_movie(
@@ -357,6 +400,7 @@ def run_tracking(
         division_refractory=division_refractory,
         min_daughter_frames=min_daughter_frames,
         n_jobs=n_jobs,
+        progress=progress,
     )
 
 

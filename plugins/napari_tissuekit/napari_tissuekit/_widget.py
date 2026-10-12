@@ -1167,6 +1167,7 @@ class TissueKitWidget(QWidget):
                 out_dir,
                 stem=stem,
                 verbose=True,
+                progress=progress,
                 **kwargs,
             )
 

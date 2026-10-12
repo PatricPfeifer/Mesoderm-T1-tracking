@@ -82,6 +82,7 @@ def track_movie(
     division_kwargs: dict | None = None,
     max_area_jump: float = 1.35,
     timings: dict[str, float] | None = None,
+    on_progress=None,
 ) -> TrackingResult:
     """Run forward tracking across all consecutive frame pairs.
 
@@ -160,6 +161,8 @@ def track_movie(
             born_at[daughter] = t
         label_to_track.append(cur_map)
         scores.append(score / max(cur.n_cells, 1))
+        if on_progress is not None:
+            on_progress(t, len(frames) - 1)
 
         fe = classify_events(
             assignment,

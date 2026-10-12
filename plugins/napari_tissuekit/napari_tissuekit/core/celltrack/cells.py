@@ -121,6 +121,7 @@ def build_all_frames(
     *,
     expand: int = 3,
     n_jobs: int = 1,
+    on_progress=None,
 ) -> list[FrameCells]:
     """Build FrameCells for every plane in ``masks`` (frames are independent)."""
 
@@ -132,7 +133,7 @@ def build_all_frames(
             expand=expand,
         )
 
-    frames = pmap(one, range(masks.shape[0]), n_jobs)
+    frames = pmap(one, range(masks.shape[0]), n_jobs, on_progress)
     for t, fc in enumerate(frames):
         if (t + 1) % 20 == 0 or t == 0 or t == masks.shape[0] - 1:
             print(
