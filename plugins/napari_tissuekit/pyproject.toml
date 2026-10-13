@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-tissuekit"
+version = "0.1.0"
+description = "Napari interface for Cellpose segmentation, cell tracking, and T1 detection"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "networkx",
+    "natsort",
+    "matplotlib",
+    "scikit-image",
+    "tifffile",
+    "opencv-python",
+    "cellpose>=4",
+]
+
+[project.optional-dependencies]
+# The napari widget. Not needed for `tissuekit` on a headless HPC node.
+gui = ["napari[pyqt5]>=0.4.18", "qtpy"]
+
+[project.scripts]
+tissuekit = "napari_tissuekit.cli:main"
+
+[project.entry-points."napari.manifest"]
+napari-tissuekit = "napari_tissuekit:napari.yaml"
+
+[tool.setuptools.packages.find]
+include = ["napari_tissuekit*"]
+
+[tool.setuptools.package-data]
+napari_tissuekit = ["napari.yaml", "feature_help/*"]

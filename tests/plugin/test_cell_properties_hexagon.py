@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from skimage.draw import polygon
 
-from napari_patric.cell_properties import FEATURES, compute_properties
+from napari_tissuekit.cell_properties import FEATURES, compute_properties
 
 S = 60.0           # side length in px (circumradius = S)
 CX, CY = 100.0, 90.0
