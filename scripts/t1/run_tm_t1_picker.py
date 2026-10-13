@@ -525,6 +525,7 @@ def import_qt():
             QMessageBox,
             QPushButton,
             QSlider,
+            QSpinBox,
             QVBoxLayout,
             QWidget,
         )
@@ -551,6 +552,7 @@ def import_qt():
             "QMessageBox": QMessageBox,
             "QPushButton": QPushButton,
             "QSlider": QSlider,
+            "QSpinBox": QSpinBox,
             "QVBoxLayout": QVBoxLayout,
             "QWidget": QWidget,
         }
@@ -573,6 +575,7 @@ def import_qt():
             QMessageBox,
             QPushButton,
             QSlider,
+            QSpinBox,
             QVBoxLayout,
             QWidget,
         )
@@ -599,6 +602,7 @@ def import_qt():
             "QMessageBox": QMessageBox,
             "QPushButton": QPushButton,
             "QSlider": QSlider,
+            "QSpinBox": QSpinBox,
             "QVBoxLayout": QVBoxLayout,
             "QWidget": QWidget,
         }
@@ -911,12 +915,32 @@ def length_t0(ev: T1Event) -> int:
     return ev.frame_start
 
 
-def length_trace_span(ev: T1Event, n: int, window: int) -> tuple[int, int]:
+def length_trace_span(
+    ev: T1Event,
+    n: int,
+    window: int,
+    frame_range: tuple[int, int] | None = None,
+) -> tuple[int, int]:
     """±window around length_t0, stretched to last AB↔CD neighbour swap."""
     t_anchor = length_t0(ev)
     t0 = max(0, t_anchor - window)
     t1 = min(n - 1, ev.frame_last_swap + window)
+    if frame_range is not None:
+        t0 = max(t0, frame_range[0])
+        t1 = min(t1, frame_range[1])
     return t0, t1
+
+
+def event_in_range(
+    ev: T1Event, frame_range: tuple[int, int] | None
+) -> bool:
+    """True if all neighbour swaps of the event fall inside frame_range."""
+    if frame_range is None:
+        return True
+    return (
+        ev.frame_first_swap >= frame_range[0]
+        and ev.frame_last_swap <= frame_range[1]
+    )
 
 
 def measure_pair_frame(
@@ -951,12 +975,13 @@ def measure_selection(
     *,
     window: int,
     expand: int,
+    frame_range: tuple[int, int] | None = None,
 ) -> list[dict]:
     """Length/angle traces: geometry once per frame, vertex-vertex length."""
     n = labels.shape[0]
     plan: dict[int, list[T1Event]] = defaultdict(list)
     for ev in events:
-        t0, t1 = length_trace_span(ev, n, window)
+        t0, t1 = length_trace_span(ev, n, window, frame_range)
         for t in range(t0, t1 + 1):
             plan[t].append(ev)
 
@@ -1235,6 +1260,7 @@ def render_selected_overlay(
     *,
     window: int,
     expand: int,
+    frame_range: tuple[int, int] | None = None,
 ) -> np.ndarray:
     """Grayscale movie; type-colored junction outlines over ±window."""
     out = grayscale_rgb(rgb)
@@ -1243,6 +1269,9 @@ def render_selected_overlay(
         t0, t1 = ev.frame_start, ev.frame_end
         win0 = max(0, t0 - window)
         win1 = min(n - 1, t1 + window)
+        if frame_range is not None:
+            win0 = max(win0, frame_range[0])
+            win1 = min(win1, frame_range[1])
         for t in range(win0, win1 + 1):
             paint_event_junctions(
                 out[t],
@@ -1322,6 +1351,7 @@ def export_selection(
     window: int,
     expand: int,
     stem: str,
+    frame_range: tuple[int, int] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     selected = sort_events_by_type(list(selected))
@@ -1397,7 +1427,9 @@ def export_selection(
         )
 
     print(
-        f"Measuring {len(selected)} event(s), window=±{window} ...",
+        f"Measuring {len(selected)} event(s), window=±{window}"
+        + (f", frames {frame_range[0]}-{frame_range[1]}" if frame_range else "")
+        + " ...",
         flush=True,
     )
     traces = measure_selection(
@@ -1405,6 +1437,7 @@ def export_selection(
         labels,
         window=window,
         expand=expand,
+        frame_range=frame_range,
     )
     len_path, ang_path = write_traces_wide_csv(
         out_dir, selected, traces, stem
@@ -1418,7 +1451,8 @@ def export_selection(
 
     print("Writing selected_overlay.tif ...", flush=True)
     overlay = render_selected_overlay(
-        rgb, labels, selected, window=window, expand=expand
+        rgb, labels, selected, window=window, expand=expand,
+        frame_range=frame_range,
     )
     ov_path = _tagged_path(out_dir, stem, "selected_overlay.tif")
     _overwrite_tif(ov_path, overlay)
@@ -1474,6 +1508,7 @@ def run_gui(
     window: int,
     expand: int,
     stem: str,
+    frame_range: tuple[int, int] | None = None,
 ) -> int:
     qt = import_qt()
     Qt = qt["Qt"]
@@ -1495,6 +1530,7 @@ def run_gui(
     QMessageBox = qt["QMessageBox"]
     QPushButton = qt["QPushButton"]
     QSlider = qt["QSlider"]
+    QSpinBox = qt["QSpinBox"]
     QVBoxLayout = qt["QVBoxLayout"]
     QWidget = qt["QWidget"]
     QAbstractItemView = qt["QAbstractItemView"]
@@ -1742,6 +1778,35 @@ def run_gui(
             layout.addLayout(left, stretch=4)
 
             right = QVBoxLayout()
+            right.addWidget(QLabel("Frame range (measure T1s from-to)"))
+            range_row = QHBoxLayout()
+            lo0, hi0 = frame_range or (0, n_frames - 1)
+            self.range_from = QSpinBox()
+            self.range_to = QSpinBox()
+            for box, v in ((self.range_from, lo0), (self.range_to, hi0)):
+                box.setRange(0, n_frames - 1)
+                box.setValue(int(v))
+            range_row.addWidget(QLabel("from"))
+            range_row.addWidget(self.range_from)
+            range_row.addWidget(QLabel("to"))
+            range_row.addWidget(self.range_to)
+            right.addLayout(range_row)
+            range_btns = QHBoxLayout()
+            btn_from = QPushButton("From = current")
+            btn_from.clicked.connect(
+                lambda: self.range_from.setValue(self.slider.value())
+            )
+            btn_to = QPushButton("To = current")
+            btn_to.clicked.connect(
+                lambda: self.range_to.setValue(self.slider.value())
+            )
+            btn_full = QPushButton("Reset")
+            btn_full.clicked.connect(self.reset_range)
+            for b in (btn_from, btn_to, btn_full):
+                range_btns.addWidget(b)
+            right.addLayout(range_btns)
+            self.range_from.valueChanged.connect(self.on_range)
+            self.range_to.valueChanged.connect(self.on_range)
             right.addWidget(QLabel("T1 filter"))
             self.filter_box = QComboBox()
             for key, label in (
@@ -1811,7 +1876,12 @@ def run_gui(
 
         def on_filter(self, *_args) -> None:
             mode = str(self.filter_box.currentData() or "all")
-            shown = {e.event_id for e in events if event_passes_filter(e, mode)}
+            rng = self.current_range()
+            shown = {
+                e.event_id
+                for e in events
+                if event_passes_filter(e, mode) and event_in_range(e, rng)
+            }
             self.view.set_shown(shown)
             shown_ev = [e for e in events if e.event_id in shown]
             n_completed = sum(1 for e in shown_ev if e.etype() == "completed_4way")
@@ -1829,6 +1899,32 @@ def run_gui(
                     del self._selected[eid]
                 self.refresh_list()
                 self.view.set_selected(set(self._selected))
+
+        def current_range(self) -> tuple[int, int] | None:
+            lo, hi = self.range_from.value(), self.range_to.value()
+            if lo == 0 and hi == n_frames - 1:
+                return None
+            return lo, hi
+
+        def on_range(self, *_args) -> None:
+            # keep from <= to by pushing the other box along
+            lo, hi = self.range_from.value(), self.range_to.value()
+            if lo > hi:
+                sender = self.sender()
+                other = self.range_to if sender is self.range_from else self.range_from
+                other.blockSignals(True)
+                other.setValue(sender.value())
+                other.blockSignals(False)
+            self.on_filter()
+
+        def reset_range(self) -> None:
+            self.range_from.blockSignals(True)
+            self.range_to.blockSignals(True)
+            self.range_from.setValue(0)
+            self.range_to.setValue(n_frames - 1)
+            self.range_from.blockSignals(False)
+            self.range_to.blockSignals(False)
+            self.on_filter()
 
         def on_frame(self, t: int) -> None:
             self.frame_lbl.setText(f"frame {t} / {n_frames - 1}")
@@ -1848,8 +1944,9 @@ def run_gui(
 
         def select_all_shown(self) -> None:
             mode = str(self.filter_box.currentData() or "all")
+            rng = self.current_range()
             for ev in events:
-                if event_passes_filter(ev, mode):
+                if event_passes_filter(ev, mode) and event_in_range(ev, rng):
                     self._selected[ev.event_id] = ev
             self.refresh_list()
             self.view.set_selected(set(self._selected))
@@ -1895,6 +1992,14 @@ def run_gui(
                 idx = self.filter_box.findData("all_kinds")
                 if idx >= 0:
                     self.filter_box.setCurrentIndex(idx)
+            if not event_in_range(ev, self.current_range()):
+                QMessageBox.warning(
+                    self,
+                    "Go to event_id",
+                    f"Event {eid} lies outside the frame range; "
+                    "widen the range first.",
+                )
+                return
             self._selected[eid] = ev
             self.refresh_list()
             self.view.set_selected(set(self._selected))
@@ -1947,6 +2052,7 @@ def run_gui(
                     window=window,
                     expand=expand,
                     stem=stem,
+                    frame_range=self.current_range(),
                 )
                 QMessageBox.information(
                     self,
@@ -2041,6 +2147,18 @@ def parse_args() -> argparse.Namespace:
         help="Frame interval in seconds (default: from calibration.json / the labels TIFF).",
     )
     p.add_argument(
+        "--frame-start",
+        type=int,
+        default=None,
+        help="First frame (inclusive) to measure T1s in (default: 0).",
+    )
+    p.add_argument(
+        "--frame-end",
+        type=int,
+        default=None,
+        help="Last frame (inclusive) to measure T1s in (default: last frame).",
+    )
+    p.add_argument(
         "--headless",
         action="store_true",
         help="No GUI; export without Qt/DISPLAY (implies --select-all).",
@@ -2069,9 +2187,15 @@ def run_headless(
     expand: int,
     stem: str,
     filter_mode: str,
+    frame_range: tuple[int, int] | None = None,
 ) -> int:
     selected = sort_events_by_type(
-        [e for e in events if event_passes_filter(e, filter_mode)]
+        [
+            e
+            for e in events
+            if event_passes_filter(e, filter_mode)
+            and event_in_range(e, frame_range)
+        ]
     )
     print(
         f"Headless select-all filter={filter_mode!r}: "
@@ -2089,6 +2213,7 @@ def run_headless(
         window=window,
         expand=expand,
         stem=stem,
+        frame_range=frame_range,
     )
     print(f"Done. Exported {len(selected)} T1(s) to {out_dir}", flush=True)
     return 0
@@ -2150,6 +2275,16 @@ def main() -> None:
             f"RGB YX {rgb.shape[1:3]} != labels {labels.shape[1:3]}"
         )
 
+    frame_range = None
+    if args.frame_start is not None or args.frame_end is not None:
+        n_t = labels.shape[0]
+        lo = 0 if args.frame_start is None else max(0, args.frame_start)
+        hi = n_t - 1 if args.frame_end is None else min(n_t - 1, args.frame_end)
+        if lo > hi:
+            raise ValueError(f"Empty frame range {lo}..{hi} (T={n_t})")
+        frame_range = (lo, hi)
+        print(f"Frame range: {lo}..{hi}", flush=True)
+
     out = args.output_dir.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
 
@@ -2163,6 +2298,7 @@ def main() -> None:
             expand=args.expand,
             stem=stem,
             filter_mode=str(args.filter),
+            frame_range=frame_range,
         )
         raise SystemExit(code)
 
@@ -2175,6 +2311,7 @@ def main() -> None:
         window=args.window,
         expand=args.expand,
         stem=stem,
+        frame_range=frame_range,
     )
     raise SystemExit(code)
 
