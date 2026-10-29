@@ -22,8 +22,9 @@ into one event from the first 4-way to the last (including aborted returns).
 vertex lengths. --search is kept for compatibility but no longer drops rows.
 
 Embryo-margin cells (touch background; optional plus-one ring) are excluded.
-Overlay colors by type: completed_4way (orange/cyan), flicker (yellow-orange/lime),
-aborted (magenta/pink), no_4way (amber/teal), other_matching (red).
+Overlay colors by type: completed (orange/cyan; with or without a 4-way vertex),
+flicker_resolved (yellow-orange/lime), flicker_aborted (magenta/pink). See
+classify_events; has_fourway / source / other_matching stay as CSV columns.
 
 Example:
   conda activate tissue_miner
@@ -74,76 +75,79 @@ from ..t1.run_tm_fourway_vertices import (  # noqa: E402
     vertex_bond,
 )
 
-BREAKING = (255, 140, 0)  # orange — shrinking AB (completed_4way)
-BUILDING = (0, 220, 255)  # cyan — growing CD (completed_4way)
-FOURWAY = (0, 180, 220)  # cyan vertex (completed_4way; was red)
+BREAKING = (255, 140, 0)  # orange — shrinking AB (completed)
+BUILDING = (0, 220, 255)  # cyan — growing CD (completed)
+FOURWAY = (0, 180, 220)  # cyan vertex (completed; was red)
 
 # Type-colored junctions / vertices for overlay + fourways.
 TYPE_COLORS: dict[str, dict[str, tuple[int, int, int]]] = {
-    "completed_4way": {
+    "completed": {
         "vertex": (0, 180, 220),
         "breaking": (255, 140, 0),
         "building": (0, 220, 255),
     },
-    "flicker": {
+    "flicker_resolved": {
         "vertex": (255, 220, 0),
         "breaking": (255, 180, 0),
         "building": (140, 255, 0),
     },
-    "aborted": {
+    "flicker_aborted": {
         "vertex": (220, 0, 220),
         "breaking": (220, 0, 220),
         "building": (255, 120, 200),
     },
-    "no_4way": {
-        "vertex": (255, 160, 0),
-        "breaking": (255, 160, 0),
-        "building": (0, 180, 160),
-    },
-    "other_matching": {
-        "vertex": (220, 40, 40),
-        "breaking": (255, 80, 60),
-        "building": (160, 0, 40),
-    },
 }
 
+EVENT_TYPES = tuple(TYPE_COLORS)
 
-def event_type(
-    kind: str,
-    has_fourway: int | bool,
-    n_swaps: int,
-    other_matching: int | bool = 0,
-) -> str:
-    """Classify a T1 row (other_matching beats flicker; no_4way if never 4-way)."""
-    if int(other_matching):
-        return "other_matching"
-    if int(n_swaps) >= 2:
-        return "flicker"
-    if kind == "aborted":
-        return "aborted"
-    if int(has_fourway) == 0:
-        return "no_4way"
-    return "completed_4way"
+# A swap-only event whose quartet has another event within this many frames
+# is a quartet rearranging back and forth (flicker), not an isolated T1.
+FLICKER_NEIGHBOUR_FRAMES = 10
 
 
-def type_colors(
-    kind: str,
-    has_fourway: int | bool,
-    n_swaps: int,
-    other_matching: int | bool = 0,
-) -> dict[str, tuple[int, int, int]]:
-    return TYPE_COLORS[
-        event_type(kind, has_fourway, n_swaps, other_matching)
-    ]
+def _frame_gap(a: dict, b: dict) -> int:
+    """Frames between two events' [t_start, t_end] spans (0 if they overlap)."""
+    return max(
+        0,
+        max(int(a["t_start"]), int(b["t_start"]))
+        - min(int(a["t_end"]), int(b["t_end"])),
+    )
+
+
+def classify_events(events: list[dict]) -> None:
+    """Set ``ev["type"]`` on every event (in place).
+
+    flicker_aborted: the quartet returns to its original neighbours.
+    flicker_resolved: net swap, but n_swaps >= 2, or (swap-only, no 4-way) the
+      quartet has another event within FLICKER_NEIGHBOUR_FRAMES.
+    completed: every other net swap, with or without a 4-way vertex.
+    """
+    by_quartet: dict[frozenset[int], list[dict]] = defaultdict(list)
+    for e in events:
+        by_quartet[e["quartet"]].append(e)
+    for e in events:
+        if str(e.get("kind", "completed")) == "aborted":
+            e["type"] = "flicker_aborted"
+        elif int(e.get("n_swaps", 0)) >= 2:
+            e["type"] = "flicker_resolved"
+        elif not int(e.get("has_fourway", 1)) and any(
+            o is not e and _frame_gap(e, o) <= FLICKER_NEIGHBOUR_FRAMES
+            for o in by_quartet[e["quartet"]]
+        ):
+            e["type"] = "flicker_resolved"
+        else:
+            e["type"] = "completed"
+
+
+def type_colors(etype: str) -> dict[str, tuple[int, int, int]]:
+    return TYPE_COLORS[etype]
 
 
 # Export column order for junction_lengths.csv (matches t1 picker select-all).
 TYPE_SORT_ORDER = {
-    "completed_4way": 0,
-    "flicker": 1,
-    "aborted": 2,
-    "no_4way": 3,
-    "other_matching": 4,
+    "completed": 0,
+    "flicker_resolved": 1,
+    "flicker_aborted": 2,
 }
 
 
@@ -899,8 +903,8 @@ T1_FILTER_MODES = (
     ("persist_3", "Persist 3"),
     ("persist_5", "Persist 5"),
     ("persist_7", "Persist 7"),
-    ("flicker", "Flicker"),
-    ("aborted", "Aborted"),
+    ("flicker_resolved", "Flicker resolved"),
+    ("flicker_aborted", "Flicker aborted"),
 )
 
 
@@ -909,7 +913,6 @@ def event_passes_filter(event: dict, mode: str) -> bool:
     kind = str(event.get("kind", "completed"))
     persist_pre = int(event.get("persist_pre", -1))
     persist_post = int(event.get("persist_post", -1))
-    n_swaps = int(event.get("n_swaps", 0))
     if mode == "all":
         return kind == "completed"
     if mode.startswith("persist_"):
@@ -917,10 +920,8 @@ def event_passes_filter(event: dict, mode: str) -> bool:
         if persist_pre < 0 or persist_post < 0:
             return False
         return kind == "completed" and persist_pre >= n and persist_post >= n
-    if mode == "flicker":
-        return n_swaps >= 2
-    if mode == "aborted":
-        return kind == "aborted"
+    if mode in ("flicker_resolved", "flicker_aborted"):
+        return event.get("type") == mode
     return kind == "completed"
 
 
@@ -950,9 +951,9 @@ def merge_neighbour_swap_events(
     """Union TM 4-way events with neighbour-swap hits; same quartet+time collapse.
 
     Complementary swaps that do not match recorded 4-way bonds are kept and
-    tagged ``other_matching`` (red overlay). Bond-matching swap-only rows stay
-    ``no_4way``. New swap-only rows that touch embryo-border cells are dropped
-    (same rule as interior-only 4-ways).
+    flagged ``other_matching`` (CSV column only; the event type comes from
+    classify_events). New swap-only rows that touch embryo-border cells are
+    dropped (same rule as interior-only 4-ways).
 
     Returns (events, n_new, n_already_tm).
     """
@@ -1046,6 +1047,28 @@ def length_trace_ok(
     return True
 
 
+def strict_ok(
+    event: dict,
+    verts_3_by_t: list[list[dict]],
+    n_frames: int,
+) -> bool:
+    """Same four cells, right geometry, on ``n_frames`` frames either side.
+
+    Before: AB persists and its two end vertices are {A,B,C} and {A,B,D}. After:
+    CD persists (A, B no longer touch) and its end vertices are {C,D,A} and
+    {C,D,B}. Persistence is the topological run length (``persist_pre`` /
+    ``persist_post``); the end-vertex test is ``vertex_bond`` via
+    ``length_trace_ok``.
+    """
+    if n_frames <= 0:
+        return True
+    return (
+        int(event.get("persist_pre", 0)) >= n_frames
+        and int(event.get("persist_post", 0)) >= n_frames
+        and length_trace_ok(event, verts_3_by_t, n_frames)
+    )
+
+
 def render_overlay(
     rgb: np.ndarray,
     labels: list[np.ndarray],
@@ -1061,12 +1084,7 @@ def render_overlay(
     h, w = out.shape[1:3]
 
     for ev in events:
-        colors = type_colors(
-            str(ev.get("kind") or "completed"),
-            ev.get("has_fourway", 1),
-            int(ev.get("n_swaps") or 0),
-            ev.get("other_matching", 0),
-        )
+        colors = type_colors(ev["type"])
         breaking = colors["breaking"]
         building = colors["building"]
         vertex = colors["vertex"]
@@ -1138,12 +1156,7 @@ def render_fourway_dots(
         for t in range(n):
             out[t] = labels_gray_rgb(labels[t], max_lab)
     for ev in events:
-        vertex = type_colors(
-            str(ev.get("kind") or "completed"),
-            ev.get("has_fourway", 1),
-            int(ev.get("n_swaps") or 0),
-            ev.get("other_matching", 0),
-        )["vertex"]
+        vertex = type_colors(ev["type"])["vertex"]
         quartet = ev["quartet"]
         t0, t1 = ev["t_start"], ev["t_end"]
         for t in range(t0, t1 + 1):
@@ -1167,11 +1180,14 @@ def run_t1_stack(
     border_rings: int = 1,
     search: int = 3,
     length_window: int = 0,
+    strict_frames: int = 1,
     pre: int = 3,
     post: int = 3,
     include_neighbour_swaps: bool = True,
     progress: Callable[[int, str], None] | None = None,
     exclude_ids: set[int] | None = None,
+    division_frames: dict[int, list[int]] | None = None,
+    division_window: int = 5,
 ) -> dict:
     """Detect T1s on a label stack. Same rules as the CLI.
 
@@ -1184,6 +1200,13 @@ def run_t1_stack(
     ``exclude_ids``: track IDs left out of T1 detection, e.g. dividing
     mothers and their daughters from ``{stem}_lineage.csv``. Any T1 whose
     quartet contains one of them is dropped.
+    ``division_frames``: track ID -> original frame(s) of each division it is
+    part of (from ``load_division_frames``). A T1 with a cell of such a track
+    in its quartet is dropped when its first-swap frame is within
+    ``division_window`` frames of that division; otherwise it is kept and
+    tagged ``involves_division=1`` with ``division_offset`` (first-swap frame
+    minus division frame; negative = before). Unlike ``exclude_ids`` the cells
+    stay in the detection, only the events are filtered.
     """
     exclude_ids = {int(i) for i in (exclude_ids or ())}
     stack = np.asarray(stack)
@@ -1338,6 +1361,7 @@ def run_t1_stack(
         print(swap_note, flush=True)
     events = merge_flicker_events(events)
     annotate_neighbour_exchanges(events, adj, present)
+    classify_events(events)
     n_swap = sum(1 for e in events if e["kind"] == "completed")
     if length_window > 0:
         kept: list[dict] = []
@@ -1357,6 +1381,19 @@ def run_t1_stack(
             f"measurable lengths; swap-ok={n_swap})",
             flush=True,
         )
+    if strict_frames > 0:
+        before = sum(1 for e in events if e["kind"] == "completed")
+        events = [
+            e
+            for e in events
+            if e["kind"] != "completed" or strict_ok(e, verts_3_by_t, strict_frames)
+        ]
+        print(
+            f"Strict (±{strict_frames} frames, same four cells at the ends of "
+            f"AB / CD): completed T1s {before} -> "
+            f"{sum(1 for e in events if e['kind']=='completed')}",
+            flush=True,
+        )
     n_excluded = 0
     if exclude_ids:
         before = len(events)
@@ -1365,6 +1402,37 @@ def run_t1_stack(
         print(
             f"Excluded dividing cells: {len(exclude_ids)} track IDs "
             f"(dropped {n_excluded} remaining events with them)",
+            flush=True,
+        )
+    n_div_window = n_div_tagged = 0
+    if division_frames:
+        kept = []
+        for e in events:
+            f_swap = int(
+                frame_indices[
+                    max(0, min(int(e.get("t_first_swap", e["t_start"])), n - 1))
+                ]
+            )
+            offsets = [
+                f_swap - int(f)
+                for cell in e["quartet"]
+                for f in division_frames.get(int(cell), ())
+            ]
+            if offsets:
+                off = min(offsets, key=abs)
+                if abs(off) <= division_window:
+                    n_div_window += 1
+                    continue
+                e["involves_division"] = 1
+                e["division_offset"] = off
+                n_div_tagged += 1
+            kept.append(e)
+        events = kept
+        n_excluded += n_div_window
+        print(
+            f"Dividing cells: dropped {n_div_window} events within "
+            f"±{division_window} frames of a division; kept {n_div_tagged} "
+            "outside that window (involves_division=1)",
             flush=True,
         )
     shown = filter_t1_events(events, "all")
@@ -1455,6 +1523,24 @@ def load_division_ids(path: Path) -> set[int]:
     return ids
 
 
+def load_division_frames(path: Path) -> dict[int, list[int]]:
+    """Track ID -> division frame(s) from a ``*_lineage.csv``.
+
+    A division happens at the first frame of its daughter tracks. Mother and
+    both daughters get that frame; a track that is a daughter and later a
+    mother gets two.
+    """
+    frames: dict[int, list[int]] = {}
+    with Path(path).open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            parent = int(float(row.get("parent_track_id") or 0))
+            if parent:
+                f = int(float(row["start_frame"]))
+                frames.setdefault(int(float(row["track_id"])), []).append(f)
+                frames.setdefault(parent, []).append(f)
+    return frames
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="T1s: interior TM 4-ways whose contacting pair swaps."
@@ -1512,13 +1598,34 @@ def parse_args(argv=None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--strict-frames",
+        type=int,
+        default=1,
+        help=(
+            "Keep a completed T1 only if, on this many frames before and after, "
+            "the same four cells hold the pair (persistence) and sit at the two "
+            "ends of the AB (before) / CD (after) junction. 0 disables."
+        ),
+    )
+    p.add_argument(
         "--lineage",
         type=Path,
         default=None,
         help=(
             "Lineage CSV from cellpose_track_divisions.py. Default: "
-            "{stem}_lineage.csv next to --labels, if present. Mothers and "
-            "daughters of every division are excluded from T1s."
+            "{stem}_lineage.csv next to --labels, if present. T1s of mothers "
+            "and daughters within --division-window frames of a division are "
+            "excluded."
+        ),
+    )
+    p.add_argument(
+        "--division-window",
+        type=int,
+        default=5,
+        help=(
+            "Frames around a division (mother before, daughters after) in which "
+            "T1s with those cells are excluded. Events outside it are kept and "
+            "marked involves_division / division_offset_frames."
         ),
     )
     p.add_argument(
@@ -1580,16 +1687,17 @@ def main(argv=None) -> None:
             stack.shape[1],
             stack.shape[2],
         )
-    exclude_ids: set[int] = set()
+    division_frames: dict[int, list[int]] = {}
     if not args.keep_dividing:
         lineage = args.lineage
         if lineage is None:
             lineage = tagged_path(args.labels.expanduser().parent, stem, "lineage.csv")
         if lineage.expanduser().is_file():
-            exclude_ids = load_division_ids(lineage.expanduser())
+            division_frames = load_division_frames(lineage.expanduser())
             print(
-                f"Lineage {lineage}: excluding {len(exclude_ids)} dividing "
-                "track IDs (mothers + daughters)",
+                f"Lineage {lineage}: {len(division_frames)} dividing track IDs "
+                f"(mothers + daughters); T1s within ±{args.division_window} "
+                "frames of a division are excluded",
                 flush=True,
             )
         elif args.lineage is not None:
@@ -1598,12 +1706,14 @@ def main(argv=None) -> None:
         stack,
         rgb=rgb,
         frame_base=f0,
-        exclude_ids=exclude_ids,
+        division_frames=division_frames,
+        division_window=args.division_window,
         expand=args.expand,
         bond_cutoff=args.bond_cutoff,
         border_rings=args.border_rings,
         search=args.search,
         length_window=args.length_window,
+        strict_frames=args.strict_frames,
         pre=args.pre,
         post=args.post,
         include_neighbour_swaps=not args.no_neighbour_swaps,
@@ -1638,6 +1748,8 @@ def main(argv=None) -> None:
         "n_swaps",
         "has_fourway",
         "other_matching",
+        "involves_division",
+        "division_offset_frames",
     ]
     with ev_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=ev_fields)
@@ -1673,17 +1785,14 @@ def main(argv=None) -> None:
                     "x": round(e["x"], 2),
                     "source": e.get("source", "tm"),
                     "kind": e.get("kind", "completed"),
-                    "type": event_type(
-                        str(e.get("kind", "completed")),
-                        int(e.get("has_fourway", 1)),
-                        int(e.get("n_swaps", 0)),
-                        int(e.get("other_matching", 0)),
-                    ),
+                    "type": e["type"],
                     "persist_pre": int(e.get("persist_pre", 0)),
                     "persist_post": int(e.get("persist_post", 0)),
                     "n_swaps": int(e.get("n_swaps", 0)),
                     "has_fourway": int(e.get("has_fourway", 1)),
                     "other_matching": int(e.get("other_matching", 0)),
+                    "involves_division": int(e.get("involves_division", 0)),
+                    "division_offset_frames": e.get("division_offset", ""),
                 }
             )
 
@@ -1722,12 +1831,7 @@ def main(argv=None) -> None:
     for eid, e in enumerate(events):
         ab = e["pair_before"]
         cd = e["pair_after"]
-        etype = event_type(
-            str(e.get("kind", "completed")),
-            int(e.get("has_fourway", 1)),
-            int(e.get("n_swaps", 0)),
-            int(e.get("other_matching", 0)),
-        )
+        etype = e["type"]
         t_zero = length_t0(e)
         frame_zero = int(frame_indices[max(0, min(t_zero, n - 1))])
         meta.append((eid, etype, frame_zero, ab, cd))
@@ -1807,18 +1911,14 @@ def main(argv=None) -> None:
         "bond_cutoff": args.bond_cutoff,
         "search": args.search,
         "length_window": args.length_window,
+        "strict_frames": args.strict_frames,
         "length_pre": args.length_pre,
         "length_post": args.length_post,
         "signed_lengths": True,
         "overlay": {
-            "completed_4way": "cyan vertex; orange break / cyan build",
-            "flicker": "yellow vertex; yellow-orange break / lime build (n_swaps>=2)",
-            "aborted": "magenta vertex; magenta break / pink build",
-            "no_4way": "amber vertex; amber break / teal build (no 4-cell vertex)",
-            "other_matching": (
-                "red vertex; red-orange break / dark red build "
-                "(other complementary matching)"
-            ),
+            "completed": "cyan vertex; orange break / cyan build (with or without 4-way)",
+            "flicker_resolved": "yellow vertex; yellow-orange break / lime build",
+            "flicker_aborted": "magenta vertex; magenta break / pink build",
             "t1_overlay.tif": (
                 "grayscale tracked_rgb + type-colored junctions + vertex disks"
             ),

@@ -47,6 +47,7 @@ STRIP_SUFFIXES = (
     "_tracked_rgb",
     "_track_events",
     "_track_qc",
+    "_cell_outlines",
     "_cp_outlines",
     "_cp_masks",
     "_cf_masks",
