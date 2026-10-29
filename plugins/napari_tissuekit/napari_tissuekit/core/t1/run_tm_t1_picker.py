@@ -28,7 +28,7 @@ import csv
 import json
 import os
 import sys
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -509,8 +509,16 @@ def resolve_picker_inputs(
 def import_qt():
     """PySide6 (preferred) or PyQt5."""
     try:
-        from PySide6.QtCore import Qt, QPointF
-        from PySide6.QtGui import QColor, QImage, QIntValidator, QPainter, QPen, QPixmap
+        from PySide6.QtCore import Qt, QPointF, QTimer
+        from PySide6.QtGui import (
+            QColor,
+            QImage,
+            QIntValidator,
+            QKeySequence,
+            QPainter,
+            QPen,
+            QPixmap,
+        )
         from PySide6.QtWidgets import (
             QAbstractItemView,
             QApplication,
@@ -529,9 +537,13 @@ def import_qt():
             QVBoxLayout,
             QWidget,
         )
+        from PySide6.QtGui import QShortcut
 
         return {
             "Qt": Qt,
+            "QTimer": QTimer,
+            "QKeySequence": QKeySequence,
+            "QShortcut": QShortcut,
             "QPointF": QPointF,
             "QColor": QColor,
             "QImage": QImage,
@@ -559,8 +571,16 @@ def import_qt():
     except ImportError:
         pass
     try:
-        from PyQt5.QtCore import Qt, QPointF
-        from PyQt5.QtGui import QColor, QImage, QIntValidator, QPainter, QPen, QPixmap
+        from PyQt5.QtCore import Qt, QPointF, QTimer
+        from PyQt5.QtGui import (
+            QColor,
+            QImage,
+            QIntValidator,
+            QKeySequence,
+            QPainter,
+            QPen,
+            QPixmap,
+        )
         from PyQt5.QtWidgets import (
             QAbstractItemView,
             QApplication,
@@ -579,9 +599,13 @@ def import_qt():
             QVBoxLayout,
             QWidget,
         )
+        from PyQt5.QtWidgets import QShortcut
 
         return {
             "Qt": Qt,
+            "QTimer": QTimer,
+            "QKeySequence": QKeySequence,
+            "QShortcut": QShortcut,
             "QPointF": QPointF,
             "QColor": QColor,
             "QImage": QImage,
@@ -623,7 +647,7 @@ PREVIEW_FOURWAY = (255, 0, 255)  # magenta — 4-way vertex
 # Export junctions: classic grayscale-overlay palette (legacy names).
 EXPORT_BREAKING = (255, 140, 0)  # orange — shrinking AB
 EXPORT_BUILDING = (0, 220, 255)  # cyan — growing CD
-EXPORT_FOURWAY = (0, 180, 220)  # cyan vertex (completed_4way)
+EXPORT_FOURWAY = (0, 180, 220)  # cyan vertex (completed)
 LENGTH_CHORD = (255, 0, 0)
 LENGTH_CHORD_ALPHA = 0.5
 MARKER_R = 6
@@ -631,44 +655,37 @@ CLICK_R = 12.0
 
 # Type-colored markers / junctions (matches scripts/t1/run_tm_t1.py).
 TYPE_COLORS: dict[str, dict[str, tuple[int, int, int]]] = {
-    "completed_4way": {
+    "completed": {
         "vertex": (0, 180, 220),
         "breaking": (255, 140, 0),
         "building": (0, 220, 255),
     },
-    "flicker": {
+    "flicker_resolved": {
         "vertex": (255, 220, 0),
         "breaking": (255, 180, 0),
         "building": (140, 255, 0),
     },
-    "aborted": {
+    "flicker_aborted": {
         "vertex": (220, 0, 220),
         "breaking": (220, 0, 220),
         "building": (255, 120, 200),
-    },
-    "no_4way": {
-        "vertex": (255, 160, 0),
-        "breaking": (255, 160, 0),
-        "building": (0, 180, 160),
     },
 }
 
 
 def event_type(kind: str, has_fourway: int | bool, n_swaps: int) -> str:
-    """Classify a T1 row (flicker beats aborted; no_4way only if never 4-way)."""
-    if int(n_swaps) >= 2:
-        return "flicker"
+    """Fallback for old events CSVs without a ``type`` column (no quartet rule)."""
     if kind == "aborted":
-        return "aborted"
-    if int(has_fourway) == 0:
-        return "no_4way"
-    return "completed_4way"
+        return "flicker_aborted"
+    if int(n_swaps) >= 2:
+        return "flicker_resolved"
+    return "completed"
 
 
-def type_colors(
-    kind: str, has_fourway: int | bool, n_swaps: int
-) -> dict[str, tuple[int, int, int]]:
-    return TYPE_COLORS[event_type(kind, has_fourway, n_swaps)]
+def type_colors(etype: str) -> dict[str, tuple[int, int, int]]:
+    return TYPE_COLORS[etype]
+
+
 # Soft pastels for quartet fills (avoid yellow / cyan / magenta clash).
 QUARTET_PALETTE = (
     (170, 130, 190),  # lavender
@@ -708,16 +725,20 @@ class T1Event:
     persist_post: int = -1
     n_swaps: int = 0
     has_fourway: int = 1
+    other_matching: int = 0
+    type: str = ""
 
     @property
     def quartet(self) -> frozenset[int]:
         return frozenset((self.A, self.B, self.C, self.D))
 
     def etype(self) -> str:
+        if self.type in TYPE_COLORS:
+            return self.type
         return event_type(self.kind, self.has_fourway, self.n_swaps)
 
     def colors(self) -> dict[str, tuple[int, int, int]]:
-        return type_colors(self.kind, self.has_fourway, self.n_swaps)
+        return type_colors(self.etype())
 
     def label(self) -> str:
         br = ";".join(str(i) for i in sorted(self.pair_breaking))
@@ -770,6 +791,8 @@ def load_events(path: Path) -> list[T1Event]:
                     has_fourway=int(row["has_fourway"])
                     if row.get("has_fourway") not in (None, "")
                     else (0 if str(row.get("source") or "") == "cellflow" else 1),
+                    other_matching=_opt_int(row, "other_matching", 0),
+                    type=str(row.get("type") or ""),
                 )
             )
     return rows
@@ -777,15 +800,14 @@ def load_events(path: Path) -> list[T1Event]:
 
 # Export / select-all order: type groups, then time within each type.
 TYPE_SORT_ORDER = {
-    "completed_4way": 0,
-    "flicker": 1,
-    "aborted": 2,
-    "no_4way": 3,
+    "completed": 0,
+    "flicker_resolved": 1,
+    "flicker_aborted": 2,
 }
 
 
 def sort_events_by_type(events: list[T1Event]) -> list[T1Event]:
-    """Order by type (completed_4way → flicker → aborted → no_4way), then frame."""
+    """Order by type (completed → flicker_resolved → flicker_aborted), then frame."""
     return sorted(
         events,
         key=lambda e: (
@@ -811,12 +833,8 @@ def event_passes_filter(ev: T1Event, mode: str) -> bool:
             and ev.persist_pre >= n
             and ev.persist_post >= n
         )
-    if mode == "flicker":
-        return ev.kind == "completed" and ev.n_swaps >= 2
-    if mode == "aborted":
-        return ev.kind == "aborted"
-    if mode == "no_4way":
-        return ev.kind == "completed" and int(ev.has_fourway) == 0
+    if mode in ("flicker_resolved", "flicker_aborted"):
+        return ev.etype() == mode
     return ev.kind == "completed"
 
 
@@ -919,28 +937,24 @@ def length_trace_span(
     ev: T1Event,
     n: int,
     window: int,
-    frame_range: tuple[int, int] | None = None,
 ) -> tuple[int, int]:
-    """±window around length_t0, stretched to last AB↔CD neighbour swap."""
+    """±window around length_t0, stretched to last AB↔CD neighbour swap.
+
+    Not clamped to the selected frame range: the full window is measured.
+    """
     t_anchor = length_t0(ev)
     t0 = max(0, t_anchor - window)
     t1 = min(n - 1, ev.frame_last_swap + window)
-    if frame_range is not None:
-        t0 = max(t0, frame_range[0])
-        t1 = min(t1, frame_range[1])
     return t0, t1
 
 
 def event_in_range(
     ev: T1Event, frame_range: tuple[int, int] | None
 ) -> bool:
-    """True if all neighbour swaps of the event fall inside frame_range."""
+    """True if the first neighbour swap / 4-way frame is inside frame_range."""
     if frame_range is None:
         return True
-    return (
-        ev.frame_first_swap >= frame_range[0]
-        and ev.frame_last_swap <= frame_range[1]
-    )
+    return frame_range[0] <= length_t0(ev) <= frame_range[1]
 
 
 def measure_pair_frame(
@@ -975,13 +989,12 @@ def measure_selection(
     *,
     window: int,
     expand: int,
-    frame_range: tuple[int, int] | None = None,
 ) -> list[dict]:
     """Length/angle traces: geometry once per frame, vertex-vertex length."""
     n = labels.shape[0]
     plan: dict[int, list[T1Event]] = defaultdict(list)
     for ev in events:
-        t0, t1 = length_trace_span(ev, n, window, frame_range)
+        t0, t1 = length_trace_span(ev, n, window)
         for t in range(t0, t1 + 1):
             plan[t].append(ev)
 
@@ -1185,6 +1198,7 @@ def paint_event_junctions(
     breaking: tuple[int, int, int] | None = None,
     building: tuple[int, int, int] | None = None,
     fourway: tuple[int, int, int] | None = None,
+    boxes: list | None = None,
 ) -> None:
     """Paint AB / CD / vertex for one event on frame t (type colors by default)."""
     from skimage.draw import disk
@@ -1201,12 +1215,12 @@ def paint_event_junctions(
     t0, t1 = ev.frame_start, ev.frame_end
     h, w = labels.shape
     if t < t0:
-        paint_pair(dst, labels, ab, breaking, expand)
+        paint_pair(dst, labels, ab, breaking, expand, boxes)
     elif t > t1:
-        paint_pair(dst, labels, cd, building, expand)
+        paint_pair(dst, labels, cd, building, expand, boxes)
     else:
-        paint_pair(dst, labels, ab, breaking, expand)
-        paint_pair(dst, labels, cd, building, expand)
+        paint_pair(dst, labels, ab, breaking, expand, boxes)
+        paint_pair(dst, labels, cd, building, expand, boxes)
         if ev.y >= 0 and ev.x >= 0:
             rr, cc = disk(
                 (int(round(ev.y)), int(round(ev.x))), 2, shape=(h, w)
@@ -1236,8 +1250,30 @@ def paint_pair(
     pair: frozenset[int],
     color: tuple[int, int, int],
     reach: int,
+    boxes: list | None = None,
 ) -> None:
+    """Paint the A-B junction outline.
+
+    boxes: ``ndi.find_objects(labels)`` for this frame (optional). With it the outline
+    is computed on a small crop around the two cells instead of the whole frame
+    (identical result, ~100x faster on large frames).
+    """
     a, b = tuple(pair)
+    if boxes is not None:
+        sa = boxes[a - 1] if 0 < a <= len(boxes) else None
+        sb = boxes[b - 1] if 0 < b <= len(boxes) else None
+        if sa is None or sb is None:
+            return  # a cell is absent on this frame: nothing to paint
+        m = int(reach) + 2
+        h, w = labels.shape
+        r0 = max(0, min(sa[0].start, sb[0].start) - m)
+        r1 = min(h, max(sa[0].stop, sb[0].stop) + m)
+        c0 = max(0, min(sa[1].start, sb[1].start) - m)
+        c1 = min(w, max(sa[1].stop, sb[1].stop) + m)
+        mask = pair_outline_mask(labels[r0:r1, c0:c1], a, b, reach)
+        if mask.any():
+            dst[r0:r1, c0:c1][mask] = color
+        return
     mask = pair_outline_mask(labels, a, b, reach)
     if mask.any():
         dst[mask] = color
@@ -1260,7 +1296,6 @@ def render_selected_overlay(
     *,
     window: int,
     expand: int,
-    frame_range: tuple[int, int] | None = None,
 ) -> np.ndarray:
     """Grayscale movie; type-colored junction outlines over ±window."""
     out = grayscale_rgb(rgb)
@@ -1269,9 +1304,6 @@ def render_selected_overlay(
         t0, t1 = ev.frame_start, ev.frame_end
         win0 = max(0, t0 - window)
         win1 = min(n - 1, t1 + window)
-        if frame_range is not None:
-            win0 = max(win0, frame_range[0])
-            win1 = min(win1, frame_range[1])
         for t in range(win0, win1 + 1):
             paint_event_junctions(
                 out[t],
@@ -1362,6 +1394,7 @@ def export_selection(
         "kind",
         "source",
         "has_fourway",
+        "other_matching",
         "n_swaps",
         "persist_pre",
         "persist_post",
@@ -1391,6 +1424,7 @@ def export_selection(
                     "kind": ev.kind,
                     "source": ev.source,
                     "has_fourway": int(ev.has_fourway),
+                    "other_matching": int(ev.other_matching),
                     "n_swaps": ev.n_swaps,
                     "persist_pre": ev.persist_pre,
                     "persist_post": ev.persist_post,
@@ -1437,7 +1471,6 @@ def export_selection(
         labels,
         window=window,
         expand=expand,
-        frame_range=frame_range,
     )
     len_path, ang_path = write_traces_wide_csv(
         out_dir, selected, traces, stem
@@ -1452,7 +1485,6 @@ def export_selection(
     print("Writing selected_overlay.tif ...", flush=True)
     overlay = render_selected_overlay(
         rgb, labels, selected, window=window, expand=expand,
-        frame_range=frame_range,
     )
     ov_path = _tagged_path(out_dir, stem, "selected_overlay.tif")
     _overwrite_tif(ov_path, overlay)
@@ -1478,10 +1510,9 @@ def export_selection(
         "length_overlay": str(len_ov_path),
         "overlay_colors": {
             "base": "grayscale tracked_rgb",
-            "completed_4way": "cyan vertex; orange break / cyan build",
-            "flicker": "yellow vertex; yellow-orange break / lime build",
-            "aborted": "magenta vertex; magenta break / pink build",
-            "no_4way": "amber vertex; amber break / teal build",
+            "completed": "cyan vertex; orange break / cyan build",
+            "flicker_resolved": "yellow vertex; yellow-orange break / lime build",
+            "flicker_aborted": "magenta vertex; magenta break / pink build",
         },
         "length_overlay_colors": {
             "base": "grayscale tracked_rgb",
@@ -1535,6 +1566,9 @@ def run_gui(
     QWidget = qt["QWidget"]
     QAbstractItemView = qt["QAbstractItemView"]
     QComboBox = qt["QComboBox"]
+    QTimer = qt["QTimer"]
+    QShortcut = qt["QShortcut"]
+    QKeySequence = qt["QKeySequence"]
 
     n_frames, h, w = labels.shape
     # Cache outline RGB so the frame slider stays responsive.
@@ -1565,18 +1599,40 @@ def run_gui(
             self._ox = 0
             self._oy = 0
             self.on_toggle = None  # callback(event_id)
+            self.setFocusPolicy(Qt.ClickFocus)
+            self._pending = False  # a redraw is already queued
+            self._boxes: dict[int, list] = {}  # frame -> ndi.find_objects(labels[t])
+            # painted junction layers (outlines + junctions, no markers); small LRU
+            self._composites: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+
+        def _request_redraw(self) -> None:
+            """Draw once per event-loop turn: fast key repeats skip the frames in between."""
+            if not self._pending:
+                self._pending = True
+                QTimer.singleShot(0, self._flush)
+
+        def _flush(self) -> None:
+            self._pending = False
+            self._redraw()
+
+        def frame_boxes(self, t: int) -> list:
+            boxes = self._boxes.get(t)
+            if boxes is None:
+                boxes = ndi.find_objects(labels[t])
+                self._boxes[t] = boxes
+            return boxes
 
         def set_frame(self, t: int) -> None:
             self._frame = int(t)
-            self._redraw()
+            self._request_redraw()
 
         def set_selected(self, ids: set[int]) -> None:
             self._selected = set(ids)
-            self._redraw()
+            self._request_redraw()
 
         def set_shown(self, ids: set[int]) -> None:
             self._shown_ids = set(ids)
-            self._redraw()
+            self._request_redraw()
 
         def visible_events(self) -> list[T1Event]:
             # Markers only while the 4-way vertex is present.
@@ -1589,13 +1645,28 @@ def run_gui(
                 and (shown is None or ev.event_id in shown)
             ]
 
-        def _redraw(self) -> None:
+        def _composite(self, vis: list) -> np.ndarray:
+            """Cell outlines + junctions of the visible events on this frame (cached)."""
+            key = (self._frame, tuple(ev.event_id for ev in vis))
+            frame = self._composites.get(key)
+            if frame is not None:
+                self._composites.move_to_end(key)
+                return frame
             frame = outline_frame(self._frame).copy()
-            vis = self.visible_events()
+            boxes = self.frame_boxes(self._frame)
             for ev in vis:
                 paint_event_junctions(
-                    frame, labels[self._frame], ev, self._frame, expand=expand
+                    frame, labels[self._frame], ev, self._frame, expand=expand,
+                    boxes=boxes,
                 )
+            self._composites[key] = frame
+            while len(self._composites) > 16:
+                self._composites.popitem(last=False)
+            return frame
+
+        def _redraw(self) -> None:
+            vis = self.visible_events()
+            frame = self._composite(vis)
             buf = np.ascontiguousarray(frame)
             qimg = QImage(buf.data, w, h, 3 * w, QImage.Format_RGB888).copy()
             painter = QPainter(qimg)
@@ -1636,7 +1707,7 @@ def run_gui(
 
         def resizeEvent(self, event) -> None:
             super().resizeEvent(event)
-            self._redraw()
+            self._request_redraw()
 
         def _to_image(self, pos) -> tuple[float, float] | None:
             x = (pos.x() - self._ox) / self._scale
@@ -1660,7 +1731,7 @@ def run_gui(
             hover = self._nearest(xy) if xy else None
             if hover != self._hover:
                 self._hover = hover
-                self._redraw()
+                self._request_redraw()
 
         def mousePressEvent(self, event) -> None:
             xy = self._to_image(event.position() if hasattr(event, "position") else event.pos())
@@ -1744,6 +1815,8 @@ def run_gui(
             super().__init__()
             self.setWindowTitle("T1 junction picker")
             self._selected: dict[int, T1Event] = {}
+            # selection snapshots taken before each step, for "Undo last step"
+            self._undo: list[tuple[str, dict[int, T1Event]]] = []
             self._confirmed = False
             self._filter_mode = "all"
 
@@ -1778,7 +1851,7 @@ def run_gui(
             layout.addLayout(left, stretch=4)
 
             right = QVBoxLayout()
-            right.addWidget(QLabel("Frame range (measure T1s from-to)"))
+            right.addWidget(QLabel("Frame range (T1s whose first swap/4-way is in from-to; ±window measured regardless)"))
             range_row = QHBoxLayout()
             lo0, hi0 = frame_range or (0, n_frames - 1)
             self.range_from = QSpinBox()
@@ -1815,9 +1888,8 @@ def run_gui(
                 ("persist_3", "Persist 3"),
                 ("persist_5", "Persist 5"),
                 ("persist_7", "Persist 7"),
-                ("flicker", "Flicker"),
-                ("aborted", "Aborted"),
-                ("no_4way", "No 4-way"),
+                ("flicker_resolved", "Flicker resolved"),
+                ("flicker_aborted", "Flicker aborted"),
             ):
                 self.filter_box.addItem(label, key)
             self.filter_box.currentIndexChanged.connect(self.on_filter)
@@ -1849,6 +1921,18 @@ def run_gui(
             btn_all.clicked.connect(self.select_all_shown)
             right.addWidget(btn_all)
 
+            self.btn_undo = QPushButton("Undo last step")
+            self.btn_undo.setToolTip(
+                "Undo the last selection step: marker click, Select all, "
+                "Remove selected from list or Go (Ctrl/Cmd+Z)."
+            )
+            self.btn_undo.setEnabled(False)
+            self.btn_undo.clicked.connect(self.undo_step)
+            right.addWidget(self.btn_undo)
+            self.undo_lbl = QLabel("")
+            self.undo_lbl.setWordWrap(True)
+            right.addWidget(self.undo_lbl)
+
             btn_rm = QPushButton("Remove selected from list")
             btn_rm.clicked.connect(self.remove_listed)
             right.addWidget(btn_rm)
@@ -1866,11 +1950,58 @@ def run_gui(
             self.on_filter()
             self.resize(1200, 700)
 
+            # Arrow keys step through the frames whichever control has the focus
+            # (Shift = 10 frames, Home / End = first / last frame).
+            self._shortcuts = []
+            for seq, fn in (
+                ("Left", lambda: self.step_frame(-1)),
+                ("Right", lambda: self.step_frame(1)),
+                ("Shift+Left", lambda: self.step_frame(-10)),
+                ("Shift+Right", lambda: self.step_frame(10)),
+                ("Home", lambda: self.slider.setValue(0)),
+                ("End", lambda: self.slider.setValue(n_frames - 1)),
+            ):
+                sc = QShortcut(QKeySequence(seq), self)
+                sc.activated.connect(fn)
+                self._shortcuts.append(sc)
+            undo_sc = QShortcut(QKeySequence("Ctrl+Z"), self)  # Cmd+Z on a Mac
+            undo_sc.activated.connect(self.undo_step)
+            self._shortcuts.append(undo_sc)
+            self.slider.setFocus()
+
+        def _push_undo(self, label: str) -> None:
+            """Remember the selection as it is now, before a step changes it."""
+            self._undo.append((label, dict(self._selected)))
+            del self._undo[:-100]
+            self._update_undo_ui()
+
+        def _update_undo_ui(self, message: str = "") -> None:
+            n = len(self._undo)
+            self.btn_undo.setEnabled(n > 0)
+            self.btn_undo.setText(f"Undo last step ({n})" if n else "Undo last step")
+            self.undo_lbl.setText(message)
+
+        def undo_step(self) -> None:
+            if not self._undo:
+                self._update_undo_ui("Nothing to undo.")
+                return
+            label, snapshot = self._undo.pop()
+            shown = self.view._shown_ids  # events hidden by the current filter stay out
+            self._selected = {
+                eid: ev for eid, ev in snapshot.items() if shown is None or eid in shown
+            }
+            self.refresh_list()
+            self.view.set_selected(set(self._selected))
+            self._update_undo_ui(f"Undid: {label}")
+
+        def step_frame(self, delta: int) -> None:
+            self.slider.setValue(max(0, min(n_frames - 1, self.slider.value() + int(delta))))
+
         def keyPressEvent(self, event) -> None:
             if event.key() == Qt.Key_Left:
-                self.slider.setValue(max(0, self.slider.value() - 1))
+                self.step_frame(-1)
             elif event.key() == Qt.Key_Right:
-                self.slider.setValue(min(n_frames - 1, self.slider.value() + 1))
+                self.step_frame(1)
             else:
                 super().keyPressEvent(event)
 
@@ -1884,14 +2015,13 @@ def run_gui(
             }
             self.view.set_shown(shown)
             shown_ev = [e for e in events if e.event_id in shown]
-            n_completed = sum(1 for e in shown_ev if e.etype() == "completed_4way")
-            n_flicker = sum(1 for e in shown_ev if e.etype() == "flicker")
-            n_aborted = sum(1 for e in shown_ev if e.etype() == "aborted")
-            n_no4 = sum(1 for e in shown_ev if e.etype() == "no_4way")
+            n_completed = sum(1 for e in shown_ev if e.etype() == "completed")
+            n_resolved = sum(1 for e in shown_ev if e.etype() == "flicker_resolved")
+            n_aborted = sum(1 for e in shown_ev if e.etype() == "flicker_aborted")
             self.filter_lbl.setText(
                 f"Showing {len(shown)} of {len(events)}. "
-                f"completed 4-way {n_completed}, flicker {n_flicker}, "
-                f"aborted {n_aborted}, no 4-way {n_no4}."
+                f"completed {n_completed}, flicker resolved {n_resolved}, "
+                f"flicker aborted {n_aborted}."
             )
             dropped = [eid for eid in list(self._selected) if eid not in shown]
             if dropped:
@@ -1935,8 +2065,10 @@ def run_gui(
             if shown is not None and eid not in shown:
                 return
             if eid in self._selected:
+                self._push_undo(f"deselect event {eid}")
                 del self._selected[eid]
             else:
+                self._push_undo(f"select event {eid}")
                 ev = next(e for e in events if e.event_id == eid)
                 self._selected[eid] = ev
             self.refresh_list()
@@ -1945,9 +2077,17 @@ def run_gui(
         def select_all_shown(self) -> None:
             mode = str(self.filter_box.currentData() or "all")
             rng = self.current_range()
-            for ev in events:
-                if event_passes_filter(ev, mode) and event_in_range(ev, rng):
-                    self._selected[ev.event_id] = ev
+            new = [
+                ev
+                for ev in events
+                if event_passes_filter(ev, mode)
+                and event_in_range(ev, rng)
+                and ev.event_id not in self._selected
+            ]
+            if new:
+                self._push_undo(f"select all ({len(new)} added)")
+            for ev in new:
+                self._selected[ev.event_id] = ev
             self.refresh_list()
             self.view.set_selected(set(self._selected))
 
@@ -2000,6 +2140,8 @@ def run_gui(
                     "widen the range first.",
                 )
                 return
+            if eid not in self._selected:
+                self._push_undo(f"add event {eid} (Go)")
             self._selected[eid] = ev
             self.refresh_list()
             self.view.set_selected(set(self._selected))
@@ -2029,6 +2171,7 @@ def run_gui(
                 return
             eid = int(item.data(Qt.UserRole))
             if eid in self._selected:
+                self._push_undo(f"remove event {eid} from the list")
                 del self._selected[eid]
             self.refresh_list()
             self.view.set_selected(set(self._selected))
@@ -2083,9 +2226,8 @@ FILTER_CHOICES = (
     "persist_3",
     "persist_5",
     "persist_7",
-    "flicker",
-    "aborted",
-    "no_4way",
+    "flicker_resolved",
+    "flicker_aborted",
 )
 
 
@@ -2150,13 +2292,13 @@ def parse_args() -> argparse.Namespace:
         "--frame-start",
         type=int,
         default=None,
-        help="First frame (inclusive) to measure T1s in (default: 0).",
+        help="First frame (inclusive) a T1's first swap/4-way may occur in (default: 0). ±window is measured regardless.",
     )
     p.add_argument(
         "--frame-end",
         type=int,
         default=None,
-        help="Last frame (inclusive) to measure T1s in (default: last frame).",
+        help="Last frame (inclusive) a T1's first swap/4-way may occur in (default: last frame).",
     )
     p.add_argument(
         "--headless",
