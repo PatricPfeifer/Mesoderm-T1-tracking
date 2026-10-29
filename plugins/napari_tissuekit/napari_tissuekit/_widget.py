@@ -314,15 +314,16 @@ class TissueKitWidget(QWidget):
 
         outline_box = QGroupBox("Outline correction (Tissue Analyzer style)")
         outline_inner = QVBoxLayout()
-        outline_inner.addWidget(
-            QLabel(
-                "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines. "
-                "Enter = Apply (local watershed, like TA). "
-                "Shift+Enter = Apply + drop small cells. "
-                "Ctrl+M = seeded local watershed (paint ≥2 seed dots first). "
-                "M = toggle Outlines. Ctrl+S / Save writes masks, outlines and *_cell_outlines.tif (cell outlines only). Cell edits below also redraw the outlines."
-            )
+        outline_help = QLabel(
+            "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines. "
+            "Enter = Apply (local watershed, like TA). "
+            "Shift+Enter = Apply + drop small cells. "
+            "Ctrl+M = seeded local watershed (paint ≥2 seed dots first). "
+            "M = toggle Outlines. Ctrl+S / Save writes masks, outlines and *_cell_outlines.tif (cell outlines only). Cell edits below also redraw the outlines."
         )
+        outline_help.setWordWrap(True)
+        outline_help.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
+        outline_inner.addWidget(outline_help)
         import_form = QFormLayout()
         self.seg_masks = QComboBox()
         self.seg_outlines = QComboBox()
@@ -356,7 +357,7 @@ class TissueKitWidget(QWidget):
         outline_inner.addWidget(self.seg_apply_shift)
         outline_inner.addWidget(self.seg_seeded)
         outline_inner.addWidget(self.seg_save)
-        self.seg_export = QPushButton("Export TIFF (masks + outlines)")
+        self.seg_export = QPushButton("Export TIFF")
         self.seg_export.clicked.connect(lambda: self._export_step_tiffs("segmentation"))
         outline_inner.addWidget(self.seg_export)
         outline_box.setLayout(outline_inner)
@@ -376,12 +377,13 @@ class TissueKitWidget(QWidget):
             from napariCellFlow.visualization_manager import VisualizationManager
         except Exception as exc:
             self.correction = None
-            inner.addWidget(
-                QLabel(
-                    "CellFlow correction tools are not importable "
-                    f"({exc}). Outline edit/save still work."
-                )
+            missing = QLabel(
+                "CellFlow correction tools are not importable "
+                f"({exc}). Outline edit/save still work."
             )
+            missing.setWordWrap(True)
+            missing.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
+            inner.addWidget(missing)
         else:
             self._data_manager = DataManager()
             self._vis = VisualizationManager(self.viewer, self._data_manager)
@@ -618,7 +620,28 @@ class TissueKitWidget(QWidget):
                 ol.brush_size = 3
             except Exception:
                 pass
+        self._autosave_outlines()
         self.status.setText(self._hand_msg)
+
+    def _autosave_outlines(self) -> None:
+        """Write the outline-only TIFF as soon as the 1 px outlines exist (no click needed)."""
+        outlines = self._seg_base_outlines
+        if outlines is None or self.project.root is None:
+            return
+        try:
+            from .core.movie_calibration import save_tiff
+
+            stem = self._seg_stem or "segmentation"
+            cal = self._calibration(
+                self._layer(self.seg_image.currentText()),
+                self._layer(self.seg_masks.currentText()),
+                stem=self._seg_stem,
+            )
+            path = self.project.step_dir("segmentation") / f"{stem}_cell_outlines.tif"
+            save_tiff(path, (outlines > 0).astype(np.uint8) * 255, cal)
+            self._hand_msg = f"{self._hand_msg} Outlines saved to {path.name}."
+        except Exception:  # saving must never break editing
+            print(traceback.format_exc(), flush=True)
 
     def _bonds_ready(self) -> bool:
         if self._seg_base_masks is None:
@@ -1005,7 +1028,7 @@ class TissueKitWidget(QWidget):
         self.track_run = QPushButton("Run tracking")
         self.track_run.clicked.connect(self._run_tracking)
         layout.addWidget(self.track_run)
-        self.track_export = QPushButton("Export TIFF (tracked labels + RGB)")
+        self.track_export = QPushButton("Export TIFF")
         self.track_export.clicked.connect(lambda: self._export_step_tiffs("tracking"))
         layout.addWidget(self.track_export)
         layout.addWidget(self._track_edit_box())
@@ -1794,7 +1817,7 @@ class TissueKitWidget(QWidget):
         self.t1_run = QPushButton("Run T1")
         self.t1_run.clicked.connect(self._run_t1)
         row.addWidget(self.t1_run)
-        self.t1_export = QPushButton("Export TIFF (overlay + four-ways)")
+        self.t1_export = QPushButton("Export TIFF")
         self.t1_export.clicked.connect(lambda: self._export_step_tiffs("t1"))
         row.addWidget(self.t1_export)
         layout.addLayout(row)
