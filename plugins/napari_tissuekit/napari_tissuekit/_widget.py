@@ -155,6 +155,7 @@ class TissueKitWidget(QWidget):
         # True while the plugin itself pushes masks into the correction widget, so
         # only the user's cell edits are mirrored onto the Outlines layer.
         self._outline_sync_busy = False
+        self._last_job_error = ""
         # TA handCorrection stack (255 = 1 px bond / background): the bonds
         # shown in Outlines and used by the watershed.
         self._seg_base_hand: np.ndarray | None = None
@@ -282,7 +283,8 @@ class TissueKitWidget(QWidget):
         self.status.setText(f"{percent}% {message}")
 
     def _on_failed(self, text: str) -> None:
-        self.status.setText(text.strip().splitlines()[-1])
+        self._last_job_error = text.strip().splitlines()[-1]
+        self.status.setText(self._last_job_error)
         print(text, flush=True)
 
     def _clear_job(self) -> None:
@@ -682,7 +684,10 @@ class TissueKitWidget(QWidget):
             )
             return False
         if self._seg_base_hand is None or self._seg_base_outlines is None:
-            self.status.setText("Bonds are still being prepared — wait for 100%.")
+            if self._last_job_error and not self._job_running():
+                self.status.setText(f"Bond preparation failed: {self._last_job_error}")
+            else:
+                self.status.setText("Bonds are still being prepared — wait for 100%.")
             return False
         return True
 
