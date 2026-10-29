@@ -584,6 +584,13 @@ class TissueKitWidget(QWidget):
 
         self._hand_msg = message
 
+        # Show outlines right away from the masks; the 1 px TA bonds replace them
+        # when the background job finishes (or they stay if that job fails).
+        from .core.outline_io import masks_to_outline_labels
+
+        self._replace_labels("Outlines", masks_to_outline_labels(masks))
+        self._style_outlines_layer(self._layer("Outlines"))
+
         def work(progress):
             from .core.outline_io import hand_stack_to_outline
             from .core.ta_bond_edit import thin_hand_stack
@@ -598,7 +605,12 @@ class TissueKitWidget(QWidget):
         self._seg_base_hand = hand
         self._seg_base_outlines = outlines.copy()
         self._replace_labels("Outlines", outlines)
-        ol = self._layer("Outlines")
+        self._style_outlines_layer(self._layer("Outlines"))
+        self._autosave_outlines()
+        self.status.setText(self._hand_msg)
+
+    def _style_outlines_layer(self, ol) -> None:
+        """Yellow 1 px outlines, brush ready for painting."""
         if isinstance(ol, Labels):
             ol.opacity = 1.0
             ol.visible = True
@@ -620,8 +632,6 @@ class TissueKitWidget(QWidget):
                 ol.brush_size = 3
             except Exception:
                 pass
-        self._autosave_outlines()
-        self.status.setText(self._hand_msg)
 
     def _autosave_outlines(self) -> None:
         """Write the outline-only TIFF as soon as the 1 px outlines exist (no click needed)."""
