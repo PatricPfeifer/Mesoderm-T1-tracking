@@ -620,7 +620,28 @@ class TissueKitWidget(QWidget):
                 ol.brush_size = 3
             except Exception:
                 pass
+        self._autosave_outlines()
         self.status.setText(self._hand_msg)
+
+    def _autosave_outlines(self) -> None:
+        """Write the outline-only TIFF as soon as the 1 px outlines exist (no click needed)."""
+        outlines = self._seg_base_outlines
+        if outlines is None or self.project.root is None:
+            return
+        try:
+            from .core.movie_calibration import save_tiff
+
+            stem = self._seg_stem or "segmentation"
+            cal = self._calibration(
+                self._layer(self.seg_image.currentText()),
+                self._layer(self.seg_masks.currentText()),
+                stem=self._seg_stem,
+            )
+            path = self.project.step_dir("segmentation") / f"{stem}_cell_outlines.tif"
+            save_tiff(path, (outlines > 0).astype(np.uint8) * 255, cal)
+            self._hand_msg = f"{self._hand_msg} Outlines saved to {path.name}."
+        except Exception:  # saving must never break editing
+            print(traceback.format_exc(), flush=True)
 
     def _bonds_ready(self) -> bool:
         if self._seg_base_masks is None:
