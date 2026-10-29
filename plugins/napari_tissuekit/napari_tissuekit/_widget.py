@@ -342,6 +342,13 @@ class TissueKitWidget(QWidget):
         )
         import_form.addRow("Watershed pad", self.seg_pad)
         outline_inner.addLayout(import_form)
+        tools = QHBoxLayout()
+        for text, mode in (("Paint", "paint"), ("Erase", "erase"), ("Pan/zoom", "pan_zoom")):
+            button = QPushButton(text)
+            button.setToolTip("Select the Outlines layer and switch napari's tool")
+            button.clicked.connect(lambda _=False, m=mode: self._set_outline_tool(m))
+            tools.addWidget(button)
+        outline_inner.addLayout(tools)
         self.seg_start_edit = QPushButton("Start outline editing")
         self.seg_start_edit.clicked.connect(self._start_outline_editing)
         outline_inner.addWidget(self.seg_start_edit)
@@ -584,6 +591,13 @@ class TissueKitWidget(QWidget):
 
         self._hand_msg = message
 
+        # Show outlines right away from the masks; the 1 px TA bonds replace them
+        # when the background job finishes (or they stay if that job fails).
+        from .core.outline_io import masks_to_outline_labels
+
+        self._replace_labels("Outlines", masks_to_outline_labels(masks))
+        self._style_outlines_layer(self._layer("Outlines"))
+
         def work(progress):
             from .core.outline_io import hand_stack_to_outline
             from .core.ta_bond_edit import thin_hand_stack
@@ -598,7 +612,27 @@ class TissueKitWidget(QWidget):
         self._seg_base_hand = hand
         self._seg_base_outlines = outlines.copy()
         self._replace_labels("Outlines", outlines)
+        self._style_outlines_layer(self._layer("Outlines"))
+        self._autosave_outlines()
+        self.status.setText(self._hand_msg)
+
+    def _set_outline_tool(self, mode: str) -> None:
+        """Paint / erase / pan on the Outlines layer without napari's own tool panel."""
         ol = self._layer("Outlines")
+        if not isinstance(ol, Labels):
+            self.status.setText("No Outlines layer yet: run segmentation or Start outline editing.")
+            return
+        self.viewer.layers.selection.clear()
+        self.viewer.layers.selection.add(ol)
+        ol.visible = True
+        if mode != "pan_zoom":
+            ol.selected_label = 1  # 1 = outline
+            ol.brush_size = max(int(ol.brush_size), 2)
+        ol.mode = mode
+        self.status.setText(f"Outlines: {mode.replace('_', '/')} tool active. Enter applies the edit.")
+
+    def _style_outlines_layer(self, ol) -> None:
+        """Yellow 1 px outlines, brush ready for painting."""
         if isinstance(ol, Labels):
             ol.opacity = 1.0
             ol.visible = True
@@ -620,8 +654,6 @@ class TissueKitWidget(QWidget):
                 ol.brush_size = 3
             except Exception:
                 pass
-        self._autosave_outlines()
-        self.status.setText(self._hand_msg)
 
     def _autosave_outlines(self) -> None:
         """Write the outline-only TIFF as soon as the 1 px outlines exist (no click needed)."""
