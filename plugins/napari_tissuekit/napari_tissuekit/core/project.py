@@ -64,7 +64,14 @@ def find_results_root(path: str | Path) -> Path:
     ):
         return p
     kids = [k for k in p.glob("*_results") if k.is_dir()]
-    return kids[0] if len(kids) == 1 else p
+    if len(kids) == 1:
+        return kids[0]
+    # A step folder itself (…/tracking) was picked: use the results folder above it.
+    if p.name in STEPS or any(p.name in names for names in STEP_FOLDERS.values()):
+        parent = p.parent
+        if parent.name.endswith("_results") or (parent / "settings.json").is_file():
+            return parent
+    return p
 
 
 def _step_dirs(root: Path, step: str) -> list[Path]:

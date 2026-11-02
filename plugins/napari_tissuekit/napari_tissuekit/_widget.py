@@ -1982,7 +1982,11 @@ class TissueKitWidget(QWidget):
             if self.project.found():
                 self._load_saved_results()
             else:
-                self.status.setText(f"Results will be saved to {root}")
+                self.status.setText(
+                    f"No saved results found in {root} (looked for a tracking/ or segmentation/ "
+                    "folder inside it). Pick the *_results folder itself. New results will be "
+                    "saved there."
+                )
 
     def _cell_props_dir(self):
         return self.project.root / "cell_props" if self.project.root is not None else None
