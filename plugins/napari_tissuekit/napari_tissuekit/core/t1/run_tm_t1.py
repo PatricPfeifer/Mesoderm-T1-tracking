@@ -1555,6 +1555,21 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="START:END (end exclusive), e.g. 0:40.",
     )
     p.add_argument("--expand", type=int, default=3)
+    p.add_argument(
+        "--classifier",
+        choices=("legacy", "states"),
+        default="legacy",
+        help="legacy = 4-way / swap detector (default); states = O/N/V state machine (t1_states.py)",
+    )
+    p.add_argument("--states-config", type=Path, default=None,
+                   help="states: optional YAML (expand, definition overrides); the definition itself is t1_states_run.DEFINITION")
+    p.add_argument("--t-dwell", type=float, default=None, help="states: dwell time in seconds (default: DEFINITION)")
+    p.add_argument("--t-stable", type=float, default=None, help="states: stable time in seconds (default: DEFINITION)")
+    p.add_argument("--t-end", type=float, default=None, help="states: a configuration persisting this long ends an event (default: DEFINITION)")
+    p.add_argument("--on-px", type=float, default=None, help="states: contact pixels at which a junction switches on (default: DEFINITION)")
+    p.add_argument("--off-px", type=float, default=None, help="states: contact pixels below which it switches off (default: DEFINITION)")
+    p.add_argument("--no-side-rule", action="store_true", help="states: switch the neighbour-relationship (side cells) rule off")
+    p.add_argument("--no-vertex-clause", action="store_true", help="states: switch the return-to-vertex clause off")
     p.add_argument("--bond-cutoff", type=float, default=3.0)
     p.add_argument(
         "--border-rings",
@@ -1702,6 +1717,20 @@ def main(argv=None) -> None:
             )
         elif args.lineage is not None:
             raise SystemExit(f"--lineage not found: {args.lineage}")
+    if args.classifier == "states":
+        from .t1_states_run import run_states_cli
+
+        lineage = args.lineage or tagged_path(args.labels.expanduser().parent, stem, "lineage.csv")
+        run_states_cli(
+            labels_path=args.labels.expanduser().resolve(),
+            rgb=args.rgb.expanduser().resolve() if args.rgb is not None else None,
+            out=out, stem=stem, cal=cal, lineage=lineage if Path(lineage).is_file() else None,
+            config=args.states_config, t_dwell=args.t_dwell, t_stable=args.t_stable, t_end=args.t_end,
+            on_px=args.on_px, off_px=args.off_px, side_rule=False if args.no_side_rule else None,
+            vertex_clause=False if args.no_vertex_clause else None,
+        )
+        print("Done (states classifier).", flush=True)
+        return
     result = run_t1_stack(
         stack,
         rgb=rgb,
