@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "napari-tissuekit"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Napari interface for Cellpose segmentation, cell tracking, and T1 detection"
 requires-python = ">=3.9"
 dependencies = [
@@ -29,6 +29,9 @@ tissuekit = "napari_tissuekit.cli:main"
 
 [project.entry-points."napari.manifest"]
 napari-tissuekit = "napari_tissuekit:napari.yaml"
+
+[tool.setuptools.dynamic]
+version = {attr = "napari_tissuekit.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["napari_tissuekit*"]

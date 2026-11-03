@@ -39,6 +39,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .cell_properties import CellPropertiesWidget
 from .core.project import WorkingFolder, find_results_root, movie_stem
 from .track_edit import (
@@ -187,6 +188,10 @@ class TissueKitWidget(QWidget):
         self.cell_props = CellPropertiesWidget(self.viewer)
         self.cell_props.dir_provider = self._cell_props_dir
         tabs.addTab(self._scrollable(self.cell_props), "Export Cell Props")
+        version = QLabel(f"v{__version__}")
+        version.setToolTip("napari-tissuekit version")
+        version.setStyleSheet("color: gray; padding: 0 6px;")
+        tabs.setCornerWidget(version, Qt.TopRightCorner)
         self.status = QLabel("Ready")
         self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
