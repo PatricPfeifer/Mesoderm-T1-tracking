@@ -190,6 +190,7 @@ class CellCorrectionWidget(QWidget):
     MIN_DRAWING_POINTS = 10
     DRAG_START_THRESHOLD = 4  # px — left-click delete vs left-drag draw
     _EDIT_KEYS = frozenset({Qt.Key_Control, Qt.Key_Alt})
+    OWN_LAYERS = frozenset({"Outlines", "Outlines (file)", "Tracked", "Drawing Preview"})  # never adopted as the masks layer
 
     def __init__(self, viewer: "napari.Viewer", data_manager: "DataManager",
                  visualization_manager: "VisualizationManager", parent: QWidget = None):
@@ -816,6 +817,11 @@ class CellCorrectionWidget(QWidget):
 
         layer = event.value
         logger.debug(f"New layer added: {layer.name}, type: {type(layer)}")
+
+        # The plugin's own Labels layers (outlines, tracks, drawing preview) are not masks: renaming them to
+        # "Segmentation" hid the Outlines layer from the plugin and made the edit tools work on the wrong layer.
+        if layer.name.split(" [")[0] in self.OWN_LAYERS:
+            return
 
         if isinstance(layer, napari.layers.Labels):
             try:
