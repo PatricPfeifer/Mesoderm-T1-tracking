@@ -13,8 +13,11 @@ same frame. Vertex-to-vertex lengths are not used for the classification, only i
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import json
 import math
+import multiprocessing as mp
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,8 +111,16 @@ def contact_length_map_euclid(lab: np.ndarray) -> dict[tuple[int, int], float]:
     return {k: math.hypot(v[0], v[1]) for k, v in acc.items()}
 
 
+def default_workers(n_tasks: int = 1 << 30, requested: int | None = None) -> int:
+    """CPU cores to use: `requested`, else $TISSUEKIT_N_JOBS, else the cores this process may use (respects a Slurm allocation), at most `n_tasks`."""
+    n = requested or int(os.environ.get("TISSUEKIT_N_JOBS", 0) or 0)
+    if not n:
+        n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    return max(1, min(int(n), int(n_tasks)))
+
+
 def build_movie_data(labels: np.ndarray, um_per_px: float, dt_s: float, stem: str, expand: int = 3,
-                     cache: Path | None = None, metric: str = "pairs") -> MovieData:
+                     cache: Path | None = None, metric: str = "pairs", workers: int | None = None) -> MovieData:
     """Contact lengths, presence, border cells and centroids of every frame (cached as an .npz).
     metric 'pairs' = 4-connected contact-pixel count (default); 'euclid' = direction-corrected length (contact_length_map_euclid)."""
     length_map = contact_length_map if metric == "pairs" else contact_length_map_euclid
@@ -127,18 +138,28 @@ def build_movie_data(labels: np.ndarray, um_per_px: float, dt_s: float, stem: st
     cx = np.full((T, L), np.nan, dtype=np.float32)
     contact: dict[tuple[int, int], dict[int, float]] = {}
     yy, xx = np.indices(labels.shape[1:])
-    for t in range(T):
+
+    def measure(t):  # one frame (frames are independent; numpy / scipy release the GIL, so frames run in threads)
         lab = labels[t].astype(np.int64)
         cnt = np.bincount(lab.ravel(), minlength=L).astype(float)
         ids = np.flatnonzero(cnt[1:]) + 1
-        present[t, ids] = True
         sy = np.bincount(lab.ravel(), weights=yy.ravel(), minlength=L)
         sx = np.bincount(lab.ravel(), weights=xx.ravel(), minlength=L)
-        cy[t, ids], cx[t, ids] = (sy[ids] / cnt[ids]), (sx[ids] / cnt[ids])
-        for c in tissue_border_cells(lab):
-            border[t, c] = True
         work = expand_labels(lab, distance=expand) if expand > 0 else lab
-        for pair, px in length_map(work).items():
+        return ids, sy[ids] / cnt[ids], sx[ids] / cnt[ids], tissue_border_cells(lab), length_map(work)
+
+    n_workers = default_workers(T, workers)
+    if n_workers > 1:
+        with cf.ThreadPoolExecutor(n_workers) as pool:
+            results = list(pool.map(measure, range(T)))
+    else:
+        results = map(measure, range(T))
+    for t, (ids, cyv, cxv, bcells, pairs_t) in enumerate(results):
+        present[t, ids] = True
+        cy[t, ids], cx[t, ids] = cyv, cxv
+        for c in bcells:
+            border[t, c] = True
+        for pair, px in pairs_t.items():
             contact.setdefault(pair, {})[t] = px * um_per_px
     pairs = sorted(contact)
     length = np.full((len(pairs), T), np.nan, dtype=np.float32)
@@ -251,15 +272,25 @@ def side_series(md: MovieData, pa: tuple, pb: tuple, min_len: float, strict: boo
     return (L > min_len if strict else L >= min_len).all(axis=0)
 
 
+_CLS: dict = {}   # per-quartet function and quartet list handed to the forked worker processes of classify_movie
+
+
+def _classify_worker(i: int):
+    return _CLS["one"](_CLS["items"][i])
+
+
 def classify_movie(md: MovieData, p: StateParams, division_frames: dict[int, list[int]] | None = None,
                    cand: dict | None = None, orientation: bool = True, complex_pair_min: float | None = None,
-                   apply_rules: bool = True, side_rule: bool = False, vertex_clause: bool = False) -> pd.DataFrame:
+                   apply_rules: bool = True, side_rule: bool = False, vertex_clause: bool = False, workers: int | None = None) -> pd.DataFrame:
     """One row per event of every candidate quartet. Classes: clean, flicker_resolved, flicker_aborted,
     abortive_shrink, unresolved, complex (complex has priority, then unresolved, see t1_states.py)."""
     cand = candidate_quartets(md, p.l_on, p.l_off) if cand is None else cand
     division_frames = division_frames or {}
-    rows, dropped, cache = [], [], {}
-    for key, ncommon in sorted(cand.items(), key=lambda kv: sorted(sorted(x) for x in kv[0])):
+    cache = {}
+
+    def one(item):  # all events of one candidate quartet (quartets are independent of each other)
+        key, ncommon = item
+        rows, dropped = [], []
         p0, p1 = sorted((tuple(sorted(x)) for x in key))
         cells = sorted(p0 + p1)
         lx, ly = md.pair_length(*p0).astype(float), md.pair_length(*p1).astype(float)
@@ -344,6 +375,26 @@ def classify_movie(md: MovieData, p: StateParams, division_frames: dict[int, lis
                 n_flips_raw=(ev.flips_raw if ev.flips_raw >= 0 else ev.flips), side_truncated=int(ev.side_truncated),
                 vertex_clause_flag=int(ev.vertex_flag),
             ))
+        return rows, dropped
+
+    items = sorted(cand.items(), key=lambda kv: sorted(sorted(x) for x in kv[0]))
+    rows, dropped = [], []
+    n_workers = default_workers(len(items), workers)
+    if n_workers > 1 and "fork" in mp.get_all_start_methods():
+        # plain-Python work per quartet: separate processes (forked, so md is shared); results come back in quartet order
+        _CLS["one"], _CLS["items"] = one, items
+        try:
+            with cf.ProcessPoolExecutor(n_workers, mp_context=mp.get_context("fork")) as pool:
+                for r, d in pool.map(_classify_worker, range(len(items)), chunksize=16):
+                    rows += r
+                    dropped += d
+        finally:
+            _CLS.clear()
+    else:
+        for item in items:
+            r, d = one(item)
+            rows += r
+            dropped += d
     df = pd.DataFrame(rows)
     df = df.sort_values(["frame_start", "A", "B", "C", "D"]).reset_index(drop=True) if len(df) else df
     df.attrs["dropped"] = pd.DataFrame(dropped)
@@ -359,14 +410,26 @@ def definition_params(dt_s: float, um_per_px: float, definition: dict | None = N
 
 
 def classify_with_definition(md: MovieData, division_frames=None, definition: dict | None = None, orientation: bool = True,
-                             cand: dict | None = None) -> pd.DataFrame:
+                             cand: dict | None = None, workers: int | None = None) -> pd.DataFrame:
     """classify_movie with the committed definition: hysteresis thresholds in pixels, group rule, side rule, true-vertex clause."""
     d = {**DEFINITION, **(definition or {})}
     p = definition_params(md.dt_s, md.um_per_px, d)
-    return classify_movie(md, p, division_frames, cand, orientation=orientation, side_rule=bool(d["side_rule"]), vertex_clause=bool(d["vertex_clause"]))
+    return classify_movie(md, p, division_frames, cand, orientation=orientation, side_rule=bool(d["side_rule"]), vertex_clause=bool(d["vertex_clause"]),
+                         workers=workers)
 
 
-def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: int = 3, anchor: str = "start") -> pd.DataFrame:
+_JL: dict = {}   # labels / expand handed to the forked worker processes of junction_length_traces
+
+
+def _junction_frame(t: int):
+    from ..celltrack.cells import build_adjacency
+    from .run_tm_fourway_vertices import junctions_one_frame
+    lab = _JL["labels"][t].astype(np.int64)
+    return t, junctions_one_frame(lab, _JL["expand"], 3.0)[1], build_adjacency(lab, expand=_JL["expand"])
+
+
+def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: int = 3, anchor: str = "start",
+                           workers: int | None = None) -> pd.DataFrame:
     """Junction length of the active pair around every event, long table (one row per event and frame). Window = anchor - pre ..
     last swap + post (anchor 'start' = frame_start, 'first_swap' = frame_first_swap); dt = frame - anchor. In every frame the active pair is the
     original pair (sign +1) or the new pair (sign -1) when exactly one of them touches (any contact on the grown labels, as the legacy tables);
@@ -384,10 +447,22 @@ def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: 
         needed.update(range(t0, t1 + 1))
         wins.append((eid, r, first, t0, t1))
     adj, verts3 = {}, {}
-    for t in sorted(needed):
-        lab = md.labels[t].astype(np.int64)
-        verts3[t] = junctions_one_frame(lab, md.expand, 3.0)[1]
-        adj[t] = build_adjacency(lab, expand=md.expand)
+    frames = sorted(needed)
+    n_workers = default_workers(len(frames), workers)
+    if n_workers > 1 and "fork" in mp.get_all_start_methods():
+        # the vertex / adjacency step is plain Python (about 6 s per frame): separate processes, the labels are shared by fork
+        _JL.update(labels=md.labels, expand=md.expand)
+        try:
+            with cf.ProcessPoolExecutor(n_workers, mp_context=mp.get_context("fork")) as pool:
+                for t, v, a in pool.map(_junction_frame, frames, chunksize=2):
+                    verts3[t], adj[t] = v, a
+        finally:
+            _JL.clear()
+    else:
+        for t in frames:
+            lab = md.labels[t].astype(np.int64)
+            verts3[t] = junctions_one_frame(lab, md.expand, 3.0)[1]
+            adj[t] = build_adjacency(lab, expand=md.expand)
     rows = []
     for eid, r, first, t0, t1 in wins:
         quartet = frozenset(int(r[k]) for k in "ABCD")
@@ -420,11 +495,12 @@ def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: 
     return df
 
 
-def write_length_tables(md: MovieData, ev: pd.DataFrame, out: Path, stem: str, pre: int = 3, post: int = 3, anchor: str = "start") -> pd.DataFrame:
+def write_length_tables(md: MovieData, ev: pd.DataFrame, out: Path, stem: str, pre: int = 3, post: int = 3, anchor: str = "start",
+                        workers: int | None = None) -> pd.DataFrame:
     """Legacy wide tables <stem>_junction_lengths{,_signed,_contact_lengths,_contact_lengths_signed}.csv (px) for the states events."""
     from ..output_names import tagged_path
     from .run_tm_t1 import FLAG_NV, TYPE_SORT_ORDER, write_junction_lengths_wide
-    tr = junction_length_traces(md, ev, pre, post, anchor)
+    tr = junction_length_traces(md, ev, pre, post, anchor, workers)
     vp, vs, cp, cs = {}, {}, {}, {}
     for r in tr.itertuples(index=False):
         k = (r.event_id, r.dt)
@@ -462,7 +538,7 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
     md = build_movie_data(np.asarray(stack), float(um_per_px), float(dt_s), "plugin", int(d["expand"]))
     if progress is not None:
         progress(50, "Classifying events")
-    df = classify_with_definition(md, division_frames, d)
+    df = classify_with_definition(md, division_frames, d, workers=1)  # serial: the plugin runs this in a Qt worker thread (no forking there)
     dropped = df.attrs.get("dropped", pd.DataFrame())
     exclude_ids = exclude_ids or set()
     events, four_xy = [], [dict() for _ in range(n)]
@@ -531,11 +607,11 @@ def load_movie(cfg: dict, stem: str, root: Path, cache_dir: Path | None = None, 
 def run_states_cli(*, labels_path: Path, rgb: Path | None, out: Path, stem: str, cal, lineage: Path | None,
                    config: Path | None = None, t_dwell: float | None = None, t_stable: float | None = None, t_end: float | None = None,
                    on_px: float | None = None, off_px: float | None = None, side_rule: bool | None = None,
-                   vertex_clause: bool | None = None, tracked_stem: str | None = None) -> Path:
+                   vertex_clause: bool | None = None, tracked_stem: str | None = None, n_jobs: int | None = None) -> Path:
     """`run_tm_t1.py --classifier states`: classify one movie with the committed definition (DEFINITION; any argument that is not None
     overrides it) and write <stem>_t1_events.csv (legacy columns + new ones), <stem>_qc.json, the junction-length tables of the events
     (vertex-to-vertex and contact length of the active pair, as the legacy tables), the calibrated twins and the picker-ready bundle.
-    `config` (YAML) is only read for `expand` and kept for compatibility."""
+    `config` (YAML) is only read for `expand` and kept for compatibility. `n_jobs`: CPU cores (default: $TISSUEKIT_N_JOBS or all cores of the allocation)."""
     from .calibrated_outputs import write_um_files
     from .t1_picker_ready import _write_one_picker_dir
     cfg = load_config(config) if config is not None and Path(config).is_file() else {}
@@ -545,10 +621,10 @@ def run_states_cli(*, labels_path: Path, rgb: Path | None, out: Path, stem: str,
     labels = np.asarray(tifffile.imread(labels_path))
     um = float(cal.um_per_px) if cal is not None and getattr(cal, "um_per_px", None) else 1.0
     dt = float(cal.s_per_frame) if cal is not None and getattr(cal, "s_per_frame", None) else 1.0
-    md = build_movie_data(labels, um, dt, stem, int(cfg.get("expand", d["expand"])))
+    md = build_movie_data(labels, um, dt, stem, int(cfg.get("expand", d["expand"])), workers=n_jobs)
     p = definition_params(dt, um, d)
     div = load_division_frames(lineage) if lineage is not None and Path(lineage).is_file() else {}
-    df = classify_with_definition(md, div, d)
+    df = classify_with_definition(md, div, d, workers=n_jobs)
     dropped = df.attrs.get("dropped", pd.DataFrame())
     df.attrs = {}
     out.mkdir(parents=True, exist_ok=True)
@@ -561,7 +637,7 @@ def run_states_cli(*, labels_path: Path, rgb: Path | None, out: Path, stem: str,
     (out / f"{stem}_qc.json").write_text(json.dumps(qc, indent=2) + "\n")
     print(f"Wrote {ev_path}: {qc['classes']}; dropped {qc['dropped']}", flush=True)
     if len(df):
-        write_length_tables(md, df, out, stem)
+        write_length_tables(md, df, out, stem, workers=n_jobs)
     write_um_files(out, stem, cal)
     # picker bundle next to the detection folder ONLY (not the shared output/t1_picker_ready/<stem> mirror that the
     # legacy detector writes: that would overwrite the bundle of the legacy run of the same movie)

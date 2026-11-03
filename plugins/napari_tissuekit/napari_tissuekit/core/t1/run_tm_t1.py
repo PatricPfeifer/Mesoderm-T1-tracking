@@ -1568,6 +1568,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--states-config", type=Path, default=None,
                    help="states: optional YAML (expand, definition overrides); the definition itself is t1_states_run.DEFINITION")
+    p.add_argument("--n-jobs", type=int, default=None,
+                   help="states: CPU cores for the per-frame steps (default: $TISSUEKIT_N_JOBS, else all cores of the Slurm allocation)")
     p.add_argument("--t-dwell", type=float, default=None, help="states: dwell time in seconds (default: DEFINITION)")
     p.add_argument("--t-stable", type=float, default=None, help="states: stable time in seconds (default: DEFINITION)")
     p.add_argument("--t-end", type=float, default=None, help="states: a configuration persisting this long ends an event (default: DEFINITION)")
@@ -1732,7 +1734,7 @@ def main(argv=None) -> None:
             out=out, stem=stem, cal=cal, lineage=lineage if Path(lineage).is_file() else None,
             config=args.states_config, t_dwell=args.t_dwell, t_stable=args.t_stable, t_end=args.t_end,
             on_px=args.on_px, off_px=args.off_px, side_rule=False if args.no_side_rule else None,
-            vertex_clause=False if args.no_vertex_clause else None,
+            vertex_clause=False if args.no_vertex_clause else None, n_jobs=args.n_jobs,
         )
         print("Done (states classifier).", flush=True)
         return
