@@ -3,6 +3,9 @@
 
 Saves progress after every frame so a short Slurm walltime can be resumed.
 
+Writes ``*_cp_masks.tif``, ``*_cp_outlines.tif`` (yellow RGB) and ``*_cell_outlines.tif``
+(1 px cell outlines, 255 on black; the plugin's default outline file).
+
 Example (``tissuekit segment`` wraps this with the results-folder layout):
   python -m napari_tissuekit.core.segmentation \
     --input movie.tif --output-dir movie_results/segmentation
@@ -18,7 +21,8 @@ import numpy as np
 from cellpose import models
 from tifffile import imread, imwrite
 
-from .outline_io import masks_to_outline_rgb
+from .outline_io import hand_stack_to_outline, masks_to_outline_rgb
+from .ta_bond_edit import thin_hand_stack
 
 from .movie_calibration import read_calibration, save_tiff  # noqa: E402
 
@@ -105,6 +109,16 @@ def segment_stack(
     return masks
 
 
+def cell_outline_stack(masks: np.ndarray, progress=None) -> np.ndarray:
+    """T,Y,X uint8 stack, 255 on the 1 px cell outlines and 0 elsewhere.
+
+    The same file the napari plugin saves as ``*_cell_outlines.tif``: Tissue Analyzer style
+    1 px bonds from a watershed of the masks, keeping only bond pixels that touch a cell.
+    """
+    hand = thin_hand_stack(masks, progress)
+    return (hand_stack_to_outline(hand) > 0).astype(np.uint8) * 255
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     inp = args.input.expanduser().resolve()
@@ -157,10 +171,23 @@ def main(argv=None) -> None:
     outlines_path = outdir / f"{inp.stem}_cp_outlines.tif"
     outlines = masks_to_outline_rgb(masks)
     save_tiff(outlines_path, outlines, cal)
-    partial.unlink(missing_ok=True)
-    prog.unlink(missing_ok=True)
     print("wrote", out, "max_label", int(masks.max()), flush=True)
     print("wrote", outlines_path, flush=True)
+
+    # Default outline-only output (as in the plugin). The masks are already on disk, so the
+    # checkpoint goes first; a failure here still ends the run with an error.
+    partial.unlink(missing_ok=True)
+    prog.unlink(missing_ok=True)
+    cell_path = outdir / f"{inp.stem}_cell_outlines.tif"
+    last = [-10]
+
+    def _progress(pct: int, msg: str) -> None:
+        if pct >= last[0] + 10:
+            last[0] = pct
+            print(f"  {msg} ({pct}%)", flush=True)
+
+    save_tiff(cell_path, cell_outline_stack(masks, _progress), cal)
+    print("wrote", cell_path, flush=True)
 
 
 if __name__ == "__main__":

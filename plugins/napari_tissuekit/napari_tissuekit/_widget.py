@@ -598,6 +598,13 @@ class TissueKitWidget(QWidget):
         self._seg_base_outlines = None
 
         if self.correction is not None:
+            # A "Segmentation" layer that already exists (e.g. loaded from the results folder) is the one the cell
+            # editing tools must use; otherwise they add a second layer ("Segmentation [1]") and edit that one.
+            existing = self._layer("Segmentation")
+            vis = getattr(self.correction, "vis_manager", None)
+            if isinstance(existing, Labels) and vis is not None and vis.tracking_layer is not existing:
+                vis.tracking_layer = existing
+                self.correction.masks_layer = existing
             self._data_manager.initialize_stack(int(masks.shape[0]))
             self._data_manager.segmentation_data = masks
             self._outline_sync_busy = True
@@ -2077,6 +2084,18 @@ class TissueKitWidget(QWidget):
             self._seg_base_masks = np.asarray(masks).copy()
             loaded.append("segmentation")
         outline_note = ""
+        self._autosave_outlines_ok = False  # loading never rewrites the saved files; only Save does
+        if "segmentation" in found:
+            from .core.project import SEG_MASK_SUFFIXES, _strip_suffix as _strip
+
+            self._seg_stem = (_strip(found["segmentation"][0].name, SEG_MASK_SUFFIXES) or "segmentation").replace("/", "_")
+        if "outlines" not in found and "segmentation" in found:
+            self._pending_outlines = None
+            self._show_segmentation_layers(
+                np.asarray(masks), f"Outline editing ready from the masks (max label {int(np.asarray(masks).max())}). "
+                "Paint/erase bonds, Enter to Apply, then Save."
+            )
+            outline_note = " Bonds are being prepared: wait for 100% before editing."
         if "outlines" in found:
             from .core.movie_calibration import read_calibration
             from .core.outline_io import outline_labels_to_rgb, outlines_rgb_to_masks, rgb_or_labels_to_outline_labels
@@ -2086,7 +2105,6 @@ class TissueKitWidget(QWidget):
             outlines = rgb_or_labels_to_outline_labels(tifffile.imread(ofile))
             self._seg_cal = read_calibration(ofile)
             self._seg_stem = (_strip_suffix(ofile.name, OUTLINE_SUFFIXES) or ofile.stem).replace("/", "_")  # keep the file's own name
-            self._autosave_outlines_ok = "segmentation" in found
             if "segmentation" in found:
                 # masks and outlines: editing starts right away; differences between the file and the masks apply on Enter
                 self._pending_outlines = outlines

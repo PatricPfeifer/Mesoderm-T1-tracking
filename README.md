@@ -90,7 +90,7 @@ Everything lands in `<movie>_results/`:
 
 ```
 movie_cut_results/
-  segmentation/   masks + outlines (.tif)
+  segmentation/   masks, outlines and 1 px cell outlines (.tif)
   tracking/       tracked labels, tracked RGB, tracks / links / events (.csv), qc.json
   t1/             t1_events.csv
   cell_props/     exported measurements and cell selections
