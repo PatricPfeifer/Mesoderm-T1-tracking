@@ -24,6 +24,8 @@ STEPS = ("segmentation", "tracking", "t1", "cell_props")
 # checks this against scripts/output_names.py). Longest suffix first.
 SEG_MASK_SUFFIXES = ("_cp_masks.tif", "_cf_masks.tif")
 TRACK_LABEL_SUFFIXES = ("_cf_tracked_labels.tif", "_tracked_labels.tif")
+# Outline files: 0/255 1 px bonds *_cell_outlines.tif (loaded first) or yellow RGB *_cp_outlines.tif (Cellpose style: a line inside each cell).
+OUTLINE_SUFFIXES = ("_cell_outlines.tif", "_cp_outlines.tif")
 T1_PATTERN = "*.csv"
 # Folder names a step may live in: the plugin's own first, then HPC/script layouts.
 STEP_FOLDERS = {
@@ -154,12 +156,19 @@ class WorkingFolder:
             "tracking": tuple(f"*{s}" for s in TRACK_LABEL_SUFFIXES),
             "t1": (T1_PATTERN,),
         }
+        # Masks and outlines may also sit directly in the chosen folder (not only in a segmentation/ subfolder).
+        seg_dirs = [*_step_dirs(self.root, "segmentation"), self.root]
         for step, pats in patterns.items():
-            files = sorted(
-                {f for d in _step_dirs(self.root, step) for pat in pats for f in d.glob(pat)}
-            )
+            dirs = seg_dirs if step == "segmentation" else _step_dirs(self.root, step)
+            files = sorted({f for d in dirs for pat in pats for f in d.glob(pat)})
             if files:
                 out[step] = files
+        outlines = sorted(
+            {f for d in seg_dirs for suf in OUTLINE_SUFFIXES for f in d.glob(f"*{suf}")},
+            key=lambda f: (not f.name.endswith(OUTLINE_SUFFIXES[0]), f.name),  # *_cell_outlines.tif first
+        )
+        if outlines:
+            out["outlines"] = outlines
         return out
 
     def guess_movie(self) -> Path | None:

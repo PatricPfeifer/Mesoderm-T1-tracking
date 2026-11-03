@@ -153,6 +153,9 @@ class TissueKitWidget(QWidget):
         self._seg_out: Path | None = None
         self._seg_base_masks: np.ndarray | None = None
         self._seg_base_outlines: np.ndarray | None = None
+        self._autosave_outlines_ok = True  # False while editing outlines loaded from a file: never rewrite the file before the user saves
+        self._pending_outlines: np.ndarray | None = None  # imported outlines shown after the bonds are built; their differences apply on Enter
+        self._seg_cal = None  # calibration read from a loaded outlines file (pixel size / frame interval)
         # True while the plugin itself pushes masks into the correction widget, so
         # only the user's cell edits are mirrored onto the Outlines layer.
         self._outline_sync_busy = False
@@ -416,6 +419,7 @@ class TissueKitWidget(QWidget):
             self.status.setText("Select an image layer.")
             return
         self._seg_stem = self._safe_stem(layer.name)
+        self._autosave_outlines_ok = True
         image = _as_tyx(np.asarray(layer.data))
         batch = int(self.seg_batch.value())
         use_gpu = self.seg_gpu.isChecked()
@@ -493,43 +497,58 @@ class TissueKitWidget(QWidget):
     def _start_outline_editing(self) -> None:
         masks_ly = self._layer(self.seg_masks.currentText())
         outlines_ly = self._layer(self.seg_outlines.currentText())
-        if masks_ly is None:
-            self.status.setText("Select a Masks layer (imported *_cp_masks.tif).")
-            return
         if outlines_ly is None:
-            self.status.setText("Select an Outlines layer (imported *_cp_outlines.tif).")
+            self.status.setText("Select an Outlines layer (a *_cp_outlines.tif or *_cell_outlines.tif).")
             return
         try:
-            from .core.outline_io import rgb_or_labels_to_outline_labels
+            from .core.outline_io import outline_labels_to_rgb, outlines_rgb_to_masks, rgb_or_labels_to_outline_labels
         except Exception as exc:
             self.status.setText(f"outline_io import failed: {exc}")
-            return
-        try:
-            masks = _as_tyx(np.asarray(masks_ly.data))
-        except ValueError as exc:
-            self.status.setText(f"Masks layer must be T,Y,X labels: {exc}")
             return
         try:
             outlines = rgb_or_labels_to_outline_labels(np.asarray(outlines_ly.data))
         except Exception as exc:
             self.status.setText(f"Could not read outlines: {exc}")
             return
-        if outlines.shape != masks.shape:
-            self.status.setText(
-                f"Outlines shape {outlines.shape} != masks shape {masks.shape}."
-            )
-            return
-        self._seg_stem = self._safe_stem(masks_ly.name)
+        # No masks (none selected, the outlines layer itself, or a binary image): the cells are the regions between the outlines.
+        from_outlines = masks_ly is None or masks_ly is outlines_ly
+        if not from_outlines:
+            try:
+                first = np.asarray(masks_ly.data[0] if np.ndim(masks_ly.data) == 3 else masks_ly.data)
+                from_outlines = np.unique(first).size <= 2
+            except Exception:
+                pass
+        if from_outlines:
+            masks = outlines_rgb_to_masks(outline_labels_to_rgb(outlines), background="auto")
+            base_name = outlines_ly.name
+        else:
+            try:
+                masks = _as_tyx(np.asarray(masks_ly.data))
+            except ValueError as exc:
+                self.status.setText(f"Masks layer must be T,Y,X labels: {exc}")
+                return
+            base_name = masks_ly.name
+            if outlines.shape != masks.shape:
+                self.status.setText(
+                    f"Outlines shape {outlines.shape} != masks shape {masks.shape}."
+                )
+                return
+        for suffix in ("_cp_outlines", "_cell_outlines", "_cp_masks"):
+            if base_name.endswith(suffix):
+                base_name = base_name[: -len(suffix)]
+        self._seg_stem = base_name.replace("/", "_") if from_outlines else self._safe_stem(base_name)  # outlines file: keep its own name
+        self._autosave_outlines_ok = not from_outlines
+        self._pending_outlines = None if from_outlines else outlines
         # Prefer raw image name for save stem when selected.
         img_ly = self._layer(self.seg_image.currentText())
-        if img_ly is not None:
+        if img_ly is not None and not from_outlines:
             self._seg_stem = self._safe_stem(img_ly.name)
         self._seg_base_masks = masks.copy()
-        # Bonds are rebuilt as 1 px TA bonds from the masks; the imported
-        # outlines are only shape-checked.
+        # Bonds are rebuilt as 1 px TA bonds from the masks (the cells between the outlines when there
+        # are no masks); with masks the imported outlines are only shape-checked.
         self._show_segmentation_layers(
             masks,
-            f"Outline editing ready (max label {int(masks.max())}). "
+            f"Outline editing ready{' from the outlines' if from_outlines else ''} (max label {int(masks.max())}). "
             "Paint/erase bonds, Enter to Apply (TA watershed), then Save.",
         )
         self._refresh_layers()
@@ -618,7 +637,20 @@ class TissueKitWidget(QWidget):
         self._seg_base_outlines = outlines.copy()
         self._replace_labels("Outlines", outlines)
         self._style_outlines_layer(self._layer("Outlines"))
-        self._autosave_outlines()
+        pending, self._pending_outlines = self._pending_outlines, None
+        if pending is not None and not np.array_equal(pending > 0, outlines > 0):
+            from .core.outline_io import outlines_are_edits
+
+            if outlines_are_edits(pending, outlines):
+                # outlines edited outside the plugin: show them; Enter applies the differences to the cells like painted strokes
+                self._replace_labels("Outlines", (pending > 0).astype(outlines.dtype))
+                self._style_outlines_layer(self._layer("Outlines"))
+                self._hand_msg = f"{self._hand_msg} The loaded outlines differ from the masks: press Enter to apply those changes."
+            else:
+                self._hand_msg = (f"{self._hand_msg} The loaded outlines are not 1 px bonds of these masks "
+                                  "(e.g. Cellpose-style *_cp_outlines.tif): bonds are rebuilt from the masks.")
+        if self._autosave_outlines_ok:
+            self._autosave_outlines()
         self.status.setText(self._hand_msg)
 
     def _set_outline_tool(self, mode: str) -> None:
@@ -673,7 +705,7 @@ class TissueKitWidget(QWidget):
                 self._layer(self.seg_image.currentText()),
                 self._layer(self.seg_masks.currentText()),
                 stem=self._seg_stem,
-            )
+            ) or self._seg_cal
             path = self.project.step_dir("segmentation") / f"{stem}_cell_outlines.tif"
             save_tiff(path, (outlines > 0).astype(np.uint8) * 255, cal)
             self._hand_msg = f"{self._hand_msg} Outlines saved to {path.name}."
@@ -939,7 +971,7 @@ class TissueKitWidget(QWidget):
             self._layer(self.seg_image.currentText()),
             self._layer(self.seg_masks.currentText()),
             stem=self._seg_stem,
-        )
+        ) or self._seg_cal
         save_tiff(masks_path, masks.astype(np.uint16, copy=False), cal)
         bonds = self._seg_base_outlines
         if self._seg_base_hand is not None and bonds is not None and bonds.shape == masks.shape:
@@ -2044,6 +2076,37 @@ class TissueKitWidget(QWidget):
             self._replace_labels("Segmentation", masks)
             self._seg_base_masks = np.asarray(masks).copy()
             loaded.append("segmentation")
+        outline_note = ""
+        if "outlines" in found:
+            from .core.movie_calibration import read_calibration
+            from .core.outline_io import outline_labels_to_rgb, outlines_rgb_to_masks, rgb_or_labels_to_outline_labels
+            from .core.project import OUTLINE_SUFFIXES, _strip_suffix
+
+            ofile = Path(found["outlines"][0])
+            outlines = rgb_or_labels_to_outline_labels(tifffile.imread(ofile))
+            self._seg_cal = read_calibration(ofile)
+            self._seg_stem = (_strip_suffix(ofile.name, OUTLINE_SUFFIXES) or ofile.stem).replace("/", "_")  # keep the file's own name
+            self._autosave_outlines_ok = "segmentation" in found
+            if "segmentation" in found:
+                # masks and outlines: editing starts right away; differences between the file and the masks apply on Enter
+                self._pending_outlines = outlines
+                self._show_segmentation_layers(
+                    np.asarray(masks), f"Outline editing ready from {ofile.name} (max label {int(np.asarray(masks).max())}). "
+                    "Paint/erase bonds, Enter to Apply, then Save."
+                )
+                outline_note = " Bonds are being prepared: wait for 100% before editing."
+                loaded.append(f"outlines {ofile.name}")
+            else:
+                self._pending_outlines = None
+                # outlines only: the cells are the regions between them, ready for outline editing and saving
+                masks = outlines_rgb_to_masks(outline_labels_to_rgb(outlines), background="auto")
+                self._seg_base_masks = masks.copy()
+                self._show_segmentation_layers(
+                    masks, f"Outline editing ready from {ofile.name} (max label {int(masks.max())}). "
+                    "Paint/erase bonds, Enter to Apply, then Save (writes *_cp_outlines.tif, *_cell_outlines.tif and *_cp_masks.tif)."
+                )
+                outline_note = " Bonds are being prepared: wait for 100% before editing."
+                loaded.append(f"outlines {ofile.name} (cells derived from the outlines)")
         if "tracking" in found:
             labels = found["tracking"][0]
             self._replace_labels("Tracked", tifffile.imread(labels))
@@ -2054,7 +2117,7 @@ class TissueKitWidget(QWidget):
                 self._replace_image("Tracked RGB", tifffile.imread(rgb))
             loaded.append("tracking")
         self._refresh_layers()
-        self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}")
+        self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}.{outline_note}")
 
     def _replace_labels(self, name: str, data: np.ndarray) -> None:
         if name == "Tracked":  # new tracks: old undo steps and protection are stale
