@@ -125,8 +125,9 @@ More options per step: `python -m napari_tissuekit.core.tracking --help`.
 
 - **No "TissueKit" in the Plugins menu:** you are not in the right environment. Run
   `conda activate tissuekit`, then `pip install -e "plugins/napari_tissuekit[gui]"` again.
-- **Panel says "CellFlow correction tools are not importable":** harmless. That optional
-  manual-correction block needs napariCellFlow, which is not part of this repository.
+- **Panel says "Manual correction tools are not importable":** the draw/delete correction
+  block failed to load (the message shows why, usually `opencv-python` or Qt). Reinstall with
+  `pip install -e "plugins/napari_tissuekit[gui]"`. Everything else still works.
 - **"A job is already running":** wait for the current step to finish (see the status line).
 - **Tracking has poor quality:** make sure *Intensity* is the movie, not `(none)`.
 

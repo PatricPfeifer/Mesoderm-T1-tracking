@@ -381,13 +381,11 @@ class TissueKitWidget(QWidget):
         group = QGroupBox("Manual correction (filled labels, optional)")
         inner = QVBoxLayout()
         try:
-            from napariCellFlow.cell_correction_widget import CellCorrectionWidget
-            from napariCellFlow.data_manager import DataManager
-            from napariCellFlow.visualization_manager import VisualizationManager
+            from .correction import CellCorrectionWidget, DataManager, VisualizationManager
         except Exception as exc:
             self.correction = None
             missing = QLabel(
-                "CellFlow correction tools are not importable "
+                "Manual correction tools are not importable "
                 f"({exc}). Outline edit/save still work."
             )
             missing.setWordWrap(True)

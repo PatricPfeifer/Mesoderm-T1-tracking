@@ -1,7 +1,7 @@
 """Headless Tissue Analyzer bond correction (EPySeg ``paint2`` algorithms).
 
 Ports ``Createpaintwidget.apply_drawing`` and ``manually_reseeded_wshed`` to
-numpy arrays, calling vendored ``neo_wshed.wshed``.
+numpy arrays, calling the ported EPySeg ``wshed`` (``_wshed.py``).
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from scipy import ndimage as ndi
 from skimage.measure import label, regionprops
 from skimage.segmentation import expand_labels, find_boundaries
 
-from .epyseg_bootstrap import import_wshed
+from ._wshed import wshed
 
 
 def labels_to_hand(labels: np.ndarray) -> np.ndarray:
@@ -106,7 +106,6 @@ def erased_into_background(
 
 def thin_hand(labels_t: np.ndarray) -> np.ndarray:
     """Labels (one frame) → TA handCorrection with 1 px bonds."""
-    wshed = import_wshed()
     hand = labels_to_hand(labels_t)
     ext = exterior_mask(hand)
     thin = np.asarray(wshed(hand, seeds="mask"), dtype=np.uint8)
@@ -121,7 +120,6 @@ def thin_hand_stack(masks: np.ndarray, progress=None) -> np.ndarray:
         stack = stack[np.newaxis, ...]
     out = np.empty(stack.shape, dtype=np.uint8)
     n = stack.shape[0]
-    import_wshed()  # import once before the worker threads start
     # skimage watershed releases the GIL, so frames thin in parallel.
     workers = max(1, min(8, os.cpu_count() or 1))
     with ThreadPoolExecutor(workers) as pool:
@@ -244,7 +242,6 @@ def apply_drawing_hand(
     ``pad`` is the context margin around the edit (TA uses 128).
     """
     pad = int(pad)
-    wshed = import_wshed()
     drawn_mask = np.asarray(hand, dtype=np.uint8).copy()
     erased = np.asarray(erased)
     drawn = np.asarray(drawn)
@@ -346,7 +343,6 @@ def manually_reseeded_wshed_hand(
     seed_mask: np.ndarray,
 ) -> np.ndarray:
     """Port of ``Createpaintwidget.manually_reseeded_wshed``."""
-    wshed = import_wshed()
     img = np.asarray(image_yx)
     if img.ndim == 3:
         img = img[..., 0] if img.shape[-1] <= 4 else img[0]
