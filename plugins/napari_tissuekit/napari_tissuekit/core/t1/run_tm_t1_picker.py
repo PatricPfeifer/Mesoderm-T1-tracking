@@ -824,17 +824,10 @@ def event_passes_filter(ev: T1Event, mode: str) -> bool:
         return True
     if mode == "all":
         return ev.kind == "completed"
-    if mode.startswith("persist_"):
-        n = int(mode.split("_", 1)[1])
-        if ev.persist_pre < 0 or ev.persist_post < 0:
-            return False
-        return (
-            ev.kind == "completed"
-            and ev.persist_pre >= n
-            and ev.persist_post >= n
-        )
     if mode in ("flicker_resolved", "flicker_aborted"):
         return ev.etype() == mode
+    if mode == "clean":  # state classifier: a clean event is the only one with type "completed"
+        return ev.kind == "completed" and ev.etype() == "completed"
     return ev.kind == "completed"
 
 
@@ -1883,11 +1876,9 @@ def run_gui(
             right.addWidget(QLabel("T1 filter"))
             self.filter_box = QComboBox()
             for key, label in (
-                ("all", "Completed (baseline)"),
-                ("all_kinds", "All kinds"),
-                ("persist_3", "Persist 3"),
-                ("persist_5", "Persist 5"),
-                ("persist_7", "Persist 7"),
+                ("all", "Completed (clean + flicker resolved)"),
+                ("all_kinds", "All counted events"),
+                ("clean", "Clean"),
                 ("flicker_resolved", "Flicker resolved"),
                 ("flicker_aborted", "Flicker aborted"),
             ):
@@ -2223,9 +2214,7 @@ def run_gui(
 FILTER_CHOICES = (
     "all",
     "all_kinds",
-    "persist_3",
-    "persist_5",
-    "persist_7",
+    "clean",
     "flicker_resolved",
     "flicker_aborted",
 )
@@ -2314,7 +2303,7 @@ def parse_args() -> argparse.Namespace:
         "--filter",
         choices=FILTER_CHOICES,
         default="all",
-        help="Event filter for --select-all / --headless (default: all = completed).",
+        help="Event filter for --select-all / --headless (default: all = clean + flicker resolved).",
     )
     return p.parse_args()
 

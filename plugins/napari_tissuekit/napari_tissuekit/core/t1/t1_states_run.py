@@ -446,6 +446,66 @@ def write_length_tables(md: MovieData, ev: pd.DataFrame, out: Path, stem: str, p
     return tr
 
 
+def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: np.ndarray | None = None, definition: dict | None = None,
+                     pre: int = 3, post: int = 3, exclude_ids: set[int] | None = None, division_frames: dict[int, list[int]] | None = None,
+                     progress=None) -> dict:
+    """Plugin counterpart of `run_t1_stack` for the state classifier: classify a (T,Y,X) tracked label stack with the committed definition
+    (DEFINITION, optionally overridden) and return the same kind of result dict (events as dicts with t_start / t_end / quartet / pair_before /
+    pair_after / type, overlay, dots, ...), so the plugin's filter, overlay and autosave code works on it unchanged. `um_per_px` and `dt_s`
+    are needed: the thresholds are pixel counts but the persistence times are seconds. Events have the legacy `type` (completed / flicker_resolved /
+    flicker_aborted) and the new `t1_class` (clean / flicker_resolved / flicker_aborted); pair_after is the pair the quartet ends on."""
+    from .run_tm_t1 import grayscale_rgb, labels_gray_rgb, render_fourway_dots, render_overlay
+    d = {**DEFINITION, **(definition or {})}
+    n = int(stack.shape[0])
+    if progress is not None:
+        progress(5, "Measuring contacts")
+    md = build_movie_data(np.asarray(stack), float(um_per_px), float(dt_s), "plugin", int(d["expand"]))
+    if progress is not None:
+        progress(50, "Classifying events")
+    df = classify_with_definition(md, division_frames, d)
+    dropped = df.attrs.get("dropped", pd.DataFrame())
+    exclude_ids = exclude_ids or set()
+    events, four_xy = [], [dict() for _ in range(n)]
+    n_excluded = 0
+    for r in df.to_dict("records"):
+        quartet = frozenset(int(r[k]) for k in "ABCD")
+        if quartet & exclude_ids:
+            n_excluded += 1
+            continue
+        orig = frozenset(int(v) for v in str(r["pair_breaking"]).split(";"))
+        new = frozenset(int(v) for v in str(r["pair_building"]).split(";"))
+        r.update(quartet=quartet, pair_before=orig, pair_after=(new if int(r["n_flips"]) % 2 else orig),
+                 t_start=int(r["frame_start"]), t_end=int(r["frame_end"]), t_first_swap=int(r["frame_first_swap"]),
+                 t_before=int(r["frame_before"]), t_after=int(r["frame_after"]))
+        sel = sorted(quartet)
+        for t in range(r["t_start"], r["t_end"] + 1):
+            ok = [c for c in sel if md.present[t, c]]
+            if ok:
+                four_xy[t][quartet] = (float(np.nanmean(md.cy[t, ok])), float(np.nanmean(md.cx[t, ok])))
+        events.append(r)
+    labels_list = [stack[t] for t in range(n)]
+    if rgb is not None:
+        overlay_base = grayscale_rgb(rgb)
+    else:
+        max_lab = int(stack.max()) if stack.size else 0
+        overlay_base = np.empty((n, stack.shape[1], stack.shape[2], 3), dtype=np.uint8)
+        for t in range(n):
+            overlay_base[t] = labels_gray_rgb(stack[t], max_lab)
+    overlay = render_overlay(overlay_base, labels_list, events, four_xy, pre=pre, post=post, reach=int(d["expand"]))
+    dots = render_fourway_dots(stack, events, four_xy, rgb=rgb)
+    classes = pd.Series([e["t1_class"] for e in events]).value_counts().to_dict()
+    reasons = dropped["drop_reason"].value_counts().to_dict() if len(dropped) else {}
+    note = (f"Event definition: {d['on_px']:g} px on / {d['off_px']:g} px off, new state held {d['t_stable_s']:g} s, event ends after "
+            f"{d['t_end_s']:g} s of persistence; side-cell rule {'on' if d['side_rule'] else 'off'}, vertex clause {'on' if d['vertex_clause'] else 'off'}. "
+            f"Classes {classes}; not counted: {reasons}.")
+    if progress is not None:
+        progress(100, f"T1s={len(events)}")
+    return {"classifier": "states", "definition": d, "stack": stack, "frame_indices": np.arange(n), "events": events, "events_shown": events,
+            "four_xy": four_xy, "adj": [], "present": [], "overlay": overlay, "dots": dots, "overlay_base": overlay_base, "n_frames": n,
+            "n_t1_confirmed": len(events), "n_excluded_events": n_excluded, "classes": classes, "dropped": reasons, "swap_note": note,
+            "expand": int(d["expand"]), "pre": pre, "post": post}
+
+
 def load_config(path) -> dict:
     return yaml.safe_load(Path(path).read_text())
 

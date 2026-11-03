@@ -909,7 +909,12 @@ T1_FILTER_MODES = (
 
 
 def event_passes_filter(event: dict, mode: str) -> bool:
-    """True if a scored event belongs in ``mode`` (plugin / picker)."""
+    """True if a scored event belongs in ``mode`` (plugin / picker).
+    Events of the state classifier carry ``t1_class`` (clean / flicker_resolved / flicker_aborted): "all" shows every counted event."""
+    if "t1_class" in event:
+        if mode in ("all", "all_kinds"):
+            return True
+        return mode in ("clean", "flicker_resolved", "flicker_aborted") and event["t1_class"] == mode
     kind = str(event.get("kind", "completed"))
     persist_pre = int(event.get("persist_pre", -1))
     persist_post = int(event.get("persist_post", -1))
@@ -1558,8 +1563,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--classifier",
         choices=("legacy", "states"),
-        default="legacy",
-        help="legacy = 4-way / swap detector (default); states = O/N/V state machine (t1_states.py)",
+        default="states",
+        help="states = O/N/V state machine with the latest event definition, t1_states_run.DEFINITION (default); legacy = old 4-way / swap detector",
     )
     p.add_argument("--states-config", type=Path, default=None,
                    help="states: optional YAML (expand, definition overrides); the definition itself is t1_states_run.DEFINITION")

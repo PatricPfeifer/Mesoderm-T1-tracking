@@ -1820,23 +1820,16 @@ class TissueKitWidget(QWidget):
         self.t1_labels = QComboBox()
         self.t1_rgb = QComboBox()
         self.t1_expand = self._spin(1, 20, 3)
-        self.t1_bond = self._dspin(0.0, 50.0, 3.0, 0.5)
-        self.t1_rings = self._spin(0, 5, 1)
         self.t1_filter = QComboBox()
-        self.t1_filter.addItem("All (baseline)", "all")
-        self.t1_filter.addItem("Persist 3", "persist_3")
-        self.t1_filter.addItem("Persist 5", "persist_5")
-        self.t1_filter.addItem("Persist 7", "persist_7")
-        self.t1_filter.addItem("Flicker resolved", "flicker_resolved")
-        self.t1_filter.addItem("Flicker aborted", "flicker_aborted")
+        for label, key in (("All counted events", "all"), ("Clean", "clean"), ("Flicker resolved", "flicker_resolved"),
+                           ("Flicker aborted", "flicker_aborted")):
+            self.t1_filter.addItem(label, key)
         self.t1_filter.currentIndexChanged.connect(self._apply_t1_filter)
         self.t1_pre = self._spin(0, 40, 3)
         self.t1_post = self._spin(0, 40, 3)
         form.addRow("Labels", self.t1_labels)
         form.addRow("RGB", self.t1_rgb)
         form.addRow("Expand", self.t1_expand)
-        form.addRow("Bond cutoff", self.t1_bond)
-        form.addRow("Border rings", self.t1_rings)
         form.addRow("T1 filter", self.t1_filter)
         form.addRow("Overlay pre", self.t1_pre)
         form.addRow("Overlay post", self.t1_post)
@@ -1872,25 +1865,25 @@ class TissueKitWidget(QWidget):
         rgb = None
         if isinstance(rgb_layer, Image):
             rgb = _as_rgb(np.asarray(rgb_layer.data)).copy()
-        kwargs = dict(
-            expand=int(self.t1_expand.value()),
-            bond_cutoff=float(self.t1_bond.value()),
-            border_rings=int(self.t1_rings.value()),
-            pre=int(self.t1_pre.value()),
-            post=int(self.t1_post.value()),
-            length_window=0,
-        )
-        if (
-            self.t1_exclude_div.isChecked()
-            and self._division_ids
-            and labels.name == "Tracked"
-        ):
-            kwargs["exclude_ids"] = set(self._division_ids)
+        cal = self._calibration(labels, rgb_layer)
+        um = getattr(cal, "um_per_px", None)
+        dt = getattr(cal, "s_per_frame", None)
+        if not um or not dt:
+            self.status.setText(
+                "The T1 definition needs the pixel size and the frame interval of the movie (not found). "
+                "Save the movie with its calibration."
+            )
+            return
+        exclude = set(self._division_ids) if (
+            self.t1_exclude_div.isChecked() and self._division_ids and labels.name == "Tracked") else None
+        pre, post = int(self.t1_pre.value()), int(self.t1_post.value())
+        definition = {"expand": int(self.t1_expand.value())}
 
         def work(progress):
-            from .core.t1.run_tm_t1 import run_t1_stack
+            from .core.t1.t1_states_run import run_states_stack
 
-            return run_t1_stack(stack, rgb=rgb, progress=progress, **kwargs)
+            return run_states_stack(stack, um_per_px=float(um), dt_s=float(dt), rgb=rgb, definition=definition,
+                                    pre=pre, post=post, exclude_ids=exclude, progress=progress)
 
         self._start(work, self._t1_done)
 
@@ -1907,18 +1900,16 @@ class TissueKitWidget(QWidget):
         result = self._t1_result
         if not result:
             return
-        from .core.t1.run_tm_t1 import fourway_counts, paint_t1_filter
+        from .core.t1.run_tm_t1 import paint_t1_filter
 
         mode = str(self.t1_filter.currentData() or "all")
         overlay, dots, shown = paint_t1_filter(result, mode)
         self._replace_image("T1 overlay", overlay)
         self._replace_image("T1 four-ways", dots)
         total = len(result.get("events") or [])
-        n_4v, n_no4 = fourway_counts(shown)
         self.status.setText(
-            f"T1 filter {self.t1_filter.currentText()}: "
-            f"showing {len(shown)} of {total}. "
-            f"4-cell vertex {n_4v}, no 4-way {n_no4}."
+            f"T1 filter {self.t1_filter.currentText()}: showing {len(shown)} of {total}. "
+            f"Classes {result.get('classes', {})}; not counted {result.get('dropped', {})}."
         )
 
     # ---- working folder ---------------------------------------------------
@@ -2019,8 +2010,7 @@ class TissueKitWidget(QWidget):
             pd.DataFrame(rows).to_csv(wf.step_dir("t1") / "t1_events.csv", index=False)
             wf.write_settings(
                 "t1",
-                {"expand": int(self.t1_expand.value()), "bond_cutoff": float(self.t1_bond.value()),
-                 "border_rings": int(self.t1_rings.value())},
+                {"expand": int(self.t1_expand.value()), "definition": result.get("definition")},
             )
             self.status.setText(f"{self.status.text()} Saved {len(rows)} T1 events to {wf.step_dir('t1', create=False)}")
         except Exception as exc:  # saving must never break the analysis
