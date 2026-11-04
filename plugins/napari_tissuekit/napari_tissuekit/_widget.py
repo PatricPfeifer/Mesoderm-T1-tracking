@@ -859,6 +859,14 @@ class TissueKitWidget(QWidget):
         )
         self.track_divisions.toggled.connect(self._track_divisions_toggled)
         form.addRow("", self.track_divisions)
+        self.track_show_edge = QCheckBox("Show edge cells (Not recommended)")
+        self.track_show_edge.setToolTip(
+            "Off (default): cells whose track touches the image edge in any frame "
+            "are hidden in the Tracked layers, since their shape and neighbours "
+            "are cut off. Files written to disk always keep every track. "
+            "Applies when tracking is run."
+        )
+        form.addRow("", self.track_show_edge)
         tipped("Max gap", self.track_gap, "gap")
         tipped("Max distance", self.track_dist, "dist")
         tipped("CPU cores", self.track_jobs, "jobs")
@@ -1193,9 +1201,21 @@ class TissueKitWidget(QWidget):
             wf.write_settings("tracking", params, movie=movie_path)
             saved = f" Saved to {wf.step_dir('tracking', create=False)}"
         self._track_run = None
-        self._replace_labels("Tracked", result["tracked"])
-        if result.get("rgb") is not None:
-            self._replace_image("Tracked RGB", result["rgb"])
+        tracked, rgb = result["tracked"], result.get("rgb")
+        hidden = 0
+        if not self.track_show_edge.isChecked():
+            from .core.tracking import edge_track_ids
+
+            edge_ids = edge_track_ids(tracked)
+            if edge_ids:
+                hide = np.isin(tracked, list(edge_ids))
+                tracked = np.where(hide, 0, tracked).astype(tracked.dtype)
+                if rgb is not None:
+                    rgb = np.where(hide[..., np.newaxis], 0, rgb).astype(rgb.dtype)
+                hidden = len(edge_ids)
+        self._replace_labels("Tracked", tracked)
+        if rgb is not None:
+            self._replace_image("Tracked RGB", rgb)
         qc = result.get("qc") or {}
         track_result = result["result"]
         parents = getattr(track_result, "parents", {}) or {}
@@ -1206,6 +1226,8 @@ class TissueKitWidget(QWidget):
                 f" divisions={qc.get('n_divide', 0)} "
                 f"(flagged {qc.get('n_divide_flagged', 0)})"
             )
+        if hidden:
+            extra += f" (hid {hidden} edge tracks)"
         self.status.setText(
             f"Tracking done. tracks={qc.get('n_tracks', track_result.n_tracks)}{extra}{saved}"
         )

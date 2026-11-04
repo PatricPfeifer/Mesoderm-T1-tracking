@@ -129,6 +129,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def edge_track_ids(stack, margin: int = 1) -> set[int]:
+    """IDs of tracks that touch the image edge (within ``margin`` px) in any frame."""
+    import numpy as np
+
+    stack = np.asarray(stack)
+    if stack.ndim == 2:
+        stack = stack[np.newaxis]
+    margin = max(int(margin), 1)
+    edge = np.zeros(stack.shape[1:], dtype=bool)
+    edge[:margin], edge[-margin:], edge[:, :margin], edge[:, -margin:] = True, True, True, True
+    return set(np.unique(stack[:, edge]).tolist()) - {0}
+
+
 def write_interior_tracks(out_dir: Path, margin: int) -> None:
     """Track everything, then drop whole tracks that touch the image edge in any frame."""
     import numpy as np
@@ -138,9 +151,7 @@ def write_interior_tracks(out_dir: Path, margin: int) -> None:
     lab_path = next(out_dir.glob("*_tracked_labels.tif"))
     csv_path = next(out_dir.glob("*_tracks.csv"))
     stack = np.array(imread(lab_path))
-    edge = np.zeros(stack.shape[1:], dtype=bool)
-    edge[:margin], edge[-margin:], edge[:, :margin], edge[:, -margin:] = True, True, True, True
-    border_ids = set(np.unique(stack[:, edge]).tolist()) - {0}
+    border_ids = edge_track_ids(stack, margin)
     stack[np.isin(stack, list(border_ids))] = 0
     imwrite(out_dir / lab_path.name.replace("_tracked_labels", "_tracked_labels_interior"), stack)
     df = pd.read_csv(csv_path)
