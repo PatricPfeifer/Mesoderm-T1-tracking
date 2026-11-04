@@ -105,10 +105,42 @@ def erased_into_background(
     return np.isin(cells_after, ids)
 
 
+MAX_ENCLOSED_GAP = 5.0  # px: half-width (distance to the nearest cell) up to which an enclosed empty gap is closed
+
+
+def outside_background(ext: np.ndarray, labels: np.ndarray, max_gap: float = MAX_ENCLOSED_GAP) -> np.ndarray:
+    """The part of ``ext`` (see :func:`exterior_mask`) that really is outside the tissue.
+
+    Segmentation leaves small empty gaps between cells. A gap that is enclosed by cells (does not reach the image
+    edge) and whose half-width is at most ``max_gap`` px is not outside: the neighbouring cells meet in it, so it
+    gets one membrane instead of one outline line on each side. Larger holes and the background outside the tissue
+    stay empty.
+    """
+    background = np.asarray(labels) == 0
+    regions = label(background, connectivity=1)
+    n = int(regions.max())
+    if n == 0 or not ext.any():
+        return ext
+    widest = np.asarray(ndi.maximum(ndi.distance_transform_edt(background), regions, np.arange(1, n + 1)))
+    edge = np.unique(np.concatenate([regions[0], regions[-1], regions[:, 0], regions[:, -1]]))
+    closed = np.zeros(n + 1, dtype=bool)
+    closed[1:] = widest <= max_gap
+    closed[edge] = False
+    closed[0] = False
+    gaps = closed[regions]
+    if not gaps.any():
+        return ext
+    ext_regions = label(ext, connectivity=1)
+    touched = np.zeros(int(ext_regions.max()) + 1, dtype=bool)
+    touched[np.unique(ext_regions[gaps & ext])] = True  # an ext area that holds a closed gap is the gap (plus its rim)
+    touched[0] = False
+    return ext & ~touched[ext_regions]
+
+
 def thin_hand(labels_t: np.ndarray) -> np.ndarray:
     """Labels (one frame) → TA handCorrection with 1 px bonds."""
     hand = labels_to_hand(labels_t)
-    ext = exterior_mask(hand)
+    ext = outside_background(exterior_mask(hand), labels_t)
     thin = np.asarray(wshed(hand, seeds="mask"), dtype=np.uint8)
     thin[ext] = 255
     return thin

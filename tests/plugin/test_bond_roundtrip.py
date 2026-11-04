@@ -1,5 +1,6 @@
 import numpy as np
 from scipy import ndimage as ndi
+from skimage.measure import label
 from skimage.segmentation import find_boundaries, watershed
 
 from napari_tissuekit.core.outline_io import hand_to_outline
@@ -38,3 +39,16 @@ def test_other_outlines_fall_back_to_rebuilt_bonds():
     assert hand_from_outlines(masks, cellpose_style) is None
     stack = hand_stack_from_outlines(masks[None], cellpose_style[None])
     assert np.array_equal(stack[0], thin_hand(masks))
+
+
+def test_enclosed_gap_between_cells_gets_one_membrane():
+    masks = _tissue()
+    masks[60:120, 100:104] = 0  # a 4 px wide gap the segmentation left between cells, fully inside the tissue
+    hand = thin_hand(masks)
+    strip = hand[70:110, 100:104] == 255
+    assert strip.mean() < 0.4  # the cells meet in the gap: a 1 px line, not an empty strip with a line on each side
+    big = masks.copy()
+    big[40:140, 90:130] = 0  # a large hole stays empty
+    assert (thin_hand(big)[60:120, 100:120] == 255).mean() > 0.9
+    sizes = np.bincount(label(thin_hand(masks), connectivity=1, background=255).ravel())[1:]
+    assert sizes.min() >= 4  # closing the gap leaves no stray 1 px cells
