@@ -124,6 +124,7 @@ HELP_HTML = """
 <li><b>Save segmentation (Ctrl+S)</b>: write masks and outlines (<code>*_cp_masks.tif</code>, <code>*_cp_outlines.tif</code>, <code>*_cell_outlines.tif</code>).</li>
 <li><b>Export TIFF</b>: same as Save.</li>
 <li>A cell needs at least <b>15 px</b> in every step (segmentation, outline edits, manual drawing, tracking); smaller regions are dropped or refused.</li>
+<li><b>Ctrl/Cmd+Z</b> takes back the last paint stroke that is not applied yet; otherwise the last applied bond edit (Enter) or manual cell edit.</li>
 <li><b>M</b> hides or shows the outlines. <i>Watershed pad</i>: area around an edit that is recomputed (smaller = faster).</li>
 <li><b>Manual correction</b> (filled cells): hold Option/Ctrl, click a cell to delete it, drag around an area to draw a new cell, Ctrl/Cmd+Z undoes.</li>
 </ul>
@@ -593,12 +594,13 @@ class TissueKitWidget(QWidget):
         if img_ly is not None and not from_outlines:
             self._seg_stem = self._safe_stem(img_ly.name)
         self._seg_base_masks = masks.copy()
-        # Bonds are rebuilt as 1 px TA bonds from the masks (the cells between the outlines when there
-        # are no masks); with masks the imported outlines are only shape-checked.
+        # The imported outlines are the starting bonds where they are the plugin's own 1 px bonds; other
+        # frames get 1 px TA bonds rebuilt from the masks (the cells between the outlines when there are no masks).
         self._show_segmentation_layers(
             masks,
             f"Outline editing ready{' from the outlines' if from_outlines else ''} (max label {int(masks.max())}). "
             "Paint/erase bonds, Enter to Apply (TA watershed), then Save.",
+            saved_outlines=outlines,
         )
         self._refresh_layers()
 
@@ -616,7 +618,28 @@ class TissueKitWidget(QWidget):
         sc_save = QShortcut(QKeySequence("Ctrl+S"), self)
         sc_save.setContext(Qt.ApplicationShortcut)
         sc_save.activated.connect(self._save_segmentation)
-        self._bond_shortcuts = (sc_enter, sc_pad, sc_toggle, sc_save)
+        # Ctrl/Cmd+Z for the whole outline editor. napari's own Labels undo (bound on the active Outlines layer) would
+        # otherwise win and replay old paint strokes; this one first takes back unapplied strokes, then applied steps.
+        sc_undo = QShortcut(QKeySequence.Undo, self)
+        sc_undo.setContext(Qt.ApplicationShortcut)
+        sc_undo.activated.connect(self._undo_edit)
+        self._bond_shortcuts = (sc_enter, sc_pad, sc_toggle, sc_save, sc_undo)
+
+    def _undo_edit(self) -> None:
+        """Ctrl/Cmd+Z: take back strokes not applied yet (napari's paint history), else the last applied step
+        (a bond edit with Enter, or a manual cell edit)."""
+        ol = self._layer("Outlines")
+        history = getattr(ol, "_undo_history", None)
+        if isinstance(ol, Labels) and history and self._seg_base_outlines is not None:
+            from .core.ta_bond_edit import changed_frames
+
+            edited = np.asarray(ol.data)
+            if edited.shape == self._seg_base_outlines.shape and changed_frames(self._seg_base_outlines, edited):
+                ol.undo()
+                self.status.setText("Undid the last paint stroke.")
+                return
+        if self.correction is not None:
+            self.correction.undo_last_action()
 
     def _toggle_outlines_visibility(self) -> None:
         ol = self._layer("Outlines")
@@ -626,8 +649,9 @@ class TissueKitWidget(QWidget):
                 f"Outlines {'shown' if ol.visible else 'hidden'} (M)."
             )
 
-    def _show_segmentation_layers(self, masks: np.ndarray, message: str) -> None:
-        """Show masks, then build 1 px TA bonds in the background for Outlines."""
+    def _show_segmentation_layers(self, masks: np.ndarray, message: str, saved_outlines: np.ndarray | None = None) -> None:
+        """Show masks, then build 1 px TA bonds in the background for Outlines. ``saved_outlines`` (0/1, T,Y,X) are kept
+        as the starting bonds where they are the plugin's own 1 px bonds, so loading a saved edit moves no line."""
         masks = np.asarray(masks)
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
@@ -645,6 +669,7 @@ class TissueKitWidget(QWidget):
             if isinstance(existing, Labels) and vis is not None and vis.tracking_layer is not existing:
                 vis.tracking_layer = existing
                 self.correction.masks_layer = existing
+            self.correction.undo_stack.clear()  # older steps belong to the previous masks
             self._data_manager.initialize_stack(int(masks.shape[0]))
             self._data_manager.segmentation_data = masks
             self._outline_sync_busy = True
@@ -671,9 +696,9 @@ class TissueKitWidget(QWidget):
 
         def work(progress):
             from .core.outline_io import hand_stack_to_outline
-            from .core.ta_bond_edit import thin_hand_stack
+            from .core.ta_bond_edit import hand_stack_from_outlines, thin_hand_stack
 
-            hand = thin_hand_stack(masks, progress)
+            hand = hand_stack_from_outlines(masks, saved_outlines, progress) if saved_outlines is not None else thin_hand_stack(masks, progress)
             return hand, hand_stack_to_outline(hand)
 
         self._start(work, self._hand_ready)
@@ -793,6 +818,8 @@ class TissueKitWidget(QWidget):
         if edited.ndim == 2:
             edited = edited[np.newaxis, ...]
         frames = changed_frames(self._seg_base_outlines, edited)
+        # cells, bonds and outlines of the frames about to change, for Undo (the edit writes into these arrays in place)
+        before = {int(t): (self._seg_base_masks[t].copy(), self._seg_base_hand[t].copy(), self._seg_base_outlines[t].copy()) for t in frames}
         if not frames:
             self.status.setText("No bond edits to apply.")
             return False
@@ -812,6 +839,8 @@ class TissueKitWidget(QWidget):
             return False
 
         self._commit_seg(updated, frames, rois)
+        if rois:
+            self._push_bond_undo(before)
         if not rois:
             self.status.setText(
                 "No cells changed. A stroke outside the tissue must enclose "
@@ -824,6 +853,27 @@ class TissueKitWidget(QWidget):
             f"{int(self._seg_base_masks.max())}."
         )
         return True
+
+    def _push_bond_undo(self, before: dict) -> None:
+        """Make the bond edit just applied one Undo step (Ctrl/Cmd+Z), shared with the manual cell edits."""
+        if self.correction is None:
+            return
+        from .correction import ActionType, UndoAction
+
+        def restore() -> None:
+            masks, hand, outlines = self._seg_base_masks, self._seg_base_hand, self._seg_base_outlines
+            if masks is None or hand is None or outlines is None:
+                return
+            frames = [t for t in before if t < masks.shape[0]]
+            for t in frames:
+                masks[t], hand[t], outlines[t] = before[t]
+            self._commit_seg(masks, frames, [])
+            self.status.setText(f"Undid the bond edit on {len(frames)} frame(s).")
+
+        self.correction.undo_stack.append(UndoAction(
+            action_type=ActionType.BOND, frame=None, description=f"bond edit on {len(before)} frame(s)",
+            affected_cell_ids=set(), restore=restore,
+        ))
 
     def _commit_seg(self, updated: np.ndarray, frames: list[int], rois: list) -> None:
         """Push changed frames into the Segmentation / Outlines layers in place."""
@@ -853,6 +903,9 @@ class TissueKitWidget(QWidget):
             # Whole frame: also resets stray painted pixels outside any ROI.
             for t in frames:
                 ol_data[t] = outlines[t]
+            for history in (getattr(ol, "_undo_history", None), getattr(ol, "_redo_history", None)):
+                if history is not None:
+                    history.clear()  # the strokes it holds are applied (or undone) now
             ol.refresh()
         else:
             self._replace_labels("Outlines", outlines.copy())
@@ -2106,7 +2159,7 @@ class TissueKitWidget(QWidget):
                 self._pending_outlines = outlines
                 self._show_segmentation_layers(
                     np.asarray(masks), f"Outline editing ready from {ofile.name} (max label {int(np.asarray(masks).max())}). "
-                    "Paint/erase bonds, Enter to Apply, then Save."
+                    "Paint/erase bonds, Enter to Apply, then Save.", saved_outlines=outlines,
                 )
                 outline_note = " Bonds are being prepared: wait for 100% before editing."
                 loaded.append(f"outlines {ofile.name}")
@@ -2117,7 +2170,8 @@ class TissueKitWidget(QWidget):
                 self._seg_base_masks = masks.copy()
                 self._show_segmentation_layers(
                     masks, f"Outline editing ready from {ofile.name} (max label {int(masks.max())}). "
-                    "Paint/erase bonds, Enter to Apply, then Save (writes *_cp_outlines.tif, *_cell_outlines.tif and *_cp_masks.tif)."
+                    "Paint/erase bonds, Enter to Apply, then Save (writes *_cp_outlines.tif, *_cell_outlines.tif and *_cp_masks.tif).",
+                    saved_outlines=outlines,
                 )
                 outline_note = " Bonds are being prepared: wait for 100% before editing."
                 loaded.append(f"outlines {ofile.name} (cells derived from the outlines)")

@@ -132,6 +132,72 @@ def thin_hand_stack(masks: np.ndarray, progress=None) -> np.ndarray:
     return out
 
 
+def hand_from_outlines(labels_t: np.ndarray, outlines_t: np.ndarray) -> np.ndarray | None:
+    """handCorrection of one frame rebuilt from saved 1 px outlines (no re-thinning), or None.
+
+    The regions between the outlines that hold a labelled pixel are the cells; everything else (the outlines and
+    the empty background outside the tissue) is 255. The result is only returned when it reproduces the saved
+    outlines exactly and has one cell per label, so a file that is not the plugin's own 1 px bonds (e.g.
+    Cellpose-style outlines) falls back to :func:`thin_hand`.
+    """
+    from .outline_io import hand_to_outline
+
+    lab = np.asarray(labels_t)
+    out = np.asarray(outlines_t) > 0
+    if lab.shape != out.shape:
+        return None
+    regions = label(~out, connectivity=1, background=0)
+    labelled = (lab > 0) & ~out
+    size = np.bincount(regions.ravel(), minlength=int(regions.max()) + 1)
+    n_labelled = np.bincount(regions[labelled], minlength=size.size)
+    # a cell is a region that is mostly labelled (the empty background outside the tissue may hold a few stray labelled pixels)
+    has_cell = n_labelled * 2 >= size
+    has_cell[0] = False
+    # a label keeps only the region that holds most of its pixels (small pockets of a label stay bond / background)
+    sel = labelled & has_cell[regions]
+    base = int(lab.max()) + 1
+    keys, counts = np.unique(regions[sel].astype(np.int64) * base + lab[sel], return_counts=True)
+    key_region, key_label = keys // base, keys % base
+    order = np.lexsort((counts, key_label))
+    last = np.ones(order.size, dtype=bool)
+    last[:-1] = key_label[order][1:] != key_label[order][:-1]
+    keep = np.zeros_like(has_cell)
+    keep[key_region[order][last]] = True
+    has_cell &= keep
+    hand = np.where(has_cell[regions], 0, 255).astype(np.uint8)
+    if int(has_cell.sum()) != int(np.unique(lab[labelled & has_cell[regions]]).size):
+        return None
+    if not np.array_equal(hand_to_outline(hand) > 0, out):
+        return None
+    return hand
+
+
+def hand_stack_from_outlines(masks: np.ndarray, outlines: np.ndarray, progress=None) -> np.ndarray:
+    """T,Y,X handCorrection for ``masks`` that keeps the saved ``outlines`` where they are the plugin's own 1 px bonds
+    (so loading a saved edit and editing again does not move any line); other frames are thinned from the masks."""
+    stack = np.asarray(masks)
+    if stack.ndim == 2:
+        stack = stack[np.newaxis, ...]
+    outs = np.asarray(outlines)
+    if outs.ndim == 2:
+        outs = outs[np.newaxis, ...]
+    out = np.empty(stack.shape, dtype=np.uint8)
+    n = stack.shape[0]
+
+    def one(t: int) -> np.ndarray:
+        hand = hand_from_outlines(stack[t], outs[t]) if outs.shape == stack.shape else None
+        return hand if hand is not None else thin_hand(stack[t])
+
+    workers = max(1, min(8, os.cpu_count() or 1))
+    with ThreadPoolExecutor(workers) as pool:
+        futures = {pool.submit(one, t): t for t in range(n)}
+        for done, fut in enumerate(as_completed(futures), start=1):
+            out[futures[fut]] = fut.result()
+            if progress is not None:
+                progress(int(100 * done / n), f"preparing bonds, frame {done}/{n}")
+    return out
+
+
 def hand_to_labels(hand: np.ndarray) -> np.ndarray:
     """handCorrection → instance labels (connectivity-1, bg=255)."""
     lab = label(np.asarray(hand), connectivity=1, background=255)

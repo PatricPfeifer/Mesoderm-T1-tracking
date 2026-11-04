@@ -10,7 +10,7 @@ from threading import Lock
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import napari
@@ -171,6 +171,7 @@ class VisualizationManager:
 class ActionType(Enum):
     DRAW = "draw"
     DELETE = "delete"
+    BOND = "bond"  # an Enter (apply bond edits) in the outline editor
 
 
 @dataclass
@@ -178,9 +179,10 @@ class UndoAction:
     """Represents a single undoable action with full stack context"""
     action_type: ActionType
     frame: Optional[int]  # Frame number for 3D stacks, None for 2D
-    previous_state: np.ndarray  # Previous state of the entire stack
     description: str  # Description of the action
     affected_cell_ids: set  # Set of cell IDs affected by this action
+    previous_state: Optional[np.ndarray] = None  # Previous state of the entire stack
+    restore: Optional[Callable[[], None]] = None  # undoes the action itself (instead of restoring previous_state)
 
 
 class CellCorrectionWidget(QWidget):
@@ -658,14 +660,8 @@ class CellCorrectionWidget(QWidget):
             return False
 
     def _setup_shortcuts(self):
-        """Set up keyboard shortcuts"""
-        try:
-            # Create shortcut with the viewer as parent to ensure global scope
-            self.undo_shortcut = QShortcut(QKeySequence.Undo, self.viewer.window())
-            self.undo_shortcut.activated.connect(self.undo_last_action)
-            logger.debug("Undo shortcut setup complete")
-        except Exception as e:
-            logger.error(f"Error setting up shortcuts: {e}")
+        """Ctrl/Cmd+Z is handled by the plugin panel (TissueKitWidget._undo_edit), which calls undo_last_action;
+        the bindings on the napari viewer in __init__ remain for use without the panel."""
 
     def _store_undo_state(self, description: str):
         """Store current state for undo"""
@@ -725,6 +721,11 @@ class CellCorrectionWidget(QWidget):
             self._updating = True
 
             action = self.undo_stack.pop()
+
+            if action.restore is not None:
+                action.restore()
+                self.status_label.setText(f"Undid: {action.description}")
+                return
 
             # Restore the state
             restored_state = action.previous_state.copy()
