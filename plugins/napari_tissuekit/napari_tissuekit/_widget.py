@@ -124,9 +124,9 @@ HELP_HTML = """
 <li><b>Save segmentation (Ctrl+S)</b>: write the masks and the 1 px outlines (<code>*_cp_masks.tif</code>, <code>*_cell_outlines.tif</code>).</li>
 <li><b>Export TIFF</b>: same as Save.</li>
 <li>A cell needs at least <b>15 px</b> in every step (segmentation, outline edits, manual drawing, tracking); smaller regions are dropped or refused.</li>
-<li><b>Ctrl/Cmd+Z</b> takes back the last paint stroke that is not applied yet; otherwise the last applied bond edit (Enter) or manual cell edit.</li>
+<li><b>Ctrl/Cmd+Z</b> takes back the last paint stroke that is not applied yet; otherwise the last applied bond edit (Enter) or cell deletion.</li>
 <li><b>M</b> hides or shows the outlines. <i>Watershed pad</i>: area around an edit that is recomputed (smaller = faster).</li>
-<li><b>Manual correction</b> (filled cells): hold Option/Ctrl, click a cell to delete it, drag around an area to draw a new cell, Ctrl/Cmd+Z undoes.</li>
+<li><b>Delete cell</b>: hold <b>Option</b> and left-click a cell to delete it (Cmd/Ctrl+Z undoes it).</li>
 </ul>
 
 <h3>Tracking tab</h3>
@@ -388,7 +388,7 @@ class TissueKitWidget(QWidget):
         outline_help = QLabel(
             "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines. "
             "Enter = Apply (local watershed, like TA). "
-            "M = toggle Outlines. Ctrl+S / Save writes the masks (*_cp_masks.tif) and the 1 px outlines (*_cell_outlines.tif). Cell edits below also redraw the outlines."
+            "M = toggle Outlines. Ctrl+S / Save writes the masks (*_cp_masks.tif) and the 1 px outlines (*_cell_outlines.tif). Deleting a cell below also redraws the outlines."
         )
         outline_help.setWordWrap(True)
         outline_help.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
@@ -436,14 +436,14 @@ class TissueKitWidget(QWidget):
         return page
 
     def _add_correction(self, layout: QVBoxLayout) -> None:
-        group = QGroupBox("Manual correction (filled labels, optional)")
+        group = QGroupBox("Delete cell (Option + left click)")
         inner = QVBoxLayout()
         try:
             from .correction import CellCorrectionWidget, DataManager, VisualizationManager
         except Exception as exc:
             self.correction = None
             missing = QLabel(
-                "Manual correction tools are not importable "
+                "The cell-delete tool is not importable "
                 f"({exc}). Outline edit/save still work."
             )
             missing.setWordWrap(True)
@@ -627,7 +627,7 @@ class TissueKitWidget(QWidget):
 
     def _undo_edit(self) -> None:
         """Ctrl/Cmd+Z: take back strokes not applied yet (napari's paint history), else the last applied step
-        (a bond edit with Enter, or a manual cell edit)."""
+        (a bond edit with Enter, or a cell deletion)."""
         ol = self._layer("Outlines")
         history = getattr(ol, "_undo_history", None)
         if isinstance(ol, Labels) and history and self._seg_base_outlines is not None:
@@ -862,7 +862,7 @@ class TissueKitWidget(QWidget):
         return True
 
     def _push_bond_undo(self, before: dict) -> None:
-        """Make the bond edit just applied one Undo step (Ctrl/Cmd+Z), shared with the manual cell edits."""
+        """Make the bond edit just applied one Undo step (Ctrl/Cmd+Z), shared with the cell deletions."""
         if self.correction is None:
             return
         from .correction import ActionType, UndoAction
@@ -927,7 +927,7 @@ class TissueKitWidget(QWidget):
                 self._outline_sync_busy = False
 
     def _mirror_cell_edits_on_outlines(self) -> None:
-        """Make the Manual correction tools (draw / delete / undo a cell) also
+        """Make the cell-delete tool (delete / undo a cell) also
         redraw that frame's 1 px cell outlines on the Outlines layer."""
         vis = self._vis
         update = vis.update_tracking_visualization
