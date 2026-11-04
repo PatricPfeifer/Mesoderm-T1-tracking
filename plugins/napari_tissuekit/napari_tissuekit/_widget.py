@@ -53,7 +53,6 @@ from .track_edit import (
     link_tracks,
     merge_protected,
     restore_cells,
-    set_id_on_frame,
     swap_tracks,
 )
 
@@ -136,8 +135,8 @@ HELP_HTML = """
 <li><b>Divisions</b>: dividing cells end their track and the two daughters get new IDs.</li>
 <li><b>Export TIFF</b>: write the tracked layers to the results folder.</li>
 <li><b>Correct tracks</b>: turn on <i>Edit tracks</i>, pick a mode and click cells on the Tracked layer.
- <i>This frame</i> changes one frame, <i>Link</i> joins two tracks, <i>Break</i> starts a new track, <i>Swap</i> exchanges two IDs.
- <b>Undo</b> takes back the last edit, <b>Clear protection</b> lets corrected cells be changed again, <b>Save corrected tracks</b> writes the corrected tracking (the old files go to a <code>previous_...</code> folder).</li>
+ <i>Link</i> joins two tracks, <i>Break</i> starts a new track, <i>Swap</i> exchanges two IDs.
+ <b>Undo</b> takes back the last edit, <b>Clear protection (lets corrected cells be changed again)</b>: corrected cells are protected so a later edit on a neighbour can't silently change them; this lifts that. <b>Save corrected tracks</b> writes the corrected tracking (the old files go to a <code>previous_...</code> folder).</li>
 </ul>
 
 <h3>T1 tab</h3>
@@ -1092,10 +1091,10 @@ class TissueKitWidget(QWidget):
         layout.addLayout(form)
         self.track_run = QPushButton("Run tracking")
         self.track_run.clicked.connect(self._run_tracking)
-        layout.addWidget(self.track_run)
+        layout.addWidget(self.track_run, 0, Qt.AlignLeft)
         self.track_export = QPushButton("Export TIFF")
         self.track_export.clicked.connect(lambda: self._export_step_tiffs("tracking"))
-        layout.addWidget(self.track_export)
+        layout.addWidget(self.track_export, 0, Qt.AlignLeft)
         layout.addWidget(self._track_edit_box())
         layout.addStretch()
         page.setLayout(layout)
@@ -1112,7 +1111,6 @@ class TissueKitWidget(QWidget):
         self.track_modes.setExclusive(True)
         for i, (key, label) in enumerate(
             (
-                ("frame", "This frame"),
                 ("link", "Link"),
                 ("break", "Break"),
                 ("swap", "Swap"),
@@ -1136,14 +1134,14 @@ class TissueKitWidget(QWidget):
         inner.addWidget(self.track_msg)
         undo = QPushButton("Undo")
         undo.clicked.connect(self._undo_track)
-        inner.addWidget(undo)
-        unprotect = QPushButton("Clear protection")
+        inner.addWidget(undo, 0, Qt.AlignLeft)
+        unprotect = QPushButton("Clear protection (lets corrected cells be changed again)")
         unprotect.setToolTip(
             "Cells you corrected are protected: a later edit on a neighbouring "
             "cell cannot silently change them. This lifts that protection."
         )
         unprotect.clicked.connect(self._clear_protection)
-        inner.addWidget(unprotect)
+        inner.addWidget(unprotect, 0, Qt.AlignLeft)
         self.track_save = QPushButton("Save corrected tracks")
         self.track_save.setToolTip(
             "Write the corrected tracking next to the original files so the later "
@@ -1152,7 +1150,7 @@ class TissueKitWidget(QWidget):
             "a previous_<time> folder first."
         )
         self.track_save.clicked.connect(self._save_track_edits)
-        inner.addWidget(self.track_save)
+        inner.addWidget(self.track_save, 0, Qt.AlignLeft)
         group.setLayout(inner)
         self.track_modes.buttons()[0].setChecked(True)
         return group
@@ -1160,7 +1158,7 @@ class TissueKitWidget(QWidget):
     def _track_mode(self) -> str:
         button = self.track_modes.checkedButton()
         if button is None:
-            return "frame"
+            return "link"
         return str(button.property("mode"))
 
     def _enable_track_editing(self, *_args) -> None:
@@ -1175,10 +1173,6 @@ class TissueKitWidget(QWidget):
     def _track_mode_changed(self) -> None:
         self._clear_track_pick()
         help_text = {
-            "frame": (
-                "Click the cell to change, then click a cell that already has "
-                "the ID you want. Only this frame changes."
-            ),
             "link": (
                 "Click the cell with the right ID (frame x), then the same "
                 "cell in a later frame (x+1). It takes the first ID from the "
@@ -1250,10 +1244,7 @@ class TissueKitWidget(QWidget):
         if self._track_pick is None:
             self._track_pick = (frame, y, x, track_id)
             self._show_track_pick(frame, y, x, track_id)
-            if mode == "frame":
-                scope = "The next click changes only this frame."
-                hint = "Now click the cell that has the ID you want."
-            elif mode == "link":
+            if mode == "link":
                 scope = "The next click changes this frame and every later frame."
                 hint = "Now go to the next frame and click the same cell."
             else:
@@ -1272,9 +1263,7 @@ class TissueKitWidget(QWidget):
             self._set_overlay_msg(msg)
             return
         self._clear_track_pick()
-        if mode == "frame":
-            self._commit_track(set_id_on_frame, (src_frame, src_id, track_id))
-        elif mode == "link":
+        if mode == "link":
             self._commit_track(link_tracks, (src_id, track_id, frame))
         else:
             self._commit_track(swap_tracks, (src_id, track_id, frame))
@@ -1840,6 +1829,7 @@ class TissueKitWidget(QWidget):
             f"Tracking done. tracks={qc.get('n_tracks', track_result.n_tracks)}{extra}{saved}"
         )
         self._refresh_layers()
+        self._select_t1_layers()
 
     def _t1_tab(self) -> QWidget:
         page = QWidget()
@@ -1871,14 +1861,12 @@ class TissueKitWidget(QWidget):
         )
         form.addRow("", self.t1_exclude_div)
         layout.addLayout(form)
-        row = QHBoxLayout()
         self.t1_run = QPushButton("Run T1")
         self.t1_run.clicked.connect(self._run_t1)
-        row.addWidget(self.t1_run)
+        layout.addWidget(self.t1_run)
         self.t1_export = QPushButton("Export TIFF")
         self.t1_export.clicked.connect(lambda: self._export_step_tiffs("t1"))
-        row.addWidget(self.t1_export)
-        layout.addLayout(row)
+        layout.addWidget(self.t1_export)
         layout.addStretch()
         page.setLayout(layout)
         return page
@@ -2146,25 +2134,31 @@ class TissueKitWidget(QWidget):
         self._select_loaded_layers(movie_layer)
         self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}.{outline_note}")
 
+    @staticmethod
+    def _pick(box: QComboBox, name: str | None) -> None:
+        idx = box.findText(name) if name else -1
+        if idx >= 0:
+            box.setCurrentIndex(idx)
+
+    def _select_t1_layers(self) -> None:
+        """T1 tab: the tracked labels and, when there is one, the tracked RGB."""
+        if self._layer("Tracked") is not None:
+            self._pick(self.t1_labels, "Tracked")
+        if self._layer("Tracked RGB") is not None:
+            self._pick(self.t1_rgb, "Tracked RGB")
+
     def _select_loaded_layers(self, movie_layer) -> None:
         """Point the layer drop-downs at the layers that loading a results folder just made."""
-        def pick(box: QComboBox, name: str | None) -> None:
-            idx = box.findText(name) if name else -1
-            if idx >= 0:
-                box.setCurrentIndex(idx)
-
+        pick = self._pick
         pick(self.seg_image, movie_layer.name if movie_layer is not None else None)
         if self._layer("Segmentation") is not None:
             pick(self.seg_masks, "Segmentation")
+            pick(self.track_labels, "Segmentation")  # tracking starts from the segmentation, not from earlier tracks
         if self._layer("Outlines") is not None:
             pick(self.seg_outlines, "Outlines")
-        if self._layer("Tracked") is not None:
-            pick(self.track_labels, "Tracked")
-            pick(self.t1_labels, "Tracked")
         if movie_layer is not None:
             pick(self.track_intensity, movie_layer.name)
-        if self._layer("Tracked RGB") is not None:
-            pick(self.t1_rgb, "Tracked RGB")
+        self._select_t1_layers()
 
     def _replace_labels(self, name: str, data: np.ndarray) -> None:
         if name == "Tracked":  # new tracks: old undo steps and protection are stale
