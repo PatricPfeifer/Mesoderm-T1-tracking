@@ -2112,9 +2112,8 @@ class TissueKitWidget(QWidget):
         import tifffile
 
         loaded = []
-        movie = self.project.read_settings().get("movie")
-        if not (movie and Path(movie).is_file()):
-            movie = self.project.guess_movie()  # e.g. results made on the HPC: no settings.json
+        # e.g. results made on the HPC: no settings.json, so guess from the mask file names
+        movie = self.project.movie_path() or self.project.guess_movie()
         movie_layer = None
         if movie and Path(movie).is_file():
             for ly in self.viewer.layers:
