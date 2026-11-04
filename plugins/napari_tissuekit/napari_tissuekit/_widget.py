@@ -691,25 +691,32 @@ class TissueKitWidget(QWidget):
         # when the background job finishes (or they stay if that job fails).
         from .core.outline_io import masks_to_outline_labels
 
-        self._replace_labels("Outlines", masks_to_outline_labels(masks))
+        interim = (np.asarray(saved_outlines) > 0).astype(np.uint8) if saved_outlines is not None and np.shape(saved_outlines) == masks.shape else masks_to_outline_labels(masks)
+        self._replace_labels("Outlines", interim)
         self._style_outlines_layer(self._layer("Outlines"))
 
         def work(progress):
             from .core.outline_io import hand_stack_to_outline
             from .core.ta_bond_edit import hand_stack_from_outlines, thin_hand_stack
 
-            hand = hand_stack_from_outlines(masks, saved_outlines, progress) if saved_outlines is not None else thin_hand_stack(masks, progress)
-            return hand, hand_stack_to_outline(hand)
+            if saved_outlines is None:
+                hand = thin_hand_stack(masks, progress)
+                return hand, hand_stack_to_outline(hand), False
+            hand, outlines, fits = hand_stack_from_outlines(masks, saved_outlines, progress)
+            # most frames fit: the file is the plugin's own, so its other frames are not edits made elsewhere
+            return hand, outlines, bool(fits.mean() >= 0.5)
 
         self._start(work, self._hand_ready)
 
     def _hand_ready(self, result: tuple) -> None:
-        hand, outlines = result
+        hand, outlines, own_file = result
         self._seg_base_hand = hand
         self._seg_base_outlines = outlines.copy()
         self._replace_labels("Outlines", outlines)
         self._style_outlines_layer(self._layer("Outlines"))
         pending, self._pending_outlines = self._pending_outlines, None
+        if own_file:
+            pending = None  # nothing in it to apply: the bonds shown are the file's (or rebuilt from the masks where it was out of date)
         if pending is not None and not np.array_equal(pending > 0, outlines > 0):
             from .core.outline_io import outlines_are_edits
 

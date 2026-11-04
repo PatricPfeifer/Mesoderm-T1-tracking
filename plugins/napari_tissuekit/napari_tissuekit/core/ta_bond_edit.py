@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from scipy import ndimage as ndi
 from skimage.measure import label, regionprops
-from skimage.segmentation import expand_labels, find_boundaries
+from skimage.segmentation import expand_labels, find_boundaries, watershed
 
 from ._wshed import wshed
 from .cell_size import MIN_CELL_AREA
@@ -108,6 +108,23 @@ def erased_into_background(
 MAX_ENCLOSED_GAP = 5.0  # px: half-width (distance to the nearest cell) up to which an enclosed empty gap is closed
 
 
+def enclosed_gaps(labels: np.ndarray, max_gap: float = MAX_ENCLOSED_GAP) -> np.ndarray:
+    """Pixels of the empty gaps in ``labels`` that are enclosed by cells (not reaching the image edge) and have a
+    half-width of at most ``max_gap`` px."""
+    background = np.asarray(labels) == 0
+    regions = label(background, connectivity=1)
+    n = int(regions.max())
+    if n == 0:
+        return np.zeros(background.shape, dtype=bool)
+    widest = np.asarray(ndi.maximum(ndi.distance_transform_edt(background), regions, np.arange(1, n + 1)))
+    edge = np.unique(np.concatenate([regions[0], regions[-1], regions[:, 0], regions[:, -1]]))
+    closed = np.zeros(n + 1, dtype=bool)
+    closed[1:] = widest <= max_gap
+    closed[edge] = False
+    closed[0] = False
+    return closed[regions]
+
+
 def outside_background(ext: np.ndarray, labels: np.ndarray, max_gap: float = MAX_ENCLOSED_GAP) -> np.ndarray:
     """The part of ``ext`` (see :func:`exterior_mask`) that really is outside the tissue.
 
@@ -116,18 +133,9 @@ def outside_background(ext: np.ndarray, labels: np.ndarray, max_gap: float = MAX
     gets one membrane instead of one outline line on each side. Larger holes and the background outside the tissue
     stay empty.
     """
-    background = np.asarray(labels) == 0
-    regions = label(background, connectivity=1)
-    n = int(regions.max())
-    if n == 0 or not ext.any():
+    if not ext.any():
         return ext
-    widest = np.asarray(ndi.maximum(ndi.distance_transform_edt(background), regions, np.arange(1, n + 1)))
-    edge = np.unique(np.concatenate([regions[0], regions[-1], regions[:, 0], regions[:, -1]]))
-    closed = np.zeros(n + 1, dtype=bool)
-    closed[1:] = widest <= max_gap
-    closed[edge] = False
-    closed[0] = False
-    gaps = closed[regions]
+    gaps = enclosed_gaps(labels, max_gap)
     if not gaps.any():
         return ext
     ext_regions = label(ext, connectivity=1)
@@ -164,12 +172,15 @@ def thin_hand_stack(masks: np.ndarray, progress=None) -> np.ndarray:
     return out
 
 
-def hand_from_outlines(labels_t: np.ndarray, outlines_t: np.ndarray) -> np.ndarray | None:
+OUTLINE_MATCH_TOLERANCE = 20  # px per frame: a saved outline this close to its reconstruction is taken as it is
+
+
+def hand_from_outlines(labels_t: np.ndarray, outlines_t: np.ndarray, tolerance: int = OUTLINE_MATCH_TOLERANCE) -> np.ndarray | None:
     """handCorrection of one frame rebuilt from saved 1 px outlines (no re-thinning), or None.
 
     The regions between the outlines that hold a labelled pixel are the cells; everything else (the outlines and
     the empty background outside the tissue) is 255. The result is only returned when it reproduces the saved
-    outlines exactly and has one cell per label, so a file that is not the plugin's own 1 px bonds (e.g.
+    outlines to within ``tolerance`` px and has one cell per label, so a file that is not the plugin's own 1 px bonds (e.g.
     Cellpose-style outlines) falls back to :func:`thin_hand`.
     """
     from .outline_io import hand_to_outline
@@ -199,35 +210,55 @@ def hand_from_outlines(labels_t: np.ndarray, outlines_t: np.ndarray) -> np.ndarr
     hand = np.where(has_cell[regions], 0, 255).astype(np.uint8)
     if int(has_cell.sum()) != int(np.unique(lab[labelled & has_cell[regions]]).size):
         return None
-    if not np.array_equal(hand_to_outline(hand) > 0, out):
+    if int(np.count_nonzero((hand_to_outline(hand) > 0) != out)) > tolerance:
         return None
     return hand
 
 
-def hand_stack_from_outlines(masks: np.ndarray, outlines: np.ndarray, progress=None) -> np.ndarray:
-    """T,Y,X handCorrection for ``masks`` that keeps the saved ``outlines`` where they are the plugin's own 1 px bonds
-    (so loading a saved edit and editing again does not move any line); other frames are thinned from the masks."""
+def hand_stack_from_outlines(masks: np.ndarray, outlines: np.ndarray, progress=None):
+    """Starting bonds for editing masks that come with saved ``outlines``: ``(hand, outlines, fits)``.
+
+    ``fits[t]`` says the saved frame is the plugin's own 1 px bonds of these masks (as opposed to some other kind of
+    outline file). Those frames keep the saved lines, so loading a saved edit and editing again moves no line - except
+    when the file still draws two lines around an empty gap that is closed now (a file from an older plugin version):
+    that frame, and every frame that does not fit, gets 1 px bonds rebuilt from the masks (:func:`thin_hand`).
+    ``outlines`` are the bonds as shown (the saved lines or the rebuilt ones).
+    """
+    from .outline_io import hand_to_outline
+
     stack = np.asarray(masks)
     if stack.ndim == 2:
         stack = stack[np.newaxis, ...]
-    outs = np.asarray(outlines)
-    if outs.ndim == 2:
-        outs = outs[np.newaxis, ...]
-    out = np.empty(stack.shape, dtype=np.uint8)
+    saved = np.asarray(outlines)
+    if saved.ndim == 2:
+        saved = saved[np.newaxis, ...]
+    fits = saved.shape == stack.shape
+    hand_out = np.empty(stack.shape, dtype=np.uint8)
+    outline_out = np.empty(stack.shape, dtype=np.uint8)
+    fit = np.zeros(stack.shape[0], dtype=bool)
     n = stack.shape[0]
 
-    def one(t: int) -> np.ndarray:
-        hand = hand_from_outlines(stack[t], outs[t]) if outs.shape == stack.shape else None
-        return hand if hand is not None else thin_hand(stack[t])
+    def one(t: int):
+        hand = hand_from_outlines(stack[t], saved[t]) if fits else None
+        fitted = hand is not None
+        if fitted:
+            gaps = enclosed_gaps(stack[t])
+            if gaps.any() and float((hand[gaps] == 255).mean()) > 0.5:
+                hand = None  # the file still draws two lines around a gap: out of date
+        if hand is not None:
+            return t, hand, (saved[t] > 0).astype(np.uint8), True
+        hand = thin_hand(stack[t])
+        return t, hand, hand_to_outline(hand), fitted
 
     workers = max(1, min(8, os.cpu_count() or 1))
     with ThreadPoolExecutor(workers) as pool:
-        futures = {pool.submit(one, t): t for t in range(n)}
+        futures = [pool.submit(one, t) for t in range(n)]
         for done, fut in enumerate(as_completed(futures), start=1):
-            out[futures[fut]] = fut.result()
+            t, hand, outline, ok = fut.result()
+            hand_out[t], outline_out[t], fit[t] = hand, outline, ok
             if progress is not None:
                 progress(int(100 * done / n), f"preparing bonds, frame {done}/{n}")
-    return out
+    return hand_out, outline_out, fit
 
 
 def hand_to_labels(hand: np.ndarray) -> np.ndarray:
@@ -325,6 +356,54 @@ def _remap_roi_labels(
     if out.max() < 65536:
         return out.astype(np.uint16)
     return out.astype(np.uint32)
+
+
+MAX_SLIVER_WIDTH = 5.0  # px (minor axis): a "cell" this narrow and long is two lines drawn beside each other
+MIN_SLIVER_ELONGATION = 2.5  # length / width
+MAX_SLIVER_AREA = 200
+
+
+def merge_slivers(bonds: np.ndarray, before: np.ndarray) -> np.ndarray:
+    """Collapse the very narrow cells an edit created (two bond lines 1-4 px apart) into one line.
+
+    A stroke painted beside an existing membrane leaves a sliver between the two lines. Cells narrower than
+    ``MAX_SLIVER_WIDTH``, long and thin, smaller than ``MAX_SLIVER_AREA`` px (or smaller than the minimal cell size),
+    and cut out of a clearly larger area of
+    ``before`` (the bonds before the edit) are filled and the bonds around them thinned again. Cells that were
+    already that small before the edit, and cells touching the border of ``bonds`` (cut off by the crop), are left
+    alone.
+    """
+    h, w = bonds.shape
+    lab = label(bonds, connectivity=1, background=255)
+    old = label(before, connectivity=1, background=255)
+    old_area = np.bincount(old.ravel())
+    drop = []
+    for r in regionprops(lab):
+        y0, x0, y1, x1 = r.bbox
+        if y0 == 0 or x0 == 0 or y1 == h or x1 == w:
+            continue
+        too_small = r.area < MIN_CELL_AREA  # not a cell at all (see cell_size)
+        thin = (
+            r.area < MAX_SLIVER_AREA
+            and r.minor_axis_length < MAX_SLIVER_WIDTH
+            and r.major_axis_length >= MIN_SLIVER_ELONGATION * max(r.minor_axis_length, 1.0)
+        )
+        if not (too_small or thin):
+            continue
+        was = np.bincount(old[r.coords[:, 0], r.coords[:, 1]]).argmax()
+        if was == 0 or old_area[was] >= 2 * r.area:  # it was bond or part of a bigger cell: this edit made it
+            drop.append(r.label)
+    if not drop:
+        return bonds
+    sliver = np.isin(lab, drop)
+    filled = bonds.copy()
+    filled[sliver] = 255
+    thinned = np.zeros_like(filled)
+    thinned[watershed(filled, markers=None, watershed_line=True) == 0] = 255
+    near = ndi.binary_dilation(sliver, iterations=4)  # only the neighbourhood of the slivers changes
+    out = bonds.copy()
+    out[near] = thinned[near]
+    return out
 
 
 def apply_drawing_hand(
@@ -427,6 +506,8 @@ def apply_drawing_hand(
         wshed(crop, seeds="mask", min_seed_area=int(min_seed_area or 0)),
         dtype=np.uint8,
     )
+    minished[exterior[min_y:max_y, min_x:max_x]] = 255
+    minished = merge_slivers(minished, np.asarray(hand, dtype=np.uint8)[min_y:max_y, min_x:max_x])
     minished[exterior[min_y:max_y, min_x:max_x]] = 255
     y1 = first_y
     y2 = min(first_y + (bounds[1] - bounds[0]) + 1, minished.shape[0])
