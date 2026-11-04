@@ -121,7 +121,7 @@ HELP_HTML = """
 <li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run segmentation or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one.</li>
 <li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
-<li><b>Save segmentation (Ctrl+S)</b>: write masks and outlines (<code>*_cp_masks.tif</code>, <code>*_cp_outlines.tif</code>, <code>*_cell_outlines.tif</code>).</li>
+<li><b>Save segmentation (Ctrl+S)</b>: write the masks and the 1 px outlines (<code>*_cp_masks.tif</code>, <code>*_cell_outlines.tif</code>).</li>
 <li><b>Export TIFF</b>: same as Save.</li>
 <li>A cell needs at least <b>15 px</b> in every step (segmentation, outline edits, manual drawing, tracking); smaller regions are dropped or refused.</li>
 <li><b>Ctrl/Cmd+Z</b> takes back the last paint stroke that is not applied yet; otherwise the last applied bond edit (Enter) or manual cell edit.</li>
@@ -388,7 +388,7 @@ class TissueKitWidget(QWidget):
         outline_help = QLabel(
             "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines. "
             "Enter = Apply (local watershed, like TA). "
-            "M = toggle Outlines. Ctrl+S / Save writes masks, outlines and *_cell_outlines.tif (cell outlines only). Cell edits below also redraw the outlines."
+            "M = toggle Outlines. Ctrl+S / Save writes the masks (*_cp_masks.tif) and the 1 px outlines (*_cell_outlines.tif). Cell edits below also redraw the outlines."
         )
         outline_help.setWordWrap(True)
         outline_help.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
@@ -1003,7 +1003,7 @@ class TissueKitWidget(QWidget):
             masks = masks[np.newaxis, ...]
         try:
             from .core.movie_calibration import save_tiff
-            from .core.outline_io import masks_to_outline_rgb, outline_labels_to_rgb
+            from .core.outline_io import masks_to_outline_rgb
         except Exception as exc:
             self.status.setText(f"Save imports failed: {exc}")
             return
@@ -1017,7 +1017,6 @@ class TissueKitWidget(QWidget):
             return
         outdir = wf.step_dir("segmentation")
         masks_path = outdir / f"{stem}_cp_masks.tif"
-        outlines_path = outdir / f"{stem}_cp_outlines.tif"
         # Keep the raw movie's pixel size / frame interval in the saved files.
         cal = self._calibration(
             self._layer(self.seg_image.currentText()),
@@ -1026,11 +1025,7 @@ class TissueKitWidget(QWidget):
         ) or self._seg_cal
         save_tiff(masks_path, masks.astype(np.uint16, copy=False), cal)
         bonds = self._seg_base_outlines
-        if self._seg_base_hand is not None and bonds is not None and bonds.shape == masks.shape:
-            save_tiff(outlines_path, outline_labels_to_rgb(bonds), cal)  # 1 px TA bonds
-        else:
-            save_tiff(outlines_path, masks_to_outline_rgb(masks), cal)
-        # Default outline-only output: T,Y,X uint8, 255 on the cell outlines, 0 elsewhere.
+        # Outline file: T,Y,X uint8, 255 on the 1 px cell outlines, 0 elsewhere.
         outline_only = (
             bonds if bonds is not None and bonds.shape == masks.shape and self._seg_base_hand is not None
             else (masks_to_outline_rgb(masks).max(axis=-1) > 0)
@@ -1039,7 +1034,7 @@ class TissueKitWidget(QWidget):
         save_tiff(cell_outlines_path, (np.asarray(outline_only) > 0).astype(np.uint8) * 255, cal)
         self._seg_base_masks = masks.copy()
         self.status.setText(
-            f"Saved {masks_path.name}, {outlines_path.name} and {cell_outlines_path.name} → {outdir}"
+            f"Saved {masks_path.name} and {cell_outlines_path.name} → {outdir}"
         )
 
     # step -> [(layer name, file tag, dtype or None)] written by "Export TIFF"
@@ -2177,7 +2172,7 @@ class TissueKitWidget(QWidget):
                 self._seg_base_masks = masks.copy()
                 self._show_segmentation_layers(
                     masks, f"Outline editing ready from {ofile.name} (max label {int(masks.max())}). "
-                    "Paint/erase bonds, Enter to Apply, then Save (writes *_cp_outlines.tif, *_cell_outlines.tif and *_cp_masks.tif).",
+                    "Paint/erase bonds, Enter to Apply, then Save (writes *_cp_masks.tif and *_cell_outlines.tif).",
                     saved_outlines=outlines,
                 )
                 outline_note = " Bonds are being prepared: wait for 100% before editing."

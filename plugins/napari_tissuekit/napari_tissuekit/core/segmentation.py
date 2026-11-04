@@ -3,8 +3,7 @@
 
 Saves progress after every frame so a short Slurm walltime can be resumed.
 
-Writes ``*_cp_masks.tif``, ``*_cp_outlines.tif`` (yellow RGB) and ``*_cell_outlines.tif``
-(1 px cell outlines, 255 on black; the plugin's default outline file).
+Writes ``*_cp_masks.tif`` and ``*_cell_outlines.tif`` (1 px cell outlines, 255 on black; the plugin's outline file).
 
 Example (``tissuekit segment`` wraps this with the results-folder layout):
   python -m napari_tissuekit.core.segmentation \
@@ -22,7 +21,7 @@ from cellpose import models
 from tifffile import imread, imwrite
 
 from .cell_size import MIN_CELL_AREA
-from .outline_io import hand_stack_to_outline, masks_to_outline_rgb
+from .outline_io import hand_stack_to_outline
 from .ta_bond_edit import thin_hand_stack
 
 from .movie_calibration import read_calibration, save_tiff  # noqa: E402
@@ -170,11 +169,7 @@ def main(argv=None) -> None:
         eval_kwargs=PRESETS[args.preset],
     )
     save_tiff(out, masks, cal)
-    outlines_path = outdir / f"{inp.stem}_cp_outlines.tif"
-    outlines = masks_to_outline_rgb(masks)
-    save_tiff(outlines_path, outlines, cal)
     print("wrote", out, "max_label", int(masks.max()), flush=True)
-    print("wrote", outlines_path, flush=True)
 
     # Default outline-only output (as in the plugin). The masks are already on disk, so the
     # checkpoint goes first; a failure here still ends the run with an error.
