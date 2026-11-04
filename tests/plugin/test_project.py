@@ -22,12 +22,60 @@ def test_resolve_prefers_manual_choice(tmp_path):
 def test_settings_accumulate_per_step(tmp_path):
     wf = WorkingFolder()
     wf.set_manual(tmp_path / "res")
-    wf.write_settings("segmentation", {"batch": 8}, movie="m.tif")
+    wf.write_settings("segmentation", {"batch": 8}, movie=tmp_path / "m.tif")
     wf.write_settings("tracking", {"expand": 3})
     data = json.loads((tmp_path / "res" / "settings.json").read_text())
-    assert data["movie"] == "m.tif"
+    assert data["movie"] == "../m.tif"
     assert data["segmentation"]["params"] == {"batch": 8}
     assert data["tracking"]["params"] == {"expand": 3} and "time" in data["tracking"]
+
+
+# ---- settings.json in a shared / synced folder --------------------------------
+def _results_with_movie(base):
+    movie = base / "movie.tif"
+    movie.parent.mkdir(parents=True, exist_ok=True)
+    movie.write_bytes(b"")
+    wf = WorkingFolder()
+    wf.set_manual(results_dir_for(movie))
+    return wf, movie
+
+
+def test_settings_store_movie_relative_to_results(tmp_path):
+    wf, movie = _results_with_movie(tmp_path / "a")
+    wf.write_settings("segmentation", {}, movie=movie)
+    data = json.loads(wf.settings_path.read_text())
+    assert data["movie"] == "../movie.tif"
+    assert str(tmp_path) not in wf.settings_path.read_text()
+    assert wf.movie_path().resolve() == movie.resolve()
+
+
+def test_movie_found_after_folder_is_moved(tmp_path):
+    """Same results on another computer (Nextcloud): the movie still resolves."""
+    wf, movie = _results_with_movie(tmp_path / "pc1")
+    wf.write_settings("segmentation", {}, movie=movie)
+    (tmp_path / "pc1").rename(tmp_path / "pc2")
+    other = WorkingFolder()
+    other.set_manual(tmp_path / "pc2" / "movie_results")
+    assert other.movie_path().resolve() == (tmp_path / "pc2" / "movie.tif").resolve()
+
+
+def test_old_absolute_paths_from_other_computers_fall_back_to_name(tmp_path):
+    wf, movie = _results_with_movie(tmp_path)
+    wf.root.mkdir()
+    for saved in (
+        "/Users/verena/Documents/current analysis/movie.tif",
+        r"C:\Users\andre\Nextcloud\HPC-share\current analysis\movie.tif",
+    ):
+        wf.settings_path.write_text(json.dumps({"movie": saved}))
+        assert wf.movie_path() == wf.root.parent / "movie.tif"
+
+
+def test_movie_path_none_when_missing(tmp_path):
+    wf, movie = _results_with_movie(tmp_path)
+    assert wf.movie_path() is None  # no settings.json
+    wf.write_settings("segmentation", {}, movie=movie)
+    movie.unlink()
+    assert wf.movie_path() is None
 
 
 def test_found_lists_existing_results(tmp_path):
