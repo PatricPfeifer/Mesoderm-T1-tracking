@@ -130,8 +130,17 @@ def rgb_or_labels_to_outline_labels(data: np.ndarray) -> np.ndarray:
     return (as_label_stack(arr) > 0).astype(np.uint8)
 
 
-def outlines_rgb_to_masks(rgb: np.ndarray) -> np.ndarray:
-    """Full-frame outlines → instance labels (interiors = cells; largest = background)."""
+# "auto": the largest region is only background when it is clearly larger than the typical cell (see outlines_rgb_to_masks)
+AUTO_BACKGROUND_FACTOR = 8.0
+
+
+def outlines_rgb_to_masks(rgb: np.ndarray, background: str = "largest") -> np.ndarray:
+    """Full-frame outlines → instance labels (interiors = cells).
+
+    background="largest": the largest region is the background (classic behaviour).
+    background="auto": the largest region is the background only if it is at least ``AUTO_BACKGROUND_FACTOR`` times the
+    median area of the other regions and touches the image border; outlines that fill the frame keep every cell.
+    """
     stack = as_outline_rgb(rgb)
     out = np.zeros(stack.shape[:3], dtype=np.uint32)
     for t in range(stack.shape[0]):
@@ -142,6 +151,11 @@ def outlines_rgb_to_masks(rgb: np.ndarray) -> np.ndarray:
             continue
         counts[0] = 0
         bg = int(counts.argmax())
+        if background == "auto":
+            others = np.delete(counts, [0, bg])
+            border = np.unique(np.concatenate([cc[0], cc[-1], cc[:, 0], cc[:, -1]]))
+            if bg not in border or (others.size and counts[bg] < AUTO_BACKGROUND_FACTOR * float(np.median(others))):
+                bg = 0
         cc[cc == bg] = 0
         uniq = np.unique(cc)
         uniq = uniq[uniq != 0]
@@ -152,6 +166,17 @@ def outlines_rgb_to_masks(rgb: np.ndarray) -> np.ndarray:
     if out.max() < 65536:
         return out.astype(np.uint16)
     return out
+
+
+def outlines_are_edits(loaded: np.ndarray, base: np.ndarray, max_fraction: float = 0.05) -> bool:
+    """True if ``loaded`` 0/1 outlines look like an edited copy of the 1 px bonds ``base`` (few differing pixels).
+
+    A Cellpose-style *_cp_outlines.tif (a line inside each cell) differs from the bonds everywhere: it is not an edit.
+    """
+    loaded, base = np.asarray(loaded) > 0, np.asarray(base) > 0
+    if loaded.shape != base.shape:
+        return False
+    return int((loaded != base).sum()) <= max_fraction * max(int(base.sum()), 1)
 
 
 def outlines_rgb_to_masks_local(

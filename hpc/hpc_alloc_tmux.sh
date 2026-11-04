@@ -6,25 +6,29 @@
 #   bash hpc/hpc_alloc_tmux.sh -p cpu -n 8 -t 5:00:00 --mem=8GB
 #   bash hpc/hpc_alloc_tmux.sh -p gpu_a100_short -n 12 -t 00:30:00 --mem=32GB --gres=gpu:1
 #
-# After attach, tell Cursor the session name is: patric
+# Runs as a batch job holding a detached tmux session on the compute node, so it
+# survives disconnects. The job ends when the session is closed or time runs out.
+# The socket lives in ~/.tmux-sockets because each Slurm step gets a private /tmp.
+#   Attach:   srun --jobid=<JOBID> --overlap --pty tmux -S ~/.tmux-sockets/<SESSION>-<JOBID> attach
+#   Run cmd:  srun --jobid=<JOBID> --overlap tmux -S ~/.tmux-sockets/<SESSION>-<JOBID> send-keys '<cmd>' Enter
 
 set -euo pipefail
 
-SESSION="${TMUX_SESSION_NAME:-patric}"
+SESSION="${TMUX_SESSION_NAME:-day-$(date +%F)}"
 PARTITION="${PARTITION:-cpu_il}"
-N="${N:-12}"
-TIME="${TIME:-4:00:00}"
-MEM="${MEM:-8GB}"
+N="${N:-8}"
+TIME="${TIME:-10:00:00}"
+MEM="${MEM:-12GB}"
 GRES=""
 
 usage() {
   cat <<EOF
-Usage: $0 [-p partition] [-n cores] [-t time] [--mem=MEM] [--gres=GRES] [-s session]
+Usage: $0 [-p partition] [-n cores (cpus-per-task)] [-t time] [--mem=MEM] [--gres=GRES] [-s session]
 
 Defaults: -p ${PARTITION} -n ${N} -t ${TIME} --mem=${MEM} -s ${SESSION}
 
-Clears leftover login-node tmux sessions, then salloc + srun --pty tmux on the
-compute allocation. Session name (for Cursor): ${SESSION}
+Submits a batch job that keeps a detached tmux session '${SESSION}' on the
+compute node, then prints the attach command.
 EOF
 }
 
@@ -53,21 +57,21 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
   exit 1
 fi
 
-echo "Clearing login-node tmux sessions..."
-if tmux ls >/dev/null 2>&1; then
-  tmux kill-server
-  echo "Login tmux server killed."
-else
-  echo "No login tmux sessions."
-fi
-
-SALLOC_ARGS=(-p "${PARTITION}" -n "${N}" -t "${TIME}" --mem="${MEM}")
+SBATCH_ARGS=(-p "${PARTITION}" -n 1 -c "${N}" -t "${TIME}" --mem="${MEM}" -J "tmux-${SESSION}")
 if [[ -n "${GRES}" ]]; then
-  SALLOC_ARGS+=(--gres="${GRES}")
+  SBATCH_ARGS+=(--gres="${GRES}")
 fi
 
-echo "Requesting allocation: ${SALLOC_ARGS[*]}"
-echo "On grant: tmux session '${SESSION}' on the compute node."
-echo "Tell Cursor: session is ${SESSION}"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+mkdir -p "${PROJECT_DIR}/logs" "${HOME}/.tmux-sockets"
 
-exec salloc "${SALLOC_ARGS[@]}" srun --pty tmux new-session -A -s "${SESSION}"
+echo "Requesting allocation: ${SBATCH_ARGS[*]}"
+JOBID=$(sbatch --parsable "${SBATCH_ARGS[@]}" -o "${PROJECT_DIR}/logs/alloc_%j.out" \
+  --wrap "export OMP_NUM_THREADS=\$SLURM_CPUS_PER_TASK; S=\$HOME/.tmux-sockets/${SESSION}-\$SLURM_JOB_ID; tmux -S \$S new-session -d -s '${SESSION}' -c '${PROJECT_DIR}' && while tmux -S \$S has-session 2>/dev/null; do sleep 60; done; rm -f \$S")
+SOCK="${HOME}/.tmux-sockets/${SESSION}-${JOBID}"
+
+echo "Job ${JOBID} submitted; waiting for it to start..."
+until [[ "$(squeue -h -j "${JOBID}" -o %T)" == RUNNING ]]; do sleep 5; done
+until [[ -S "${SOCK}" ]]; do sleep 2; done
+echo "Running on $(squeue -h -j "${JOBID}" -o %N), tmux session '${SESSION}'"
+echo "Attach: srun --jobid=${JOBID} --overlap --pty tmux -S ${SOCK} attach"

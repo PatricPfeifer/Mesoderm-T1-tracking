@@ -13,7 +13,7 @@
 salloc -p dev_gpu_h100 -n 12 -t 0:30:00 --mem=10GB --gres=gpu:1
 sinfo_t_idle
 salloc -p gpu_a100_short -n 12 -t 00:30:00 --mem=32GB --gres=gpu:1
-salloc -p cpu -n 8 -t 2:00:00 --mem=32GB
+salloc -p cpu -n 8 -t 10:00:00 --mem=12GB
 salloc -p cpu_il -n 12 -t 12:00:00 --mem=12GB
 
 start_vnc_desktop --sw-rendering --queue cpu_il --ppn 4 --walltime 02:00:00

@@ -14,8 +14,9 @@ Nothing in here depends on napari or Qt, so it can be tested on its own.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 STEPS = ("segmentation", "tracking", "t1", "cell_props")
 
@@ -24,6 +25,8 @@ STEPS = ("segmentation", "tracking", "t1", "cell_props")
 # checks this against scripts/output_names.py). Longest suffix first.
 SEG_MASK_SUFFIXES = ("_cp_masks.tif", "_cf_masks.tif")
 TRACK_LABEL_SUFFIXES = ("_cf_tracked_labels.tif", "_tracked_labels.tif")
+# Outline files: 0/255 1 px bonds *_cell_outlines.tif (loaded first) or yellow RGB *_cp_outlines.tif (Cellpose style: a line inside each cell).
+OUTLINE_SUFFIXES = ("_cell_outlines.tif", "_cp_outlines.tif")
 T1_PATTERN = "*.csv"
 # Folder names a step may live in: the plugin's own first, then HPC/script layouts.
 STEP_FOLDERS = {
@@ -64,7 +67,14 @@ def find_results_root(path: str | Path) -> Path:
     ):
         return p
     kids = [k for k in p.glob("*_results") if k.is_dir()]
-    return kids[0] if len(kids) == 1 else p
+    if len(kids) == 1:
+        return kids[0]
+    # A step folder itself (…/tracking) was picked: use the results folder above it.
+    if p.name in STEPS or any(p.name in names for names in STEP_FOLDERS.values()):
+        parent = p.parent
+        if parent.name.endswith("_results") or (parent / "settings.json").is_file():
+            return parent
+    return p
 
 
 def _step_dirs(root: Path, step: str) -> list[Path]:
@@ -130,11 +140,45 @@ class WorkingFolder:
         self.root.mkdir(parents=True, exist_ok=True)
         data = self.read_settings()
         if movie:
-            data["movie"] = str(movie)
+            data["movie"] = self._relative_movie(movie)
         data[step] = {"time": datetime.now().isoformat(timespec="seconds"), "params": params}
         self.settings_path.write_text(
             json.dumps(data, indent=2, default=str) + "\n", encoding="utf-8"
         )
+
+    def _relative_movie(self, movie: str | Path) -> str:
+        """Movie path relative to the results folder, with ``/`` on every OS.
+
+        A shared or synced results folder then names the same movie on every machine
+        (an absolute path only exists on the computer that wrote it).
+        """
+        assert self.root is not None
+        try:
+            rel = os.path.relpath(Path(movie).resolve(), self.root.resolve())
+        except ValueError:  # Windows: movie on another drive than the results folder
+            return str(movie)
+        return Path(rel).as_posix()
+
+    def movie_path(self) -> Path | None:
+        """The movie named in ``settings.json``, if it exists on this computer.
+
+        Relative entries are resolved against the results folder. Older files store an
+        absolute path from the computer that wrote them; when that path is missing here,
+        the file of the same name next to (or inside) the results folder is used.
+        """
+        saved = self.read_settings().get("movie")
+        if not saved or self.root is None:
+            return None
+        path = Path(saved)
+        if not path.is_absolute() and not PureWindowsPath(saved).is_absolute():
+            path = self.root / saved
+        if path.is_file():
+            return path
+        name = (PureWindowsPath if "\\" in saved else PurePosixPath)(saved).name
+        for folder in (self.root.parent, self.root):
+            if (folder / name).is_file():
+                return folder / name
+        return None
 
     # ---- what is already there --------------------------------------------
     def found(self) -> dict[str, list[Path]]:
@@ -147,12 +191,19 @@ class WorkingFolder:
             "tracking": tuple(f"*{s}" for s in TRACK_LABEL_SUFFIXES),
             "t1": (T1_PATTERN,),
         }
+        # Masks and outlines may also sit directly in the chosen folder (not only in a segmentation/ subfolder).
+        seg_dirs = [*_step_dirs(self.root, "segmentation"), self.root]
         for step, pats in patterns.items():
-            files = sorted(
-                {f for d in _step_dirs(self.root, step) for pat in pats for f in d.glob(pat)}
-            )
+            dirs = seg_dirs if step == "segmentation" else _step_dirs(self.root, step)
+            files = sorted({f for d in dirs for pat in pats for f in d.glob(pat)})
             if files:
                 out[step] = files
+        outlines = sorted(
+            {f for d in seg_dirs for suf in OUTLINE_SUFFIXES for f in d.glob(f"*{suf}")},
+            key=lambda f: (not f.name.endswith(OUTLINE_SUFFIXES[0]), f.name),  # *_cell_outlines.tif first
+        )
+        if outlines:
+            out["outlines"] = outlines
         return out
 
     def guess_movie(self) -> Path | None:

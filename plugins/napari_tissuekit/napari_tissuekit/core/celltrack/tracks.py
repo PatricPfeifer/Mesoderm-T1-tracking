@@ -440,6 +440,14 @@ def close_gaps(
                         note=f"gap_close k={k}",
                     )
                 )
+                # The merged track now ends where tr_b ends. Without this the root (tr_e) keeps its
+                # old end, looks "terminated" again at the next gap size and can be joined to a second
+                # newborn track that is alive at the same time: one track ID on two cells in a frame.
+                root = uf.find(tr_e)
+                track_end[root] = track_end[tr_b]
+                track_end_label[root] = track_end_label[tr_b]
+                track_end_centroid[root] = track_end_centroid[tr_b]
+                track_end_neigh[root] = track_end_neigh[tr_b]
 
     if n_closed:
         # Remap all label_to_track through union-find.
@@ -472,6 +480,12 @@ def close_gaps(
         parents.clear()
         parents.update(remapped_parents)
         next_track_id = new_id
+
+    for t, mapping in enumerate(label_to_track):  # a track ID must never sit on two cells of one frame
+        ids = list(mapping.values())
+        if len(ids) != len(set(ids)):
+            dup = sorted({i for i in ids if ids.count(i) > 1})
+            raise RuntimeError(f"gap closing left track IDs {dup} on two cells in frame index {t}")
 
     if verbose:
         print(f"Gap closing: merged {n_closed} track pairs", flush=True)

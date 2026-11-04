@@ -41,10 +41,7 @@ def _folder(target: str, results: str | None) -> tuple[WorkingFolder, Path | Non
 def _movie(wf: WorkingFolder, movie: Path | None) -> Path | None:
     if movie is not None:
         return movie
-    saved = wf.read_settings().get("movie")
-    if saved and Path(saved).is_file():
-        return Path(saved)
-    return wf.guess_movie()
+    return wf.movie_path() or wf.guess_movie()
 
 
 def _need(wf: WorkingFolder, step: str, hint: str) -> Path:

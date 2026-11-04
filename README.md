@@ -68,9 +68,9 @@ Results are saved automatically in a folder **next to the movie**, called
 `<movie name>_results`. To keep the repository clean, first copy the movie somewhere else,
 for example to your Desktop, and open that copy.
 
-A short walkthrough of the steps below (load, segment, track, select cells, colour by feature):
+Walkthrough of the steps below (load, segment, track, select cells, colour by feature; fullscreen and scrubbing available):
 
-![TissueKit walkthrough](docs/images/tissuekit_walkthrough.gif)
+https://github.com/user-attachments/assets/eeccd6eb-240b-4ec5-82f8-67aea8ade14d
 
 1. **Open the movie** (File > Open File(s)...), then **Plugins > TissueKit**.
 2. **Segmentation** tab: *Image* = `movie_cut`, press **Run segmentation**.
@@ -90,7 +90,7 @@ Everything lands in `<movie>_results/`:
 
 ```
 movie_cut_results/
-  segmentation/   masks + outlines (.tif)
+  segmentation/   masks, outlines and 1 px cell outlines (.tif)
   tracking/       tracked labels, tracked RGB, tracks / links / events (.csv), qc.json
   t1/             t1_events.csv
   cell_props/     exported measurements and cell selections
@@ -125,8 +125,9 @@ More options per step: `python -m napari_tissuekit.core.tracking --help`.
 
 - **No "TissueKit" in the Plugins menu:** you are not in the right environment. Run
   `conda activate tissuekit`, then `pip install -e "plugins/napari_tissuekit[gui]"` again.
-- **Panel says "CellFlow correction tools are not importable":** harmless. That optional
-  manual-correction block needs napariCellFlow, which is not part of this repository.
+- **Panel says "Manual correction tools are not importable":** the draw/delete correction
+  block failed to load (the message shows why, usually `opencv-python` or Qt). Reinstall with
+  `pip install -e "plugins/napari_tissuekit[gui]"`. Everything else still works.
 - **"A job is already running":** wait for the current step to finish (see the status line).
 - **Tracking has poor quality:** make sure *Intensity* is the movie, not `(none)`.
 
