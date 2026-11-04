@@ -119,7 +119,7 @@ HELP_HTML = """
 <ul>
 <li><b>Image</b>: the movie. <b>Run segmentation</b> finds the cells (Cellpose). <i>Batch size</i>: frames at once. <i>Use GPU</i>: only if one is available.</li>
 <li><b>Masks / Outlines</b>: the cell layer and the outline layer to edit (set automatically after loading).</li>
-<li><b>Start outline editing</b>: show the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
+<li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run segmentation or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one.</li>
 <li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
 <li><b>Save segmentation (Ctrl+S)</b>: write masks and outlines (<code>*_cp_masks.tif</code>, <code>*_cp_outlines.tif</code>, <code>*_cell_outlines.tif</code>).</li>
@@ -414,7 +414,8 @@ class TissueKitWidget(QWidget):
             button.clicked.connect(lambda _=False, m=mode: self._set_outline_tool(m))
             tools.addWidget(button)
         outline_inner.addLayout(tools)
-        self.seg_start_edit = QPushButton("Start outline editing")
+        self.seg_start_edit = QPushButton("Start outline editing (for separately imported outlines)")
+        self.seg_start_edit.setToolTip("Only needed for outlines or masks you dragged in yourself and picked above. Not needed after Run segmentation or loading a results folder: editing starts there by itself.")
         self.seg_start_edit.clicked.connect(self._start_outline_editing)
         outline_inner.addWidget(self.seg_start_edit)
         self.seg_commit = QPushButton("Apply bond edits (Enter)")
