@@ -123,7 +123,6 @@ HELP_HTML = """
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one.</li>
 <li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
 <li><b>Apply + drop small cells (Shift+Enter)</b>: the same, and cells smaller than <i>Min cell area</i> are removed.</li>
-<li><b>Seeded local watershed (Ctrl+M)</b>: paint at least two seed dots, then press it to re-split that area.</li>
 <li><b>Save segmentation (Ctrl+S)</b>: write masks and outlines (<code>*_cp_masks.tif</code>, <code>*_cp_outlines.tif</code>, <code>*_cell_outlines.tif</code>).</li>
 <li><b>Export TIFF</b>: same as Save.</li>
 <li>A cell needs at least <b>15 px</b> in every step (segmentation, outline edits, manual drawing, tracking); smaller regions are dropped or refused. <i>Min cell area</i> can only raise this for Shift+Enter.</li>
@@ -391,7 +390,6 @@ class TissueKitWidget(QWidget):
             "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines. "
             "Enter = Apply (local watershed, like TA). "
             "Shift+Enter = Apply + drop small cells. "
-            "Ctrl+M = seeded local watershed (paint ≥2 seed dots first). "
             "M = toggle Outlines. Ctrl+S / Save writes masks, outlines and *_cell_outlines.tif (cell outlines only). Cell edits below also redraw the outlines."
         )
         outline_help.setWordWrap(True)
@@ -430,13 +428,10 @@ class TissueKitWidget(QWidget):
         self.seg_commit.clicked.connect(lambda: self._apply_bond_edits(False))
         self.seg_apply_shift = QPushButton("Apply + drop small cells (Shift+Enter)")
         self.seg_apply_shift.clicked.connect(lambda: self._apply_bond_edits(True))
-        self.seg_seeded = QPushButton("Seeded local watershed (Ctrl+M)")
-        self.seg_seeded.clicked.connect(self._seeded_local_watershed)
         self.seg_save = QPushButton("Save segmentation")
         self.seg_save.clicked.connect(self._save_segmentation)
         outline_inner.addWidget(self.seg_commit)
         outline_inner.addWidget(self.seg_apply_shift)
-        outline_inner.addWidget(self.seg_seeded)
         outline_inner.addWidget(self.seg_save)
         self.seg_export = QPushButton("Export TIFF")
         self.seg_export.clicked.connect(lambda: self._export_step_tiffs("segmentation"))
@@ -631,16 +626,13 @@ class TissueKitWidget(QWidget):
         sc_shift2 = QShortcut(QKeySequence("Shift+Enter"), self)
         sc_shift2.setContext(Qt.ApplicationShortcut)
         sc_shift2.activated.connect(lambda: self._apply_bond_edits(True))
-        sc_m = QShortcut(QKeySequence("Ctrl+M"), self)
-        sc_m.setContext(Qt.ApplicationShortcut)
-        sc_m.activated.connect(self._seeded_local_watershed)
         sc_toggle = QShortcut(QKeySequence(Qt.Key_M), self)
         sc_toggle.setContext(Qt.ApplicationShortcut)
         sc_toggle.activated.connect(self._toggle_outlines_visibility)
         sc_save = QShortcut(QKeySequence("Ctrl+S"), self)
         sc_save.setContext(Qt.ApplicationShortcut)
         sc_save.activated.connect(self._save_segmentation)
-        self._bond_shortcuts = (sc_enter, sc_pad, sc_shift, sc_shift2, sc_m, sc_toggle, sc_save)
+        self._bond_shortcuts = (sc_enter, sc_pad, sc_shift, sc_shift2, sc_toggle, sc_save)
 
     def _toggle_outlines_visibility(self) -> None:
         ol = self._layer("Outlines")
@@ -954,52 +946,6 @@ class TissueKitWidget(QWidget):
         if ol_data is not None:
             ol.refresh()
         self.status.setText(f"Outlines redrawn on {len(frames)} frame(s) after the cell edit.")
-
-    def _seeded_local_watershed(self) -> None:
-        if not self._bonds_ready():
-            return
-        ol = self._layer("Outlines")
-        img_ly = self._layer(self.seg_image.currentText())
-        if not isinstance(ol, Labels):
-            self.status.setText("Missing Outlines layer.")
-            return
-        if img_ly is None:
-            self.status.setText("Select an Image layer for seeded watershed.")
-            return
-        try:
-            from .core.ta_bond_edit import changed_frames, seeded_local_wshed
-        except Exception as exc:
-            self.status.setText(f"TA bond edit import failed: {exc}")
-            return
-        t0 = time.perf_counter()
-        try:
-            image = _as_tyx(np.asarray(img_ly.data))
-            seeds = np.asarray(ol.data)
-            if seeds.ndim == 2:
-                seeds = seeds[np.newaxis, ...]
-            frames = changed_frames(self._seg_base_outlines, seeds)
-            if not frames:
-                self.status.setText("Paint seed dots first (Ctrl+M).")
-                return
-            updated, rois = seeded_local_wshed(
-                image,
-                self._seg_base_masks,
-                self._seg_base_hand,
-                seeds,
-                self._seg_base_outlines,
-                frames=frames,
-            )
-        except Exception as exc:
-            self.status.setText(f"Seeded watershed failed: {exc}")
-            print(traceback.format_exc(), flush=True)
-            return
-
-        self._commit_seg(updated, frames, rois)
-        self.status.setText(
-            f"Seeded local watershed done on {len(frames)} frame(s) in "
-            f"{time.perf_counter() - t0:.2f}s. max label "
-            f"{int(self._seg_base_masks.max())}."
-        )
 
     def _save_segmentation(self) -> None:
         if self._seg_base_masks is None and self._layer("Segmentation") is None:

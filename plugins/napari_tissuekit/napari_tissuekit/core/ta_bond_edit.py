@@ -1,6 +1,6 @@
 """Headless Tissue Analyzer bond correction (EPySeg ``paint2`` algorithms).
 
-Ports ``Createpaintwidget.apply_drawing`` and ``manually_reseeded_wshed`` to
+Ports ``Createpaintwidget.apply_drawing`` to
 numpy arrays, calling the ported EPySeg ``wshed`` (``_wshed.py``).
 """
 from __future__ import annotations
@@ -338,53 +338,6 @@ def apply_drawing_hand(
     return drawn_mask
 
 
-def manually_reseeded_wshed_hand(
-    image_yx: np.ndarray,
-    hand: np.ndarray,
-    seed_mask: np.ndarray,
-) -> np.ndarray:
-    """Port of ``Createpaintwidget.manually_reseeded_wshed``."""
-    img = np.asarray(image_yx)
-    if img.ndim == 3:
-        img = img[..., 0] if img.shape[-1] <= 4 else img[0]
-    drawn_mask = np.asarray(hand, dtype=np.uint8).copy()
-    labs = label(np.asarray(seed_mask) > 0, connectivity=2, background=0)
-    rps_user = regionprops(labs)
-    if len(rps_user) == 0:
-        return drawn_mask
-
-    drawn_mask[labs != 0] = 0
-    lab_cells = label(drawn_mask, connectivity=1, background=255)
-    rps_cells = regionprops(lab_cells)
-
-    min_y = 100000000
-    min_x = 100000000
-    max_y = 0
-    max_x = 0
-    for rps in rps_user:
-        label_id = int(lab_cells[rps.coords[0][0], rps.coords[0][1]])
-        if label_id == 0:
-            continue
-        bbox = rps_cells[label_id - 1].bbox
-        min_y = min(bbox[0], min_y)
-        min_x = min(bbox[1], min_x)
-        max_y = max(bbox[2], max_y)
-        max_x = max(bbox[3], max_x)
-
-    if min_y >= max_y or min_x >= max_x:
-        return drawn_mask
-
-    crop_img = img[min_y : max_y + 1, min_x : max_x + 1]
-    crop_seeds = labs[min_y : max_y + 1, min_x : max_x + 1]
-    minished = np.asarray(
-        wshed(crop_img, seeds=crop_seeds, weak_blur=1.0), dtype=np.uint8
-    )
-    roi = drawn_mask[min_y : max_y + 1, min_x : max_x + 1]
-    roi[minished != 0] = minished[minished != 0]
-    drawn_mask[min_y : max_y + 1, min_x : max_x + 1] = roi
-    return drawn_mask
-
-
 def changed_frames(base_outlines: np.ndarray, edited_outlines: np.ndarray) -> list[int]:
     """Indices of frames whose outline layer differs from the base (T,Y,X)."""
     base = np.asarray(base_outlines)
@@ -498,39 +451,6 @@ def apply_bond_strokes(
         new_hand = apply_drawing_hand(
             hand[t], erased, drawn, min_seed_area=min_seed_area, pad=pad
         )
-        res = relabel_changed(masks[t], hand[t], new_hand)
-        hand[t] = new_hand
-        if res is not None:
-            masks = _write_frame(masks, t, res[0])
-            rois.append((t, *res[1]))
-    return masks, rois
-
-
-def seeded_local_wshed(
-    image: np.ndarray,
-    masks: np.ndarray,
-    hand: np.ndarray,
-    seed_outlines: np.ndarray,
-    base_outlines: np.ndarray,
-    *,
-    frames,
-):
-    """Ctrl+M: seeded local watershed from newly painted dots.
-
-    Same in-place contract and return value as :func:`apply_bond_strokes`.
-    """
-    img = np.asarray(image)
-    if img.ndim == 2:
-        img = img[np.newaxis, ...]
-    rois: list[tuple[int, slice, slice]] = []
-    for t in frames:
-        t = int(t)
-        # Seeds = newly painted dots, not existing bonds.
-        seed = (np.asarray(seed_outlines[t]) > 0) & ~(np.asarray(base_outlines[t]) > 0)
-        if not np.any(seed):
-            continue
-        frame_img = img[t] if img.shape[0] == masks.shape[0] else img[0]
-        new_hand = manually_reseeded_wshed_hand(frame_img, hand[t], seed.astype(np.uint8))
         res = relabel_changed(masks[t], hand[t], new_hand)
         hand[t] = new_hand
         if res is not None:
