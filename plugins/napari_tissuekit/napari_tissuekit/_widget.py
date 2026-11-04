@@ -122,10 +122,9 @@ HELP_HTML = """
 <li><b>Start outline editing</b>: show the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one.</li>
 <li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
-<li><b>Apply + drop small cells (Shift+Enter)</b>: the same, and cells smaller than <i>Min cell area</i> are removed.</li>
 <li><b>Save segmentation (Ctrl+S)</b>: write masks and outlines (<code>*_cp_masks.tif</code>, <code>*_cp_outlines.tif</code>, <code>*_cell_outlines.tif</code>).</li>
 <li><b>Export TIFF</b>: same as Save.</li>
-<li>A cell needs at least <b>15 px</b> in every step (segmentation, outline edits, manual drawing, tracking); smaller regions are dropped or refused. <i>Min cell area</i> can only raise this for Shift+Enter.</li>
+<li>A cell needs at least <b>15 px</b> in every step (segmentation, outline edits, manual drawing, tracking); smaller regions are dropped or refused.</li>
 <li><b>M</b> hides or shows the outlines. <i>Watershed pad</i>: area around an edit that is recomputed (smaller = faster).</li>
 <li><b>Manual correction</b> (filled cells): hold Option/Ctrl, click a cell to delete it, drag around an area to draw a new cell, Ctrl/Cmd+Z undoes.</li>
 </ul>
@@ -389,7 +388,6 @@ class TissueKitWidget(QWidget):
         outline_help = QLabel(
             "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines. "
             "Enter = Apply (local watershed, like TA). "
-            "Shift+Enter = Apply + drop small cells. "
             "M = toggle Outlines. Ctrl+S / Save writes masks, outlines and *_cell_outlines.tif (cell outlines only). Cell edits below also redraw the outlines."
         )
         outline_help.setWordWrap(True)
@@ -398,13 +396,8 @@ class TissueKitWidget(QWidget):
         import_form = QFormLayout()
         self.seg_masks = QComboBox()
         self.seg_outlines = QComboBox()
-        self.seg_min_area = QSpinBox()
-        self.seg_min_area.setRange(MIN_CELL_AREA, 100000)
-        self.seg_min_area.setValue(MIN_CELL_AREA)
-        self.seg_min_area.setToolTip(f"Shift+Enter removes cells smaller than this. Never below {MIN_CELL_AREA} px, the minimal cell size of every step.")
         import_form.addRow("Masks", self.seg_masks)
         import_form.addRow("Outlines", self.seg_outlines)
-        import_form.addRow("Min cell area", self.seg_min_area)
         self.seg_pad = QSpinBox()
         self.seg_pad.setRange(8, 512)
         self.seg_pad.setValue(128)
@@ -425,13 +418,10 @@ class TissueKitWidget(QWidget):
         self.seg_start_edit.clicked.connect(self._start_outline_editing)
         outline_inner.addWidget(self.seg_start_edit)
         self.seg_commit = QPushButton("Apply bond edits (Enter)")
-        self.seg_commit.clicked.connect(lambda: self._apply_bond_edits(False))
-        self.seg_apply_shift = QPushButton("Apply + drop small cells (Shift+Enter)")
-        self.seg_apply_shift.clicked.connect(lambda: self._apply_bond_edits(True))
+        self.seg_commit.clicked.connect(lambda: self._apply_bond_edits())
         self.seg_save = QPushButton("Save segmentation")
         self.seg_save.clicked.connect(self._save_segmentation)
         outline_inner.addWidget(self.seg_commit)
-        outline_inner.addWidget(self.seg_apply_shift)
         outline_inner.addWidget(self.seg_save)
         self.seg_export = QPushButton("Export TIFF")
         self.seg_export.clicked.connect(lambda: self._export_step_tiffs("segmentation"))
@@ -616,23 +606,17 @@ class TissueKitWidget(QWidget):
         # ApplicationShortcut so Enter works while the canvas has focus (TA-like).
         sc_enter = QShortcut(QKeySequence(Qt.Key_Return), self)
         sc_enter.setContext(Qt.ApplicationShortcut)
-        sc_enter.activated.connect(lambda: self._apply_bond_edits(False))
+        sc_enter.activated.connect(lambda: self._apply_bond_edits())
         sc_pad = QShortcut(QKeySequence(Qt.Key_Enter), self)
         sc_pad.setContext(Qt.ApplicationShortcut)
-        sc_pad.activated.connect(lambda: self._apply_bond_edits(False))
-        sc_shift = QShortcut(QKeySequence("Shift+Return"), self)
-        sc_shift.setContext(Qt.ApplicationShortcut)
-        sc_shift.activated.connect(lambda: self._apply_bond_edits(True))
-        sc_shift2 = QShortcut(QKeySequence("Shift+Enter"), self)
-        sc_shift2.setContext(Qt.ApplicationShortcut)
-        sc_shift2.activated.connect(lambda: self._apply_bond_edits(True))
+        sc_pad.activated.connect(lambda: self._apply_bond_edits())
         sc_toggle = QShortcut(QKeySequence(Qt.Key_M), self)
         sc_toggle.setContext(Qt.ApplicationShortcut)
         sc_toggle.activated.connect(self._toggle_outlines_visibility)
         sc_save = QShortcut(QKeySequence("Ctrl+S"), self)
         sc_save.setContext(Qt.ApplicationShortcut)
         sc_save.activated.connect(self._save_segmentation)
-        self._bond_shortcuts = (sc_enter, sc_pad, sc_shift, sc_shift2, sc_toggle, sc_save)
+        self._bond_shortcuts = (sc_enter, sc_pad, sc_toggle, sc_save)
 
     def _toggle_outlines_visibility(self) -> None:
         ol = self._layer("Outlines")
@@ -789,7 +773,7 @@ class TissueKitWidget(QWidget):
             return False
         return True
 
-    def _apply_bond_edits(self, drop_small: bool) -> bool:
+    def _apply_bond_edits(self) -> bool:
         """Apply painted bond strokes. Returns True if any frame changed."""
         if not self._bonds_ready():
             return False
@@ -809,10 +793,6 @@ class TissueKitWidget(QWidget):
         if edited.ndim == 2:
             edited = edited[np.newaxis, ...]
         frames = changed_frames(self._seg_base_outlines, edited)
-        min_area = max(int(self.seg_min_area.value()), MIN_CELL_AREA) if drop_small else MIN_CELL_AREA
-        if drop_small and not frames:
-            # Drop small cells on the frame being viewed, not the whole movie.
-            frames = [self._current_frame(self._seg_base_masks.shape[0])]
         if not frames:
             self.status.setText("No bond edits to apply.")
             return False
@@ -823,7 +803,7 @@ class TissueKitWidget(QWidget):
                 self._seg_base_outlines,
                 edited,
                 frames=frames,
-                min_seed_area=min_area - 1,  # the watershed removes regions of up to this many px
+                min_seed_area=MIN_CELL_AREA - 1,  # the watershed removes regions of up to this many px
                 pad=int(self.seg_pad.value()),
             )
         except Exception as exc:
@@ -838,17 +818,12 @@ class TissueKitWidget(QWidget):
                 "an area (closed loop, or closed against the tissue edge)."
             )
             return False
-        extra = f", min_area={min_area}" if drop_small else ""
         self.status.setText(
-            f"Applied bond edits on {len(frames)} frame(s) (TA wshed{extra}) "
+            f"Applied bond edits on {len(frames)} frame(s) (TA wshed) "
             f"in {time.perf_counter() - t0:.2f}s. max label "
             f"{int(self._seg_base_masks.max())}."
         )
         return True
-
-    def _current_frame(self, n_frames: int) -> int:
-        frame = int(round(float(self.viewer.dims.point[0]))) if n_frames > 1 else 0
-        return int(np.clip(frame, 0, n_frames - 1))
 
     def _commit_seg(self, updated: np.ndarray, frames: list[int], rois: list) -> None:
         """Push changed frames into the Segmentation / Outlines layers in place."""
@@ -958,7 +933,7 @@ class TissueKitWidget(QWidget):
             isinstance(self._layer("Outlines"), Labels)
             and self._seg_base_hand is not None
         ):
-            self._apply_bond_edits(False)
+            self._apply_bond_edits()
         seg = self._layer("Segmentation")
         if not isinstance(seg, Labels):
             self.status.setText("Missing Segmentation labels layer.")
