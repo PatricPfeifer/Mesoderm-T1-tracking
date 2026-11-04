@@ -27,6 +27,7 @@ from .tracks import (
 
 from ..output_names import input_stem, tagged_path  # noqa: E402
 from ..movie_calibration import Calibration, calibration_for, save_tiff  # noqa: E402
+from ..cell_size import MIN_CELL_AREA, remove_small_labels  # noqa: E402
 
 
 def _stage_progress(progress, lo: int, hi: int, message: str):
@@ -143,6 +144,11 @@ def track_loaded(
     cal = calibration
     if cal is None and (intensity_path or masks_path):
         cal = calibration_for(intensity_path, masks_path, stem=stem)
+    small_masks, n_small = remove_small_labels(movie.masks)  # regions under the minimal cell size are not cells
+    if n_small:
+        movie.masks = small_masks
+        if verbose:
+            print(f"Ignored {n_small} regions smaller than {MIN_CELL_AREA} px.", flush=True)
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)

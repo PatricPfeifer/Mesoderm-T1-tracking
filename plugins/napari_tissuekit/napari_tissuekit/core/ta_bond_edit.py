@@ -14,6 +14,7 @@ from skimage.measure import label, regionprops
 from skimage.segmentation import expand_labels, find_boundaries
 
 from ._wshed import wshed
+from .cell_size import MIN_CELL_AREA
 
 
 def labels_to_hand(labels: np.ndarray) -> np.ndarray:
@@ -37,7 +38,7 @@ def exterior_mask(hand: np.ndarray) -> np.ndarray:
 
 
 def enclosed_background(
-    exterior: np.ndarray, drawn: np.ndarray, min_area: int = 10
+    exterior: np.ndarray, drawn: np.ndarray, min_area: int = MIN_CELL_AREA
 ) -> np.ndarray:
     """Background pieces cut off by ``drawn`` strokes (new cells).
 

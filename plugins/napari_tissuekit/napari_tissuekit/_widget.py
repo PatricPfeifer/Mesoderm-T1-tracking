@@ -19,6 +19,7 @@ from qtpy.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QDoubleSpinBox,
     QFormLayout,
@@ -35,12 +36,14 @@ from qtpy.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QTabWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from . import __version__
 from .cell_properties import CellPropertiesWidget
+from .core.cell_size import MIN_CELL_AREA
 from .core.project import WorkingFolder, find_results_root, movie_stem
 from .track_edit import (
     CellUndo,
@@ -94,6 +97,66 @@ def _as_rgb(data: np.ndarray) -> np.ndarray:
         raise ValueError(f"expected T,Y,X,3 RGB, got {arr.shape}")
     return arr
 
+
+HELP_HTML = """
+<h3>Workflow</h3>
+<ol>
+<li><b>Open the movie</b> in napari, or press <b>Folder...</b> and pick its <code>*_results</code> folder: saved results load and the drop-downs fill in by themselves.</li>
+<li><b>Segmentation</b>: find the cells and correct their outlines.</li>
+<li><b>Tracking</b>: give every cell the same ID in all frames.</li>
+<li><b>T1</b>: find neighbour exchanges (T1 transitions).</li>
+</ol>
+<p>Everything is saved in the results folder next to the movie. Progress and errors show in the line at the bottom.</p>
+
+<h3>Top bar</h3>
+<ul>
+<li><b>Folder...</b>: choose the results folder. If it holds saved results they are loaded.</li>
+<li><b>Load results</b>: load the saved movie, segmentation, outlines and tracking.</li>
+<li><b>Help</b>: this window.</li>
+</ul>
+
+<h3>Segmentation tab</h3>
+<ul>
+<li><b>Image</b>: the movie. <b>Run segmentation</b> finds the cells (Cellpose). <i>Batch size</i>: frames at once. <i>Use GPU</i>: only if one is available.</li>
+<li><b>Masks / Outlines</b>: the cell layer and the outline layer to edit (set automatically after loading).</li>
+<li><b>Start outline editing</b>: show the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
+<li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one.</li>
+<li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
+<li><b>Apply + drop small cells (Shift+Enter)</b>: the same, and cells smaller than <i>Min cell area</i> are removed.</li>
+<li><b>Seeded local watershed (Ctrl+M)</b>: paint at least two seed dots, then press it to re-split that area.</li>
+<li><b>Save segmentation (Ctrl+S)</b>: write masks and outlines (<code>*_cp_masks.tif</code>, <code>*_cp_outlines.tif</code>, <code>*_cell_outlines.tif</code>).</li>
+<li><b>Export TIFF</b>: same as Save.</li>
+<li>A cell needs at least <b>15 px</b> in every step (segmentation, outline edits, manual drawing, tracking); smaller regions are dropped or refused. <i>Min cell area</i> can only raise this for Shift+Enter.</li>
+<li><b>M</b> hides or shows the outlines. <i>Watershed pad</i>: area around an edit that is recomputed (smaller = faster).</li>
+<li><b>Manual correction</b> (filled cells): hold Option/Ctrl, click a cell to delete it, drag around an area to draw a new cell, Ctrl/Cmd+Z undoes.</li>
+</ul>
+
+<h3>Tracking tab</h3>
+<ul>
+<li><b>Labels</b>: the segmentation to track. <b>Intensity</b>: the movie (or none).</li>
+<li><b>Run tracking</b>: track the cells. The defaults are fine to start with; hover over a setting for what it does.</li>
+<li><b>Divisions</b>: dividing cells end their track and the two daughters get new IDs.</li>
+<li><b>Export TIFF</b>: write the tracked layers to the results folder.</li>
+<li><b>Correct tracks</b>: turn on <i>Edit tracks</i>, pick a mode and click cells on the Tracked layer.
+ <i>This frame</i> changes one frame, <i>Link</i> joins two tracks, <i>Break</i> starts a new track, <i>Swap</i> exchanges two IDs.
+ <b>Undo</b> takes back the last edit, <b>Clear protection</b> lets corrected cells be changed again, <b>Save corrected tracks</b> writes the corrected tracking (the old files go to a <code>previous_...</code> folder).</li>
+</ul>
+
+<h3>T1 tab</h3>
+<ul>
+<li><b>Labels</b>: the Tracked layer. <b>RGB</b>: the Tracked RGB image used for the overlay.</li>
+<li><b>Run T1</b>: detect T1 transitions. Needs the pixel size and frame interval stored in the movie.</li>
+<li><b>T1 filter</b>: show all counted events, only clean ones, flicker resolved, or flicker aborted.</li>
+<li><b>Overlay pre / post</b>: frames shown before and after each event. <b>Expand</b>: how far cells are grown to find contacts.</li>
+<li><b>Exclude dividing cells</b>: leave out mothers and daughters (needs tracking with Divisions).</li>
+<li><b>Export TIFF</b>: write the T1 layers to the results folder.</li>
+</ul>
+
+<h3>Export Cell Props tab</h3>
+<p>Measure cell properties on the Tracked layer. Set the pixel size and frame interval, click cells (<i>Select cells</i>) or use <b>Select all cells</b>,
+tick the features you want and use <b>Color</b> to colour the cells by a feature. <b>Feature guide</b> explains each feature.
+<b>Export CSV...</b> writes the table. <b>Save selection...</b> / <b>Load selection...</b> keep your chosen cells for later.</p>
+"""
 
 TRACK_TIPS = {
     "expand": (
@@ -338,8 +401,9 @@ class TissueKitWidget(QWidget):
         self.seg_masks = QComboBox()
         self.seg_outlines = QComboBox()
         self.seg_min_area = QSpinBox()
-        self.seg_min_area.setRange(0, 100000)
-        self.seg_min_area.setValue(10)
+        self.seg_min_area.setRange(MIN_CELL_AREA, 100000)
+        self.seg_min_area.setValue(MIN_CELL_AREA)
+        self.seg_min_area.setToolTip(f"Shift+Enter removes cells smaller than this. Never below {MIN_CELL_AREA} px, the minimal cell size of every step.")
         import_form.addRow("Masks", self.seg_masks)
         import_form.addRow("Outlines", self.seg_outlines)
         import_form.addRow("Min cell area", self.seg_min_area)
@@ -753,8 +817,8 @@ class TissueKitWidget(QWidget):
         if edited.ndim == 2:
             edited = edited[np.newaxis, ...]
         frames = changed_frames(self._seg_base_outlines, edited)
-        min_area = int(self.seg_min_area.value()) if drop_small else 0
-        if min_area and not frames:
+        min_area = max(int(self.seg_min_area.value()), MIN_CELL_AREA) if drop_small else MIN_CELL_AREA
+        if drop_small and not frames:
             # Drop small cells on the frame being viewed, not the whole movie.
             frames = [self._current_frame(self._seg_base_masks.shape[0])]
         if not frames:
@@ -767,7 +831,7 @@ class TissueKitWidget(QWidget):
                 self._seg_base_outlines,
                 edited,
                 frames=frames,
-                min_seed_area=min_area,
+                min_seed_area=min_area - 1,  # the watershed removes regions of up to this many px
                 pad=int(self.seg_pad.value()),
             )
         except Exception as exc:
@@ -1966,10 +2030,26 @@ class TissueKitWidget(QWidget):
         load = QPushButton("Load results")
         load.setToolTip("Load segmentation and tracking already saved in the results folder")
         load.clicked.connect(self._load_saved_results)
+        help_button = QPushButton("Help")
+        help_button.setToolTip("How to use this panel: the workflow and what every button does")
+        help_button.clicked.connect(self._show_help)
         bar.addWidget(self.folder_label, 1)
         bar.addWidget(choose)
         bar.addWidget(load)
+        bar.addWidget(help_button)
         return bar
+
+    def _show_help(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"napari-tissuekit v{__version__}: how to use")
+        dialog.resize(560, 640)
+        text = QTextBrowser()
+        text.setHtml(HELP_HTML)
+        box = QVBoxLayout()
+        box.addWidget(text)
+        dialog.setLayout(box)
+        dialog.show()
+        self._help_dialog = dialog  # keep a reference so the window stays open
 
     @staticmethod
     def _scrollable(page: QWidget) -> QScrollArea:
@@ -2070,13 +2150,19 @@ class TissueKitWidget(QWidget):
         movie = self.project.read_settings().get("movie")
         if not (movie and Path(movie).is_file()):
             movie = self.project.guess_movie()  # e.g. results made on the HPC: no settings.json
-        if movie and Path(movie).is_file() and Path(movie).resolve() not in {
-            Path(p).resolve() for p in self._layer_paths(*self.viewer.layers) if p
-        }:
+        movie_layer = None
+        if movie and Path(movie).is_file():
+            for ly in self.viewer.layers:
+                path = getattr(getattr(ly, "source", None), "path", None)
+                if isinstance(ly, Image) and path and Path(path).resolve() == Path(movie).resolve():
+                    movie_layer = ly
+        if movie and Path(movie).is_file() and movie_layer is None:
+            before = {id(ly) for ly in self.viewer.layers}
             try:
                 self.viewer.open(str(movie), plugin="napari")
             except Exception:
                 self.viewer.add_image(tifffile.imread(movie), name=movie_stem(movie))
+            movie_layer = next((ly for ly in self.viewer.layers if id(ly) not in before and isinstance(ly, Image)), None)
             loaded.append("movie")
         if "segmentation" in found:
             masks = tifffile.imread(found["segmentation"][0])
@@ -2135,7 +2221,28 @@ class TissueKitWidget(QWidget):
                 self._replace_image("Tracked RGB", tifffile.imread(rgb))
             loaded.append("tracking")
         self._refresh_layers()
+        self._select_loaded_layers(movie_layer)
         self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}.{outline_note}")
+
+    def _select_loaded_layers(self, movie_layer) -> None:
+        """Point the layer drop-downs at the layers that loading a results folder just made."""
+        def pick(box: QComboBox, name: str | None) -> None:
+            idx = box.findText(name) if name else -1
+            if idx >= 0:
+                box.setCurrentIndex(idx)
+
+        pick(self.seg_image, movie_layer.name if movie_layer is not None else None)
+        if self._layer("Segmentation") is not None:
+            pick(self.seg_masks, "Segmentation")
+        if self._layer("Outlines") is not None:
+            pick(self.seg_outlines, "Outlines")
+        if self._layer("Tracked") is not None:
+            pick(self.track_labels, "Tracked")
+            pick(self.t1_labels, "Tracked")
+        if movie_layer is not None:
+            pick(self.track_intensity, movie_layer.name)
+        if self._layer("Tracked RGB") is not None:
+            pick(self.t1_rgb, "Tracked RGB")
 
     def _replace_labels(self, name: str, data: np.ndarray) -> None:
         if name == "Tracked":  # new tracks: old undo steps and protection are stale

@@ -21,6 +21,7 @@ import numpy as np
 from cellpose import models
 from tifffile import imread, imwrite
 
+from .cell_size import MIN_CELL_AREA
 from .outline_io import hand_stack_to_outline, masks_to_outline_rgb
 from .ta_bond_edit import thin_hand_stack
 
@@ -92,6 +93,7 @@ def segment_stack(
 ) -> np.ndarray:
     """Segment each frame with Cellpose cpsam. Shared by the CLI and napari plugin."""
     img = as_stack(img)
+    eval_kwargs = {"min_size": MIN_CELL_AREA, **(eval_kwargs or {})}  # Cellpose drops regions below min_size px
     n_frames, ly, lx = img.shape
     if masks is None:
         masks = np.zeros((n_frames, ly, lx), dtype=np.uint16)
@@ -101,7 +103,7 @@ def segment_stack(
     model = models.CellposeModel(gpu=use_gpu, pretrained_model="cpsam")
     for t in range(start, n_frames):
         print(f"frame {t + 1}/{n_frames}", flush=True)
-        m = model.eval(img[t], batch_size=batch_size, **(eval_kwargs or {}))[0]
+        m = model.eval(img[t], batch_size=batch_size, **eval_kwargs)[0]
         masks[t] = np.asarray(m, dtype=np.uint16)
         if on_frame is not None:
             on_frame(t, masks)

@@ -18,6 +18,7 @@ import numpy as np
 from napari.layers import Labels
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QKeySequence
+from .core.cell_size import MIN_CELL_AREA
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QApplication,
     QShortcut, QSizePolicy
@@ -376,6 +377,10 @@ class CellCorrectionWidget(QWidget):
             # Optimized mask updates using boolean operations
             empty_mask = (current_frame_data == 0)
             add_mask = np.logical_and(new_cell_mask > 0, empty_mask)
+            if int(add_mask.sum()) < MIN_CELL_AREA:
+                self.undo_stack.pop()  # nothing was changed
+                self.status_label.setText(f"Cell not added: it needs at least {MIN_CELL_AREA} px (drew {int(add_mask.sum())}).")
+                return
             current_frame_data[add_mask] = self.next_cell_id
 
             # Update data and visualization
