@@ -319,13 +319,118 @@ def job_script(cfg: RemoteConfig, remote_dir: str, movie_name: str, tag: str,
         "python -c \"import torch; print('torch', torch.__version__, '| GPU usable:', "
         "torch.cuda.is_available())\" || true",
         *(_install_lines(install) if install is not None and install.needs_install else []),
-        f"tissuekit segment {q(movie_name)} --preset {q(cfg.preset)} --batch-size {int(cfg.batch_size)}"
-        + (f" --run {q(run)}" if run else "")
-        + (f" --params {q(json.dumps(params, separators=(',', ':')))}" if params else "")
-        + ("" if fill_holes else " --no-fill-holes"),
+        _segment_cmd(movie_name, cfg.preset, int(cfg.batch_size), run, params, fill_holes),
     ]
     lines.append("echo TISSUEKIT_DONE")
     return "\n".join(lines) + "\n"
+
+
+def _segment_cmd(movie_name: str, preset: str, batch_size: int, run: str = "",
+                 params: dict | None = None, fill_holes: bool = True) -> str:
+    """The ``tissuekit segment`` line of a job script."""
+    q = shlex.quote
+    return (
+        f"tissuekit segment {q(movie_name)} --preset {q(preset)} --batch-size {int(batch_size)}"
+        + (f" --run {q(run)}" if run else "")
+        + (f" --params {q(json.dumps(params, separators=(',', ':')))}" if params else "")
+        + ("" if fill_holes else " --no-fill-holes")
+    )
+
+
+# ---- batch: many (egg, profile) items one after another in one GPU job ----------------
+
+def parse_time(text: str) -> int:
+    """Seconds of a Slurm time limit: ``mm``, ``mm:ss``, ``hh:mm:ss`` or ``d-hh[:mm[:ss]]``."""
+    text = text.strip()
+    days = 0
+    if "-" in text:
+        d, text = text.split("-", 1)
+        days = int(d)
+        parts = [int(x) for x in text.split(":")] + [0, 0]
+        h, m, s = parts[:3]
+    else:
+        parts = [int(x) for x in text.split(":")]
+        if len(parts) == 1:
+            h, m, s = 0, parts[0], 0
+        elif len(parts) == 2:
+            h, (m, s) = 0, parts
+        else:
+            h, m, s = parts[-3:]
+    return ((days * 24 + h) * 60 + m) * 60 + s
+
+
+def format_time(seconds: int) -> str:
+    """Slurm time limit ``hh:mm:ss`` (hours may exceed 24)."""
+    seconds = max(int(seconds), 60)
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def batch_time(per_item: str, n_items: int) -> str:
+    """Time limit of a batch job: the per-item limit times the number of items."""
+    return format_time(parse_time(per_item) * max(int(n_items), 1))
+
+
+# Longest job a queue accepts (bwUniCluster 3.0 batch queue table): every dev_* queue 30 min,
+# gpu_h100 72 h. Other queues are not checked here (Slurm refuses a too long job itself).
+DEV_MAX = "00:30:00"
+PARTITION_MAX = {"gpu_h100": "72:00:00"}
+
+
+def partition_problem(partition: str, time_limit: str) -> str:
+    """Why ``time_limit`` does not fit ``partition`` (empty if it fits or the queue is unknown)."""
+    limit = DEV_MAX if partition.startswith("dev_") else PARTITION_MAX.get(partition)
+    if limit is None or parse_time(time_limit) <= parse_time(limit):
+        return ""
+    hint = " Use gpu_h100 (up to 72 h) in Cluster settings, or fewer items." if partition.startswith("dev_") else ""
+    return f"{time_limit} is longer than {partition} allows ({limit}).{hint}"
+
+
+def batch_job_script(cfg: RemoteConfig, remote_dir: str, items, install: "PluginState | None" = None) -> str:
+    """Slurm script that segments every item in turn (``items``: :class:`core.batch.BatchItem`).
+
+    Each item prints ``TISSUEKIT_ITEM i/N``, then ``TISSUEKIT_ITEM_DONE i`` or
+    ``TISSUEKIT_ITEM_FAILED i``. A failed item does not stop the others: a command in a
+    ``&&`` / ``||`` list does not end the script under ``set -e``.
+    """
+    q = shlex.quote
+    n = len(items)
+    conda_sh = cfg.conda_sh.replace("~", "$HOME", 1) if cfg.conda_sh.startswith("~") else q(cfg.conda_sh)
+    eggs = len({it.movie_name for it in items})
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name=tk_batch_{eggs}x{n}",
+        f"#SBATCH --partition={cfg.partition}",
+        *([f"#SBATCH --gres={cfg.gres}"] if cfg.gres else []),
+        "#SBATCH --ntasks=1",
+        f"#SBATCH --cpus-per-task={int(cfg.cpus)}",
+        f"#SBATCH --mem={cfg.mem}",
+        f"#SBATCH --time={batch_time(cfg.time, n)}",
+        f"#SBATCH --output={remote_dir}/slurm-%j.log",
+        "set -eo pipefail  # no -u: conda activate reads unset variables",
+        f"source {conda_sh}",
+        f"conda activate {q(cfg.conda_env)}",
+        f"cd {q(remote_dir)}",
+        "nvidia-smi -L || true",
+        "python -c \"import torch; print('torch', torch.__version__, '| GPU usable:', "
+        "torch.cuda.is_available())\" || true",
+        *(_install_lines(install) if install is not None and install.needs_install else []),
+    ]
+    for i, it in enumerate(items, 1):
+        cmd = _segment_cmd(it.movie_name, run_name_label(it.profile), int(it.params.get("batch_size", cfg.batch_size)),
+                           it.run, it.params, it.fill_holes)
+        lines += [
+            f"echo {q(f'TISSUEKIT_ITEM {i}/{n} {it.movie_name} {it.run}')}",
+            f"{cmd} && echo 'TISSUEKIT_ITEM_DONE {i}' || echo 'TISSUEKIT_ITEM_FAILED {i}'",
+        ]
+    lines.append("echo TISSUEKIT_DONE")
+    return "\n".join(lines) + "\n"
+
+
+def run_name_label(profile: str) -> str:
+    """Preset name as a single shell word (it is only a label when --params is given)."""
+    return re.sub(r"\s+", "_", profile.strip()) or "custom"
 
 
 def conda_root(cfg: RemoteConfig) -> str:

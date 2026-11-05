@@ -282,6 +282,17 @@ class TissueKitWidget(QWidget):
         self.cell_props = CellPropertiesWidget(self.viewer)
         self.cell_props.dir_provider = self._cell_props_dir
         tabs.addTab(self._scrollable(self.cell_props), "Export Cell Props")
+        from .batch_widget import BatchPanel
+
+        self.batch = BatchPanel(
+            current_values=self.seg_params.values,
+            fill_holes=self.seg_fill_holes.isChecked,
+            open_egg=self._open_batch_egg,
+            run_items=self._run_batch,
+        )
+        batch_index = tabs.addTab(self.batch, "Batch")
+        # read the folder again when the tab is shown (presets saved, runs made meanwhile)
+        tabs.currentChanged.connect(lambda i: self.batch.refresh() if i == batch_index else None)
         version = QLabel(f"v{__version__}")
         version.setToolTip("napari-tissuekit version")
         version.setStyleSheet("color: gray; padding: 0 6px;")
@@ -1010,6 +1021,54 @@ class TissueKitWidget(QWidget):
         self._refresh_layers()
         self._pick(self.seg_masks, "Segmentation")
         self._pick(self.track_labels, "Segmentation")
+
+    # ---- Batch tab ---------------------------------------------------------------------
+    def _run_batch(self, items, skipped) -> None:
+        """Step 1: show what the batch would submit (the real cluster run comes next)."""
+        from .batch_widget import DryRunDialog
+
+        cfg = self._remote_cfg()
+        if cfg is None:
+            return
+        try:
+            DryRunDialog(items, skipped, cfg, self).exec_()
+        except ValueError as exc:  # e.g. a time limit in the settings that is not hh:mm:ss
+            self.status.setText(f"Batch: cannot read the time limit '{cfg.time}' ({exc}); fix it in Cluster settings.")
+
+    def _open_batch_egg(self, egg, run=None) -> None:
+        """Open one egg of the Batch tab: its movie and saved results (``run`` made active first)."""
+        if len(self.viewer.layers):
+            unsaved = " The Tracked layer has unsaved edits." if self._track_dirty else ""
+            answer = QMessageBox.question(
+                self, "Open egg",
+                f"Close the current layers before opening {egg.name}?{unsaved}\n\n"
+                "Yes: close them. No: keep them and add the egg.",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Cancel:
+                return
+            if answer == QMessageBox.Yes:
+                self.viewer.layers.clear()
+                self._seg_base_masks = None
+                self._seg_base_hand = None
+                self._seg_run = None
+                self._seg_pending = None
+                self._tracking_files = None
+                self._track_dirty = False
+        self.project.set_manual(egg.results)
+        if run:
+            self.project.set_active_seg_run(run)
+        self._refresh_folder_label()
+        if self.project.found():
+            self._load_saved_results()  # also opens the movie
+        else:
+            before = {id(ly) for ly in self.viewer.layers}
+            self.viewer.open(str(egg.movie), plugin="napari")
+            self._refresh_layers()
+            new = next((ly for ly in self.viewer.layers if id(ly) not in before and isinstance(ly, Image)), None)
+            if new is not None:
+                self._pick(self.seg_image, new.name)
+            self.status.setText(f"Opened {egg.name} (no results yet). Results go to {egg.results}.")
 
     def _start_outline_editing(self) -> None:
         masks_ly = self._layer(self.seg_masks.currentText())
