@@ -9,6 +9,7 @@ scikit-image
 tifffile
 opencv-python
 qtpy
+paramiko>=3  # "Run on cluster GPU" (SSH to bwUniCluster)
 
 # Segmentation: Cellpose 4 (Cellpose-SAM, cpsam)
 cellpose>=4
