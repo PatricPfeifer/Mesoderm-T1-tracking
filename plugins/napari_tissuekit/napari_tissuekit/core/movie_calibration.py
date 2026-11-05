@@ -160,6 +160,9 @@ def _merge(primary: Calibration | None, fallback: Calibration | None) -> Calibra
     )
 
 
+merge_calibrations = _merge  # public name
+
+
 def calibration_for(*paths: Path | str | None, stem: str | None = None) -> Calibration | None:
     """Calibration from the first given file that has one.
 

@@ -293,7 +293,7 @@ def _check_host_key(host: str, port: int, key) -> None:
 
 def job_script(cfg: RemoteConfig, remote_dir: str, movie_name: str, tag: str,
                install: "PluginState | None" = None, run: str = "",
-               params: dict | None = None) -> str:
+               params: dict | None = None, fill_holes: bool = True) -> str:
     """Slurm script for one segmentation. ``params`` = every Cellpose value from the plugin's
     Segmentation tab (sent as JSON, so presets saved only on this computer work there too)."""
     q = shlex.quote
@@ -321,7 +321,8 @@ def job_script(cfg: RemoteConfig, remote_dir: str, movie_name: str, tag: str,
         *(_install_lines(install) if install is not None and install.needs_install else []),
         f"tissuekit segment {q(movie_name)} --preset {q(cfg.preset)} --batch-size {int(cfg.batch_size)}"
         + (f" --run {q(run)}" if run else "")
-        + (f" --params {q(json.dumps(params, separators=(',', ':')))}" if params else ""),
+        + (f" --params {q(json.dumps(params, separators=(',', ':')))}" if params else "")
+        + ("" if fill_holes else " --no-fill-holes"),
     ]
     lines.append("echo TISSUEKIT_DONE")
     return "\n".join(lines) + "\n"
@@ -586,7 +587,7 @@ def _mark_active_run(job: "RemoteJob") -> None:
 
 def submit(cfg: RemoteConfig, session: Session, movie: Path, local_results: Path,
            progress: Progress, install: PluginState | None = None,
-           run: str | None = None, params: dict | None = None) -> RemoteJob:
+           run: str | None = None, params: dict | None = None, fill_holes: bool = True) -> RemoteJob:
     """Upload and sbatch. The job is remembered on this computer right away, so a lost
     connection (or a closed napari) never loses it: 'Fetch cluster results' picks it up."""
     run = run or local_run_name(Path(local_results), cfg.preset)  # free here, so nothing local is overwritten
@@ -597,7 +598,7 @@ def submit(cfg: RemoteConfig, session: Session, movie: Path, local_results: Path
     movie_name = upload_movie(session, movie, remote_dir, progress)
     script = posixpath.join(remote_dir, "job.sh")
     with session.sftp.open(script, "w") as fh:
-        fh.write(job_script(cfg, remote_dir, movie_name, tag, install, run, params))
+        fh.write(job_script(cfg, remote_dir, movie_name, tag, install, run, params, fill_holes))
     out = session.run(f"sbatch --parsable {shlex.quote(script)}").strip()
     job_id = out.split(";")[0].strip()
     if not job_id.isdigit():
@@ -698,7 +699,7 @@ def run_segmentation(cfg: RemoteConfig, password: str, otp: str, movie: Path,
                      sleep: Callable[[float], None] = time.sleep,
                      on_log: Callable[[str], None] | None = None,
                      run: str | None = None,
-                     params: dict | None = None) -> tuple[RemoteJob, Path]:
+                     params: dict | None = None, fill_holes: bool = True) -> tuple[RemoteJob, Path]:
     """The one-button round trip. Returns the job and the downloaded ``*_cp_masks.tif``.
 
     ``run``/``params``: run folder name and Cellpose values chosen in the Segmentation tab
@@ -707,7 +708,7 @@ def run_segmentation(cfg: RemoteConfig, password: str, otp: str, movie: Path,
     with Session.connect(cfg, password, otp) as session:
         state = sync_plugin(cfg, session, progress)
         progress(0, "logged in; uploading movie ...")
-        job = submit(cfg, session, Path(movie), Path(local_results), progress, state, run, params)
+        job = submit(cfg, session, Path(movie), Path(local_results), progress, state, run, params, fill_holes)
         wait_for(session, job, progress, cfg.poll_seconds, sleep, on_log=on_log)
         files = download_seg(session, job, progress)
         if masks_file(files) is None:  # keep the job remembered: it can be fetched again

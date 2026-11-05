@@ -77,9 +77,11 @@ def cmd_segment(args, extra) -> None:
         argv += ["--params", args.params]
     if args.force_cpu:
         argv.append("--force-cpu")
+    if not args.fill_holes:
+        argv.append("--no-fill-holes")
     segmentation.main(argv + extra)
     run_info = {"preset": args.preset, "params": {**params, "batch_size": batch},
-                "batch_size": batch, "gpu": not args.force_cpu}
+                "batch_size": batch, "gpu": not args.force_cpu, "fill_holes": args.fill_holes}
     wf.write_run_params(run, run_info)
     wf.set_active_seg_run(run)
     wf.write_settings("segmentation", {"run": run, **run_info}, movie=str(movie))
@@ -133,6 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     seg.add_argument("--batch-size", type=int, default=None,
                      help="256x256 px tiles per GPU pass (default: the preset's, else 8)")
     seg.add_argument("--force-cpu", action="store_true")
+    seg.add_argument("--no-fill-holes", dest="fill_holes", action="store_false",
+                     help="leave empty space enclosed by cells empty (default: it becomes a new cell)")
     add("track", cmd_track, "track the saved segmentation")
     add("t1", cmd_t1, "detect T1 events on the saved tracking")
     return p
