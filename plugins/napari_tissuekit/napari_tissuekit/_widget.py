@@ -265,6 +265,8 @@ class TissueKitWidget(QWidget):
         layout.addWidget(tabs)
         layout.addWidget(self.status)
         self.setLayout(layout)
+        self._apply_section_style()
+        self.viewer.events.theme.connect(self._apply_section_style)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.viewer.layers.events.inserted.connect(self._refresh_layers)
         self.viewer.layers.events.removed.connect(self._refresh_layers)
@@ -275,6 +277,35 @@ class TissueKitWidget(QWidget):
         self._update_overlay()
         self._install_bond_shortcuts()
         self._refresh_layers()
+
+    def _apply_section_style(self, *_args) -> None:
+        """Coloured section titles and clearer borders on every QGroupBox."""
+        try:
+            from napari.utils.theme import get_theme
+
+            bg = get_theme(self.viewer.theme).background.as_rgb_tuple()
+            dark = sum(bg[:3]) < 384
+        except Exception:
+            dark = self.viewer.theme != "light"
+        # light yellow on dark (echoes the yellow outlines); dark amber on light
+        title, border = ("#f5d67b", "#6a7380") if dark else ("#8a5a00", "#9a9fa6")
+        self.setStyleSheet(
+            f"""
+            QGroupBox {{
+                border: 1px solid {border};
+                border-radius: 4px;
+                margin-top: 16px;
+                padding-top: 8px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 8px;
+                padding: 0 4px;
+                color: {title};
+            }}
+            """
+        )
 
     def sizeHint(self) -> QSize:
         return QSize(320, super().sizeHint().height())
@@ -387,17 +418,22 @@ class TissueKitWidget(QWidget):
         form.addRow("Batch size", self.seg_batch)
         form.addRow("", self.seg_gpu)
         form.addRow("", self.seg_fill_holes)
-        layout.addLayout(form)
+        segment_box = QGroupBox("1 · Segment")
+        segment_inner = QVBoxLayout()
+        segment_inner.addLayout(form)
         self.seg_run = QPushButton("Run segmentation")
         self.seg_run.clicked.connect(self._run_segmentation)
-        layout.addWidget(self.seg_run)
+        segment_inner.addWidget(self.seg_run)
+        segment_box.setLayout(segment_inner)
+        layout.addWidget(segment_box)
 
-        outline_box = QGroupBox("Outline correction (Tissue Analyzer style)")
+        outline_box = QGroupBox("2 · Correct outlines")
         outline_inner = QVBoxLayout()
         outline_help = QLabel(
-            "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines (right mouse button erases while Paint is on). "
+            "Tissue Analyzer style. Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines "
+            "(right mouse button erases while Paint is on). "
             "Enter = Apply (local watershed, like TA). "
-            "M = toggle Outlines. Ctrl+S / Save writes the masks (*_cp_masks.tif) and the 1 px outlines (*_cell_outlines.tif). Deleting a cell below also redraws the outlines."
+            "M = toggle Outlines. Deleting a cell also redraws the outlines."
         )
         outline_help.setWordWrap(True)
         outline_help.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
@@ -429,24 +465,38 @@ class TissueKitWidget(QWidget):
         outline_inner.addWidget(self.seg_start_edit)
         self.seg_commit = QPushButton("Apply bond edits (Enter)")
         self.seg_commit.clicked.connect(lambda: self._apply_bond_edits())
-        self.seg_save = QPushButton("Save segmentation")
-        self.seg_save.clicked.connect(self._save_segmentation)
         outline_inner.addWidget(self.seg_commit)
-        outline_inner.addWidget(self.seg_save)
-        self.seg_export = QPushButton("Export TIFF")
-        self.seg_export.clicked.connect(lambda: self._export_step_tiffs("segmentation"))
-        outline_inner.addWidget(self.seg_export)
+        self._add_correction(outline_inner)
         outline_box.setLayout(outline_inner)
         layout.addWidget(outline_box)
 
-        self._add_correction(layout)
+        save_box = QGroupBox("3 · Save / export")
+        save_row = QHBoxLayout()
+        self.seg_save = QPushButton("Save segmentation")
+        self.seg_save.setToolTip(
+            "Ctrl+S. Writes the masks (*_cp_masks.tif) and the 1 px outlines "
+            "(*_cell_outlines.tif) to the results folder."
+        )
+        self.seg_save.clicked.connect(self._save_segmentation)
+        self.seg_export = QPushButton("Export TIFF")
+        self.seg_export.clicked.connect(lambda: self._export_step_tiffs("segmentation"))
+        save_row.addWidget(self.seg_save)
+        save_row.addWidget(self.seg_export)
+        save_box.setLayout(save_row)
+        layout.addWidget(save_box)
+
         layout.addStretch()
         page.setLayout(layout)
         return page
 
-    def _add_correction(self, layout: QVBoxLayout) -> None:
-        group = QGroupBox("Delete cell (Option + left click)")
-        inner = QVBoxLayout()
+    def _add_correction(self, inner: QVBoxLayout) -> None:
+        """Delete-cell tool, appended to the outline-correction section."""
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        inner.addWidget(line)
+        title = QLabel("<b>Delete cell</b>")
+        inner.addWidget(title)
         try:
             from .correction import CellCorrectionWidget, DataManager, VisualizationManager
         except Exception as exc:
@@ -464,10 +514,9 @@ class TissueKitWidget(QWidget):
             self.correction = CellCorrectionWidget(
                 self.viewer, self._data_manager, self._vis
             )
+            self.correction.layout().setContentsMargins(0, 0, 0, 0)
             inner.addWidget(self.correction)
             self._mirror_cell_edits_on_outlines()
-        group.setLayout(inner)
-        layout.addWidget(group)
 
     def _run_segmentation(self) -> None:
         if self._job_running():
@@ -1203,24 +1252,50 @@ class TissueKitWidget(QWidget):
         )
         self.track_divisions.toggled.connect(self._track_divisions_toggled)
         form.addRow("", self.track_divisions)
+        self.track_show_edge = QCheckBox("Show edge cells (Not recommended)")
+        self.track_show_edge.setToolTip(
+            "Off (default): cells whose track touches the image edge in any frame "
+            "are hidden in the Tracked layers, since their shape and neighbours "
+            "are cut off. Files written to disk always keep every track. "
+            "Applies when tracking is run."
+        )
+        form.addRow("", self.track_show_edge)
         tipped("Max gap", self.track_gap, "gap")
         tipped("Max distance", self.track_dist, "dist")
         tipped("CPU cores", self.track_jobs, "jobs")
         form.addRow("Save to", self.track_out)
-        layout.addLayout(form)
+        track_box = QGroupBox("1 · Track")
+        track_inner = QVBoxLayout()
+        track_inner.addLayout(form)
         self.track_run = QPushButton("Run tracking")
         self.track_run.clicked.connect(self._run_tracking)
-        layout.addWidget(self.track_run, 0, Qt.AlignLeft)
+        track_inner.addWidget(self.track_run)
+        track_box.setLayout(track_inner)
+        layout.addWidget(track_box)
+        layout.addWidget(self._track_edit_box())
+
+        save_box = QGroupBox("3 · Save / export")
+        save_row = QHBoxLayout()
+        self.track_save = QPushButton("Save corrected tracks")
+        self.track_save.setToolTip(
+            "Write the corrected tracking next to the original files so the later "
+            "steps use it: tracked labels and RGB, tracks, links, events, lineage "
+            "(divisions follow your edits) and QC. The previous files are copied to "
+            "a previous_<time> folder first."
+        )
+        self.track_save.clicked.connect(self._save_track_edits)
         self.track_export = QPushButton("Export TIFF")
         self.track_export.clicked.connect(lambda: self._export_step_tiffs("tracking"))
-        layout.addWidget(self.track_export, 0, Qt.AlignLeft)
-        layout.addWidget(self._track_edit_box())
+        save_row.addWidget(self.track_save)
+        save_row.addWidget(self.track_export)
+        save_box.setLayout(save_row)
+        layout.addWidget(save_box)
         layout.addStretch()
         page.setLayout(layout)
         return page
 
     def _track_edit_box(self) -> QGroupBox:
-        group = QGroupBox("Correct tracks")
+        group = QGroupBox("2 · Correct tracks")
         inner = QVBoxLayout()
         self.track_edit = QCheckBox("Edit tracks")
         self.track_edit.toggled.connect(self._track_edit_toggled)
@@ -1261,15 +1336,6 @@ class TissueKitWidget(QWidget):
         )
         unprotect.clicked.connect(self._clear_protection)
         inner.addWidget(unprotect, 0, Qt.AlignLeft)
-        self.track_save = QPushButton("Save corrected tracks")
-        self.track_save.setToolTip(
-            "Write the corrected tracking next to the original files so the later "
-            "steps use it: tracked labels and RGB, tracks, links, events, lineage "
-            "(divisions follow your edits) and QC. The previous files are copied to "
-            "a previous_<time> folder first."
-        )
-        self.track_save.clicked.connect(self._save_track_edits)
-        inner.addWidget(self.track_save, 0, Qt.AlignLeft)
         group.setLayout(inner)
         self.track_modes.buttons()[0].setChecked(True)
         return group
@@ -1930,11 +1996,23 @@ class TissueKitWidget(QWidget):
             wf.write_settings("tracking", params, movie=movie_path)
             saved = f" Saved to {wf.step_dir('tracking', create=False)}"
         self._track_run = None
-        self._replace_labels("Tracked", result["tracked"])
+        tracked, rgb = result["tracked"], result.get("rgb")
+        hidden = 0
+        if not self.track_show_edge.isChecked():
+            from .core.tracking import edge_track_ids
+
+            edge_ids = edge_track_ids(tracked)
+            if edge_ids:
+                hide = np.isin(tracked, list(edge_ids))
+                tracked = np.where(hide, 0, tracked).astype(tracked.dtype)
+                if rgb is not None:
+                    rgb = np.where(hide[..., np.newaxis], 0, rgb).astype(rgb.dtype)
+                hidden = len(edge_ids)
+        self._replace_labels("Tracked", tracked)
         labels_out = result.get("labels_path")
         self._tracking_files = Path(labels_out) if labels_out else None
-        if result.get("rgb") is not None:
-            self._replace_image("Tracked RGB", result["rgb"])
+        if rgb is not None:
+            self._replace_image("Tracked RGB", rgb)
         qc = result.get("qc") or {}
         track_result = result["result"]
         parents = getattr(track_result, "parents", {}) or {}
@@ -1945,6 +2023,8 @@ class TissueKitWidget(QWidget):
                 f" divisions={qc.get('n_divide', 0)} "
                 f"(flagged {qc.get('n_divide_flagged', 0)})"
             )
+        if hidden:
+            extra += f" (hid {hidden} edge tracks)"
         self.status.setText(
             f"Tracking done. tracks={qc.get('n_tracks', track_result.n_tracks)}{extra}{saved}"
         )
@@ -1996,13 +2076,21 @@ class TissueKitWidget(QWidget):
             "update them."
         )
         form.addRow("", self.t1_exclude_div)
-        layout.addLayout(form)
+        detect_box = QGroupBox("1 · Detect T1 events")
+        detect_inner = QVBoxLayout()
+        detect_inner.addLayout(form)
         self.t1_run = QPushButton("Run T1")
         self.t1_run.clicked.connect(self._run_t1)
-        layout.addWidget(self.t1_run)
+        detect_inner.addWidget(self.t1_run)
+        detect_box.setLayout(detect_inner)
+        layout.addWidget(detect_box)
+        export_box = QGroupBox("2 · Export")
+        export_inner = QVBoxLayout()
         self.t1_export = QPushButton("Export TIFF")
         self.t1_export.clicked.connect(lambda: self._export_step_tiffs("t1"))
-        layout.addWidget(self.t1_export)
+        export_inner.addWidget(self.t1_export)
+        export_box.setLayout(export_inner)
+        layout.addWidget(export_box)
         layout.addStretch()
         page.setLayout(layout)
         return page
@@ -2195,9 +2283,8 @@ class TissueKitWidget(QWidget):
         import tifffile
 
         loaded = []
-        movie = self.project.read_settings().get("movie")
-        if not (movie and Path(movie).is_file()):
-            movie = self.project.guess_movie()  # e.g. results made on the HPC: no settings.json
+        # e.g. results made on the HPC: no settings.json, so guess from the mask file names
+        movie = self.project.movie_path() or self.project.guess_movie()
         movie_layer = None
         if movie and Path(movie).is_file():
             for ly in self.viewer.layers:

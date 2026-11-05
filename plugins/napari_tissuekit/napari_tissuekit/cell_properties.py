@@ -62,6 +62,7 @@ COLORABLE = {
     "circularity": "viridis",
     "shape_index": "viridis",
     "eccentricity": "viridis",
+    "aspect_ratio": "viridis",
     "solidity": "viridis",
     "major_axis": "viridis",
     "minor_axis": "viridis",
@@ -76,6 +77,7 @@ FEATURES: dict[str, tuple[str, bool]] = {
     "circularity": ("Circularity", True),
     "shape_index": ("Shape index", True),
     "eccentricity": ("Eccentricity", False),
+    "aspect_ratio": ("Aspect ratio (major / minor)", False),
     "solidity": ("Solidity", False),
     "major_axis": ("Major axis length", False),
     "minor_axis": ("Minor axis length", False),
@@ -145,6 +147,9 @@ def compute_properties(
                     row[f] = per / np.sqrt(area) if area > 0 else np.nan
                 elif f == "eccentricity":
                     row[f] = float(rp.eccentricity)
+                elif f == "aspect_ratio":
+                    minor = float(rp.minor_axis_length)
+                    row[f] = float(rp.major_axis_length) / minor if minor > 0 else np.nan
                 elif f == "solidity":
                     row[f] = float(rp.solidity)
                 elif f == "major_axis":
@@ -270,6 +275,12 @@ class CellPropertiesWidget(QWidget):
         self._junctions: list[tuple[int, int]] = []  # pairs of track IDs whose junction length is followed
         self._picking: list[int] | None = None  # None = not adding a junction; else the cell(s) clicked so far
         self._auto_cal = (0.0, 0.0)  # what was last filled in automatically (pixel size, frame interval)
+        # Computed feature table + instance stack, reused while only the colour
+        # scale changes. Valid for one (layer, data version, selection, feature,
+        # calibration) key; the version is bumped whenever a labels layer changes.
+        self._overlay_cache: dict | None = None
+        self._data_version = 0
+        self._watched: set[int] = set()
 
         self.labels_combo = QComboBox()
         self.pixel_size = QDoubleSpinBox()
@@ -308,8 +319,9 @@ class CellPropertiesWidget(QWidget):
 
         self.feature_boxes: dict[str, QCheckBox] = {}
         self.color_buttons: dict[str, QToolButton] = {}
-        fbox = QGroupBox("Features  (tick = export, Color = paint cells)")
+        fbox = QGroupBox("2 · Features")
         flay = QVBoxLayout()
+        flay.addWidget(QLabel("Tick = export, Color = paint cells"))
         for key, (label, default) in FEATURES.items():
             cb = QCheckBox(label)
             cb.setChecked(default)
@@ -338,13 +350,21 @@ class CellPropertiesWidget(QWidget):
         self.legend_bar = QLabel()
         self.legend_bar.setFixedHeight(14)
         self.legend_bar.setScaledContents(True)
-        self.legend_min = QLabel("")
-        self.legend_max = QLabel("")
+        # manual colour-scale limits per feature: {key: {"lo": float, "hi": float}}
+        self._manual_range: dict[str, dict[str, float]] = {}
+        self.legend_min = self._limit_box("lo")
+        self.legend_max = self._limit_box("hi")
         self.legend_max.setAlignment(Qt.AlignRight)
+        self.legend_reset = QToolButton()
+        self.legend_reset.setText("Auto")
+        self.legend_reset.setToolTip("Reset min and max to the automatic range")
+        self.legend_reset.clicked.connect(self._reset_range)
         self.zero_cb = QCheckBox("Scale starts at 0")
-        self.zero_cb.toggled.connect(lambda *_: self._rebuild())
+        self.zero_cb.toggled.connect(lambda *_: self._recolor())
         lrow = QHBoxLayout()
         lrow.addWidget(self.legend_min)
+        lrow.addStretch(1)
+        lrow.addWidget(self.legend_reset)
         lrow.addStretch(1)
         lrow.addWidget(self.legend_max)
         llay = QVBoxLayout()
@@ -354,7 +374,7 @@ class CellPropertiesWidget(QWidget):
         llay.addWidget(self.zero_cb)
         self.legend_box.setLayout(llay)
 
-        jbox = QGroupBox("Junction length over time")
+        jbox = QGroupBox("3 · Junction length over time")
         jlay = QVBoxLayout()
         self.junction_add = QPushButton("Add junction")
         self.junction_add.setCheckable(True)
@@ -400,18 +420,28 @@ class CellPropertiesWidget(QWidget):
         self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
+        select_box = QGroupBox("1 · Select cells")
+        sel_lay = QVBoxLayout()
+        sel_lay.addLayout(form)
+        sel_lay.addWidget(self.select_cb)
+        sel_lay.addWidget(self.hover)
+        sel_lay.addWidget(QLabel("Selected tracks (double-click: jump to first frame)"))
+        sel_lay.addWidget(self.list)
+        sel_lay.addLayout(row)
+        select_box.setLayout(sel_lay)
+
+        export_box = QGroupBox("4 · Export")
+        exp_lay = QVBoxLayout()
+        exp_lay.addWidget(export)
+        exp_lay.addLayout(srow)
+        export_box.setLayout(exp_lay)
+
         lay = QVBoxLayout()
-        lay.addLayout(form)
-        lay.addWidget(self.select_cb)
-        lay.addWidget(self.hover)
-        lay.addWidget(QLabel("Selected tracks (double-click: jump to first frame)"))
-        lay.addWidget(self.list)
-        lay.addLayout(row)
+        lay.addWidget(select_box)
         lay.addWidget(fbox)
         lay.addWidget(self.legend_box)
         lay.addWidget(jbox)
-        lay.addWidget(export)
-        lay.addLayout(srow)
+        lay.addWidget(export_box)
         lay.addWidget(self.status)
         lay.addStretch(1)
         self.setLayout(lay)
@@ -447,7 +477,19 @@ class CellPropertiesWidget(QWidget):
         layer = self._labels_layer()
         return None if layer is None else as_tyx(layer.data)
 
+    def _bump_version(self, *_a) -> None:
+        self._data_version += 1
+
+    def _watch_layers(self) -> None:
+        """Invalidate the overlay cache when any labels layer is repainted or replaced."""
+        for ly in self.viewer.layers:
+            if isinstance(ly, Labels) and ly.name != SELECTED_LAYER and id(ly) not in self._watched:
+                self._watched.add(id(ly))
+                for ev in ("data", "set_data", "paint"):
+                    getattr(ly.events, ev).connect(self._bump_version)
+
     def _refresh_layers(self, *_a) -> None:
+        self._watch_layers()
         names = [
             ly.name
             for ly in self.viewer.layers
@@ -755,13 +797,29 @@ class CellPropertiesWidget(QWidget):
             self.color_feature = None
         self._rebuild()
 
-    def _color_overlay(self, stack: np.ndarray):
-        """Instance-labelled stack (one label per selected track and frame) + colormap."""
-        import matplotlib
+    def _cache_key(self) -> tuple:
+        return (
+            id(self._labels_layer()),
+            self._data_version,
+            tuple(self._selected),
+            self.color_feature,
+            self.pixel_size.value(),
+            self.interval.value(),
+        )
 
-        key = self.color_feature
+    def _color_base(self, stack: np.ndarray) -> dict | None:
+        """Feature values and instance-labelled stack; cached while the inputs are unchanged."""
+        key = self._cache_key()
+        cache = self._overlay_cache
+        if cache is not None and cache["key"] == key:
+            return cache
+        self._overlay_cache = None
         df = compute_properties(
-            stack, self._selected, [key], self.pixel_size.value(), self.interval.value()
+            stack,
+            self._selected,
+            [self.color_feature],
+            self.pixel_size.value(),
+            self.interval.value(),
         )
         if df.empty:
             return None
@@ -770,13 +828,6 @@ class CellPropertiesWidget(QWidget):
         finite = vals[np.isfinite(vals)]
         if not len(finite):
             return None
-        vmin = 0.0 if self.zero_cb.isChecked() else float(finite.min())
-        vmax = float(finite.max())
-        if vmax <= vmin:
-            vmax = vmin + 1e-9
-        cm = matplotlib.colormaps[COLORABLE[key]]
-        rgba = cm(np.clip((vals - vmin) / (vmax - vmin), 0, 1))
-        rgba[~np.isfinite(vals)] = [0.5, 0.5, 0.5, 1.0]
         inst = np.arange(1, len(df) + 1, dtype=np.uint32)
         data = np.zeros(stack.shape, dtype=np.uint32)
         lut = np.zeros(int(stack.max()) + 1, dtype=np.uint32)
@@ -784,24 +835,112 @@ class CellPropertiesWidget(QWidget):
             lut[:] = 0
             lut[grp["track_id"].to_numpy()] = inst[grp.index.to_numpy()]
             data[int(t)] = lut[stack[int(t)]]
+        self._overlay_cache = {
+            "key": key,
+            "col": col,
+            "vals": vals,
+            "inst": inst,
+            "data": data,
+            "lo": float(finite.min()),
+            "hi": float(finite.max()),
+        }
+        return self._overlay_cache
+
+    def _color_overlay(self, stack: np.ndarray):
+        """Instance-labelled stack (one label per selected track and frame) + colormap."""
+        import matplotlib
+
+        key = self.color_feature
+        base = self._color_base(stack)
+        if base is None:
+            return None
+        col, vals, inst, data = base["col"], base["vals"], base["inst"], base["data"]
+        vmin = 0.0 if self.zero_cb.isChecked() else base["lo"]
+        vmax = base["hi"]
+        manual = self._manual_range.get(key, {})
+        vmin = manual.get("lo", vmin)
+        vmax = manual.get("hi", vmax)
+        if vmax <= vmin:
+            vmax = vmin + 1e-9
+        cm = matplotlib.colormaps[COLORABLE[key]]
+        rgba = cm(np.clip((vals - vmin) / (vmax - vmin), 0, 1))
+        rgba[~np.isfinite(vals)] = [0.5, 0.5, 0.5, 1.0]
         color_dict = {None: [0, 0, 0, 0]}
         color_dict.update({int(i): rgba[i - 1] for i in inst})
         return data, DirectLabelColormap(color_dict=color_dict), col, vmin, vmax
 
-    def _set_legend(self, info) -> None:
-        if info is None:
-            self.legend_title.setText("No feature selected for coloring.")
-            self.legend_bar.clear()
-            self.legend_min.setText("")
-            self.legend_max.setText("")
+    def _limit_box(self, which: str) -> QDoubleSpinBox:
+        box = QDoubleSpinBox()
+        box.setRange(-1e9, 1e9)
+        box.setDecimals(4)
+        box.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        box.setKeyboardTracking(False)
+        box.setMaximumWidth(90)
+        box.setEnabled(False)
+        box.setToolTip("Click to type a value and amplify a range; values beyond it saturate")
+        box.valueChanged.connect(lambda v, w=which: self._limit_edited(w, v))
+        return box
+
+    def _limit_edited(self, which: str, value: float) -> None:
+        if self.color_feature is None:
             return
-        _data, _cmap, col, vmin, vmax = info
-        self.legend_title.setText(
-            f"{col}: fixed scale over all frames of the {len(self._selected)} selected track(s)"
-        )
-        self.legend_bar.setPixmap(colormap_image(COLORABLE[self.color_feature]))
-        self.legend_min.setText(f"{vmin:.3g}")
-        self.legend_max.setText(f"{vmax:.3g}")
+        self._manual_range.setdefault(self.color_feature, {})[which] = float(value)
+        self._recolor()
+
+    def _reset_range(self) -> None:
+        if self.color_feature is not None:
+            self._manual_range.pop(self.color_feature, None)
+            self._recolor()
+
+    def _recolor(self) -> None:
+        """Re-apply the colour scale to the existing overlay layer without recomputing."""
+        if self.color_feature is None:
+            return
+        cache = self._overlay_cache
+        stack = self._stack()
+        if (
+            stack is None
+            or cache is None
+            or cache["key"] != self._cache_key()
+            or SELECTED_LAYER not in self.viewer.layers
+        ):
+            self._rebuild()
+            return
+        info = self._color_overlay(stack)
+        if info is None:
+            self._rebuild()
+            return
+        self.viewer.layers[SELECTED_LAYER].colormap = info[1]
+        self._set_legend(info)
+
+    def _set_legend(self, info) -> None:
+        boxes = (self.legend_min, self.legend_max)
+        for b in boxes:
+            b.blockSignals(True)
+        try:
+            if info is None:
+                self.legend_title.setText("No feature selected for coloring.")
+                self.legend_bar.clear()
+                for b in boxes:
+                    b.setValue(0.0)
+                    b.setEnabled(False)
+                self.legend_reset.setEnabled(False)
+                return
+            _data, _cmap, col, vmin, vmax = info
+            manual = bool(self._manual_range.get(self.color_feature))
+            scale = "manual scale" if manual else "fixed scale over all frames"
+            self.legend_title.setText(
+                f"{col}: {scale} of the {len(self._selected)} selected track(s)"
+            )
+            self.legend_bar.setPixmap(colormap_image(COLORABLE[self.color_feature]))
+            self.legend_min.setValue(vmin)
+            self.legend_max.setValue(vmax)
+            for b in boxes:
+                b.setEnabled(True)
+            self.legend_reset.setEnabled(manual)
+        finally:
+            for b in boxes:
+                b.blockSignals(False)
 
     def _update_overlay(self, stack: np.ndarray | None) -> None:
         if SELECTED_LAYER in self.viewer.layers:
