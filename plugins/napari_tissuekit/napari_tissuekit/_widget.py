@@ -133,7 +133,7 @@ HELP_HTML = """
 
 <h3>Segmentation tab</h3>
 <ul>
-<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). <i>Use GPU</i> (also under Parameters, not saved in presets): this computer's GPU, on by default (falls back to the CPU when there is none). <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
+<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). Run locally uses this computer's GPU when it has one, else the CPU; the cluster always uses its GPU. <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
 <li><b>Masks / Outlines</b>: the cell layer and the outline layer to edit (set automatically after loading).</li>
 <li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run locally / Run on cluster or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one. With Paint, the <b>right mouse button</b> erases.</li>
@@ -466,12 +466,6 @@ class TissueKitWidget(QWidget):
         form = QFormLayout()
         form.setVerticalSpacing(4)
         self.seg_image = QComboBox()
-        self.seg_gpu = QCheckBox("Use GPU")
-        self.seg_gpu.setToolTip(
-            "Use this computer's GPU for 'Run locally' (on by default; Cellpose falls back to the CPU when "
-            "there is no GPU). Not saved in presets; cluster runs always use the cluster's GPU."
-        )
-        self.seg_gpu.setChecked(True)
         self.seg_fill_holes = QCheckBox("Fill enclosed holes as new cells")
         self.seg_fill_holes.setToolTip(
             "Empty space that is closed in by cells becomes a cell of its own. Space that reaches the image edge "
@@ -484,8 +478,7 @@ class TissueKitWidget(QWidget):
         self.seg_params = SegParamsPanel(name_for=self._next_run_name)
         form.addRow("Image", self.seg_image)
         self.seg_params.add_rows(form)
-        # In the Parameters pane, but not saved in presets: it depends on this computer (the cluster always uses its GPU).
-        self.seg_params.add_body_row("", self.seg_gpu)
+        # In the Parameters pane, but not saved in presets.
         self.seg_params.add_body_row("", self.seg_fill_holes)
         segment_box = QGroupBox("1 · Segment")
         segment_inner = QVBoxLayout()
@@ -671,7 +664,7 @@ class TissueKitWidget(QWidget):
         self._remember_calibration(layer)
         image = _as_tyx(np.asarray(layer.data))
         batch = int(self.seg_params.values()["batch_size"])
-        use_gpu = self.seg_gpu.isChecked()
+        use_gpu = True  # always: Cellpose uses the CPU by itself when this computer has no GPU
         fill_holes = self.seg_fill_holes.isChecked()
         work = Path(tempfile.mkdtemp(prefix="tissuekit_seg_"))
         image_path = work / "image.npy"
@@ -681,7 +674,7 @@ class TissueKitWidget(QWidget):
         self._seg_out = out_path
         # Settings of this run (preset + every Cellpose value); the run folder is named when it is saved.
         self._seg_pending = {**self.seg_params.run_info(), "run_base": self.seg_params.run_base(),
-                             "batch_size": batch, "gpu": use_gpu, "fill_holes": fill_holes, "where": "local"}
+                             "batch_size": batch, "gpu": "auto", "fill_holes": fill_holes, "where": "local"}
         import json
 
         from .core.seg_params import eval_kwargs
@@ -2679,7 +2672,7 @@ class TissueKitWidget(QWidget):
         wf.write_settings(
             "segmentation",
             {"model": "cpsam", "run": self._seg_run, **info,
-             "batch_size": int(self.seg_params.values()["batch_size"]), "gpu": self.seg_gpu.isChecked(),
+             "batch_size": int(self.seg_params.values()["batch_size"]), "gpu": "auto",
              "fill_holes": self.seg_fill_holes.isChecked()},
             movie=next((p for p in self._layer_paths(self._layer(self.seg_image.currentText())) if p), None),
         )

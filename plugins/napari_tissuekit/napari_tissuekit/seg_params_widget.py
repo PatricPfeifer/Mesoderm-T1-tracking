@@ -114,7 +114,7 @@ class SegParamsPanel(QWidget):
         form.addRow(self.body)
 
     def add_body_row(self, label: str, widget: QWidget) -> None:
-        """An extra row in the Parameters pane that is not part of a preset (e.g. Use GPU)."""
+        """An extra row in the Parameters pane that is not part of a preset (e.g. Fill enclosed holes)."""
         self._body_form.addRow(label, widget)
 
     # ---- presets ---------------------------------------------------------------
