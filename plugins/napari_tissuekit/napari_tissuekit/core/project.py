@@ -3,11 +3,12 @@
 Layout (next to the input movie by default)::
 
     <movie_dir>/<movie_stem>_results/
-        segmentation/   masks + outlines
+        segmentation/   one folder per run (parameter set): <run>/ masks + outlines + params.json;
+                        files directly in segmentation/ (older layout, cluster/HPC) are the run "original"
         tracking/       tracked labels, RGB, tracks/links/events CSVs, qc.json
         t1/             T1 events
         cell_props/     exports and selections from "Export Cell Props"
-        settings.json   parameters and time of the last run of every step
+        settings.json   parameters and time of the last run of every step, active segmentation run
 
 Nothing in here depends on napari or Qt, so it can be tested on its own.
 """
@@ -39,6 +40,9 @@ LEGACY_FOLDER_GLOBS = {
     "segmentation": ("*_cp_seg", "*_cf_seg"),
     "tracking": ("*_cp_track", "*_cf_track"),
 }
+# Segmentation runs: files directly in the segmentation folder(s) form this run.
+LEGACY_RUN = "original"
+RUN_PARAMS = "params.json"
 MOVIE_EXTENSIONS = (".ome.tif", ".ome.tiff", ".tif", ".tiff", ".czi", ".nd2", ".lif")
 
 
@@ -90,6 +94,12 @@ def _strip_suffix(name: str, suffixes) -> str | None:
         if name.endswith(suf):
             return name[: -len(suf)]
     return None
+
+
+def _seg_files(dirs) -> list[Path]:
+    """Mask and outline files directly inside ``dirs``."""
+    sufs = (*SEG_MASK_SUFFIXES, *OUTLINE_SUFFIXES)
+    return sorted({f for d in dirs if d.is_dir() for s in sufs for f in d.glob(f"*{s}")})
 
 
 class WorkingFolder:
@@ -180,24 +190,103 @@ class WorkingFolder:
                 return folder / name
         return None
 
+    # ---- segmentation runs --------------------------------------------------
+    def _legacy_seg_dirs(self) -> list[Path]:
+        """Folders whose own files form the run "original" (masks may also sit in the results folder itself)."""
+        return [*_step_dirs(self.root, "segmentation"), self.root]
+
+    def _run_dirs(self, run: str | None) -> list[Path]:
+        if run is None:
+            run = self.active_seg_run()
+        if run is None or run == LEGACY_RUN:
+            return self._legacy_seg_dirs()
+        return [self.root / "segmentation" / run]
+
+    def seg_runs(self) -> list[str]:
+        """Segmentation runs that hold masks or outlines ("original" first, then by name)."""
+        if self.root is None or not self.root.is_dir():
+            return []
+        runs = [LEGACY_RUN] if _seg_files(self._legacy_seg_dirs()) else []
+        base = self.root / "segmentation"
+        if base.is_dir():
+            runs += sorted(d.name for d in base.iterdir() if d.is_dir() and _seg_files([d]))
+        return runs
+
+    def seg_run_dir(self, run: str, create: bool = True) -> Path:
+        """Folder of ``run``. "original" is the folder that already holds its masks (else segmentation/)."""
+        assert self.root is not None, "no working folder set"
+        if run == LEGACY_RUN:
+            files = _seg_files(self._legacy_seg_dirs())
+            d = files[0].parent if files else self.root / "segmentation"
+        else:
+            d = self.root / "segmentation" / run
+        if create:
+            d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def new_run_name(self, base: str) -> str:
+        """``base`` made safe and unused: ``cellflow``, then ``cellflow_2`` ..."""
+        from .seg_params import run_name
+
+        base = run_name(base)
+        taken = set(self.seg_runs()) | {LEGACY_RUN}
+        if self.root is not None and (self.root / "segmentation").is_dir():
+            taken |= {d.name for d in (self.root / "segmentation").iterdir() if d.is_dir()}
+        name, i = base, 2
+        while name in taken:
+            name, i = f"{base}_{i}", i + 1
+        return name
+
+    def active_seg_run(self) -> str | None:
+        """The run the plugin shows and tracks: the one saved in settings.json, else the newest."""
+        runs = self.seg_runs()
+        if not runs:
+            return None
+        saved = self.read_settings().get("active_segmentation_run")
+        if saved in runs:
+            return saved
+        newest = {r: max(f.stat().st_mtime for f in _seg_files(self._run_dirs(r))) for r in runs}
+        return max(runs, key=newest.get)
+
+    def set_active_seg_run(self, run: str) -> None:
+        assert self.root is not None
+        self.root.mkdir(parents=True, exist_ok=True)
+        data = self.read_settings()
+        data["active_segmentation_run"] = run
+        self.settings_path.write_text(json.dumps(data, indent=2, default=str) + "\n", encoding="utf-8")
+
+    def write_run_params(self, run: str, params: dict) -> Path:
+        path = self.seg_run_dir(run) / RUN_PARAMS
+        data = {"run": run, "time": datetime.now().isoformat(timespec="seconds"), **params}
+        path.write_text(json.dumps(data, indent=2, default=str) + "\n", encoding="utf-8")
+        return path
+
+    def read_run_params(self, run: str) -> dict:
+        try:
+            return json.loads((self.seg_run_dir(run, create=False) / RUN_PARAMS).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
     # ---- what is already there --------------------------------------------
-    def found(self) -> dict[str, list[Path]]:
-        """Result files already in the folder, per step (empty lists omitted)."""
+    def found(self, run: str | None = None) -> dict[str, list[Path]]:
+        """Result files already in the folder, per step (empty lists omitted).
+
+        Segmentation masks and outlines come from one run: ``run``, else the active run.
+        """
         out: dict[str, list[Path]] = {}
         if self.root is None or not self.root.is_dir():
             return out
-        patterns = {
-            "segmentation": tuple(f"*{s}" for s in SEG_MASK_SUFFIXES),
-            "tracking": tuple(f"*{s}" for s in TRACK_LABEL_SUFFIXES),
-            "t1": (T1_PATTERN,),
-        }
-        # Masks and outlines may also sit directly in the chosen folder (not only in a segmentation/ subfolder).
-        seg_dirs = [*_step_dirs(self.root, "segmentation"), self.root]
-        for step, pats in patterns.items():
-            dirs = seg_dirs if step == "segmentation" else _step_dirs(self.root, step)
-            files = sorted({f for d in dirs for pat in pats for f in d.glob(pat)})
-            if files:
-                out[step] = files
+        seg_dirs = self._run_dirs(run)
+        masks = sorted({f for d in seg_dirs for s in SEG_MASK_SUFFIXES for f in d.glob(f"*{s}")})
+        if masks:
+            out["segmentation"] = masks
+        tracks = sorted({f for d in _step_dirs(self.root, "tracking") for s in TRACK_LABEL_SUFFIXES
+                         for f in d.glob(f"*{s}")})
+        if tracks:
+            out["tracking"] = tracks
+        t1 = sorted({f for d in _step_dirs(self.root, "t1") for f in d.glob(T1_PATTERN)})
+        if t1:
+            out["t1"] = t1
         outlines = sorted(
             {f for d in seg_dirs for suf in OUTLINE_SUFFIXES for f in d.glob(f"*{suf}")},
             key=lambda f: (not f.name.endswith(OUTLINE_SUFFIXES[0]), f.name),  # *_cell_outlines.tif first

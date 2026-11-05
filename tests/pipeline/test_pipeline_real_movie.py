@@ -72,7 +72,7 @@ def test_segmentation_then_tracking(tmp_path):
     results = tmp_path / "results"
     run_script("-m", "napari_tissuekit.cli", "segment", MOVIE, "--results", results,
                "--preset", "cellflow", "--force-cpu")
-    masks_path = next((results / "segmentation").glob("*_cp_masks.tif"))
+    masks_path = next((results / "segmentation" / "cellflow").glob("*_cp_masks.tif"))
     masks = imread(masks_path)
     assert masks.shape == (N_FRAMES, 291, 291)
     cells = [len(np.unique(m)) - 1 for m in masks]

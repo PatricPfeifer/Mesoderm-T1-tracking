@@ -27,18 +27,9 @@ from .ta_bond_edit import thin_hand_stack
 from .movie_calibration import read_calibration, save_tiff  # noqa: E402
 
 
-# Cellpose eval settings. "cellflow" = the settings of the older napariCellFlow
-# segmentation (auto diameter, stricter flow/cell-probability), used for the Egg1 HPC runs.
-PRESETS: dict[str, dict] = {
-    "default": {},
-    "cellflow": {
-        "diameter": None,
-        "flow_threshold": 0.6,
-        "cellprob_threshold": 0.3,
-        "min_size": 25,
-        "normalize": True,
-    },
-}
+# Cellpose eval settings: named presets plus single values (see seg_params.py).
+from .seg_params import BUILTIN_PRESETS as PRESETS  # noqa: E402
+from .seg_params import all_presets, eval_kwargs  # noqa: E402
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -53,8 +44,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--batch-size",
         type=int,
-        default=8,
-        help="Cellpose eval batch_size (default: 8).",
+        default=None,
+        help="256x256 px tiles per GPU pass (default: the preset's, else 8).",
     )
     p.add_argument(
         "--force-cpu",
@@ -63,11 +54,36 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--preset",
-        choices=sorted(PRESETS),
         default="default",
-        help="Cellpose eval settings (default: cpsam defaults).",
+        help="Named Cellpose settings: default, cellflow or one of your saved presets.",
+    )
+    p.add_argument(
+        "--params",
+        default=None,
+        help="JSON of single Cellpose settings over the preset, e.g. {\"flow_threshold\": 0.6}.",
     )
     return p.parse_args(argv)
+
+
+def resolve_all(preset: str, params_json: str | dict | None = None) -> dict:
+    """Every setting (Cellpose values and batch size): the preset's, then ``params_json`` over them.
+
+    An unknown preset name is fine when ``params_json`` is given (it is then only a label,
+    e.g. a preset saved on another computer)."""
+    import json
+
+    from .seg_params import full_params
+
+    extra = json.loads(params_json) if isinstance(params_json, str) else dict(params_json or {})
+    presets = all_presets()
+    if preset not in presets and not extra:
+        raise SystemExit(f"unknown preset {preset!r}; known: {', '.join(presets)}")
+    return full_params({**presets.get(preset, {}), **extra})
+
+
+def resolve_params(preset: str, params_json: str | dict | None = None) -> dict:
+    """Cellpose eval settings of ``preset`` + ``params_json`` (without the batch size)."""
+    return eval_kwargs(resolve_all(preset, params_json))
 
 
 def as_stack(img: np.ndarray) -> np.ndarray:
@@ -161,12 +177,12 @@ def main(argv=None) -> None:
 
     masks = segment_stack(
         img,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size or resolve_all(args.preset, args.params)["batch_size"],
         use_gpu=not args.force_cpu,
         start=start,
         masks=masks,
         on_frame=_checkpoint,
-        eval_kwargs=PRESETS[args.preset],
+        eval_kwargs=resolve_params(args.preset, args.params),
     )
     save_tiff(out, masks, cal)
     print("wrote", out, "max_label", int(masks.max()), flush=True)

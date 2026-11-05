@@ -27,8 +27,12 @@ from qtpy.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -45,6 +49,7 @@ from . import __version__
 from .cell_properties import CellPropertiesWidget
 from .core.cell_size import MIN_CELL_AREA
 from .core.project import WorkingFolder, find_results_root, movie_stem
+from .remote_widget import RemoteRunner
 from .track_edit import (
     CellUndo,
     ProtectedCellsError,
@@ -86,6 +91,18 @@ def _as_tyx(data: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _as_tyx_shape(shape, rgb: bool = False) -> tuple[int, int, int]:
+    """T,Y,X of a layer from its shape only (no pixel loading), like ``_as_tyx``."""
+    shape = tuple(int(s) for s in shape)
+    if rgb or (len(shape) == 4 and shape[-1] <= 4):
+        shape = shape[:-1]
+    elif len(shape) == 4 and shape[1] <= 4:
+        shape = (shape[0], *shape[2:])
+    if len(shape) == 2:
+        shape = (1, *shape)
+    return shape[0], shape[-2], shape[-1]
+
+
 def _as_rgb(data: np.ndarray) -> np.ndarray:
     arr = np.asarray(data)
     if arr.ndim == 3 and arr.shape[-1] == 3:
@@ -116,9 +133,9 @@ HELP_HTML = """
 
 <h3>Segmentation tab</h3>
 <ul>
-<li><b>Image</b>: the movie. <b>Run segmentation</b> finds the cells (Cellpose). <i>Batch size</i>: frames at once. <i>Use GPU</i>: only if one is available.</li>
+<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). <i>Use GPU</i> (also under Parameters, not saved in presets): this computer's GPU, only if one is available. Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
 <li><b>Masks / Outlines</b>: the cell layer and the outline layer to edit (set automatically after loading).</li>
-<li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run segmentation or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
+<li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run locally / Run on cluster or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one.</li>
 <li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
 <li><b>Save segmentation (Ctrl+S)</b>: write the masks and the 1 px outlines (<code>*_cp_masks.tif</code>, <code>*_cell_outlines.tif</code>).</li>
@@ -226,6 +243,10 @@ class TissueKitWidget(QWidget):
         self._seg_base_hand: np.ndarray | None = None
         self._hand_msg = ""
         self._seg_stem: str = "segmentation"
+        # Segmentation run (segmentation/<run>/) the Segmentation layer belongs to; None = not saved yet.
+        self._seg_run: str | None = None
+        self._seg_pending: dict | None = None  # settings of a finished run, written when it is saved
+        self._compare_colors = iter(())  # colours for "Add for comparison" layers
         self._track_pick: tuple[int, int, int, int] | None = None
         self._track_undo: deque = deque(maxlen=20)
         # Pixels set by manual edits, one record per edit (same order as the undo
@@ -244,6 +265,14 @@ class TissueKitWidget(QWidget):
         # that "Save corrected tracks" compares against), and unsaved-edit flag.
         self._tracking_files: Path | None = None
         self._track_dirty = False
+        # Cluster (bwUniCluster) segmentation runs in its own thread, so local work goes on.
+        self._remote = RemoteRunner(self)
+        self._remote_tmp: Path | None = None
+        self._remote_fetch_job = None
+        self._remote_events: list[str] = []  # timestamped steps for the Log window
+        self._remote_cluster_text = ""
+        self._remote_event_key = ""
+        self._remote_log_dialog = None
 
         tabs = QTabWidget()
         tabs.addTab(self._scrollable(self._segmentation_tab()), "Segmentation")
@@ -276,6 +305,38 @@ class TissueKitWidget(QWidget):
         self._update_overlay()
         self._install_bond_shortcuts()
         self._refresh_layers()
+        self._announce_waiting_cluster_jobs()
+
+    def _announce_waiting_cluster_jobs(self) -> None:
+        """After a lost connection or a restart: say that a cluster job still waits to be fetched."""
+        try:
+            from .core.remote import load_jobs
+
+            jobs = load_jobs()
+        except Exception:
+            return
+        if jobs:
+            names = ", ".join(f"{j.movie_name} (job {j.job_id})" for j in jobs[-3:])
+            self.status.setText(
+                f"{len(jobs)} cluster job{'s' if len(jobs) > 1 else ''} waiting: {names}. "
+                "Use Cluster settings > Fetch cluster results to pick it up."
+            )
+        self._announce_waiting_cluster_jobs()
+
+    def _announce_waiting_cluster_jobs(self) -> None:
+        """After a lost connection or a restart: say that a cluster job can still be fetched."""
+        try:
+            from .core.remote import load_jobs
+
+            jobs = load_jobs()
+        except Exception:
+            return
+        if jobs:
+            names = ", ".join(j.movie_name for j in jobs[:3])
+            self.status.setText(
+                f"{len(jobs)} cluster job(s) waiting ({names}): use Cluster settings > Fetch cluster results. "
+                "They keep running on the cluster while napari is closed."
+            )
 
     def _apply_section_style(self, *_args) -> None:
         """Coloured section titles and clearer borders on every QGroupBox."""
@@ -316,7 +377,8 @@ class TissueKitWidget(QWidget):
         if hasattr(self, 'folder_label'):
             self._refresh_folder_label()
         images = [ly.name for ly in self.viewer.layers if isinstance(ly, Image)]
-        labels = [ly.name for ly in self.viewer.layers if isinstance(ly, Labels)]
+        # "Seg · <run>" layers are read-only comparison overlays, never inputs.
+        labels = [ly.name for ly in self.viewer.layers if isinstance(ly, Labels) and not ly.name.startswith("Seg · ")]
         # Masks: Labels plus non-RGB Images (imported *_cp_masks.tif often opens as Image).
         mask_candidates = list(labels)
         for ly in self.viewer.layers:
@@ -400,21 +462,99 @@ class TissueKitWidget(QWidget):
         page = QWidget()
         layout = QVBoxLayout()
         form = QFormLayout()
+        form.setVerticalSpacing(4)
         self.seg_image = QComboBox()
-        self.seg_batch = QSpinBox()
-        self.seg_batch.setRange(1, 64)
-        self.seg_batch.setValue(8)
         self.seg_gpu = QCheckBox("Use GPU")
+        self.seg_gpu.setToolTip(
+            "Use this computer's GPU for 'Run locally' (only if one is available). Not saved in presets; "
+            "cluster runs always use the cluster's GPU."
+        )
         self.seg_gpu.setChecked(False)
+        from .seg_params_widget import SegParamsPanel
+
+        # One form, one label column: Image, Preset, Parameters (incl. batch size), Run name.
+        self.seg_params = SegParamsPanel(name_for=self._next_run_name)
         form.addRow("Image", self.seg_image)
-        form.addRow("Batch size", self.seg_batch)
-        form.addRow("", self.seg_gpu)
+        self.seg_params.add_rows(form)
+        # In the Parameters pane, but not saved in presets: it depends on this computer (the cluster always uses its GPU).
+        self.seg_params.add_body_row("", self.seg_gpu)
         segment_box = QGroupBox("1 · Segment")
         segment_inner = QVBoxLayout()
+        segment_inner.setSpacing(6)
         segment_inner.addLayout(form)
-        self.seg_run = QPushButton("Run segmentation")
+
+        # Run here or on the cluster; the cluster's occasional actions sit in one menu.
+        self.seg_run = QPushButton("Run locally")
+        self.seg_run.setToolTip("Segment the movie with Cellpose on this computer")
         self.seg_run.clicked.connect(self._run_segmentation)
-        segment_inner.addWidget(self.seg_run)
+        self.seg_remote = QPushButton("Run on cluster")
+        self.seg_remote.setToolTip(
+            "Log in to bwUniCluster once (password + OTP), upload the movie, segment it on a GPU "
+            "node and download the results here. Runs in the background; you can keep working."
+        )
+        self.seg_remote.clicked.connect(lambda: self._run_remote_segmentation())
+        cluster_btn = QPushButton("Cluster settings")  # a push button sizes itself to fit its text and menu arrow
+        cluster_btn.setToolTip("Fetch results, job log, cluster settings and one-time setup")
+        cluster_menu = QMenu(cluster_btn)
+        self.seg_remote_fetch = cluster_menu.addAction("Fetch cluster results")
+        self.seg_remote_fetch.setToolTip("Collect a cluster job whose connection was lost (laptop asleep, Wi-Fi).")
+        self.seg_remote_fetch.triggered.connect(lambda: self._fetch_remote_segmentation())
+        remote_log = cluster_menu.addAction("Log...")
+        remote_log.setToolTip("Live view of what the cluster job is doing (this computer's steps and the job log)")
+        remote_log.triggered.connect(lambda: self._show_remote_log())
+        cluster_menu.addSeparator()
+        remote_cfg = cluster_menu.addAction("Settings...")
+        remote_cfg.setToolTip("Cluster user name, GPU queue, conda env")
+        remote_cfg.triggered.connect(lambda: self._remote_settings())
+        self.seg_remote_setup = cluster_menu.addAction("Set up cluster...")
+        self.seg_remote_setup.setToolTip(
+            "One time: install Miniforge and a conda env (torch, Cellpose, this plugin) in your "
+            "cluster home via a CPU job (10-20 min). Later runs keep the code up to date by themselves."
+        )
+        self.seg_remote_setup.triggered.connect(lambda: self._setup_remote())
+        cluster_menu.setToolTipsVisible(True)
+        cluster_btn.setMenu(cluster_menu)
+        cluster_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        run_row = QHBoxLayout()
+        run_row.setSpacing(4)
+        run_row.addWidget(self.seg_run, 1)
+        run_row.addWidget(self.seg_remote, 1)
+        run_row.addWidget(cluster_btn)
+        segment_inner.addLayout(run_row)
+        self.seg_remote_bar = QProgressBar()
+        self.seg_remote_bar.setTextVisible(True)
+        self.seg_remote_bar.hide()  # shown while a cluster job runs
+        segment_inner.addWidget(self.seg_remote_bar)
+
+        # Saved runs (one folder per parameter set): pick the one to edit / track, or overlay others.
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        segment_inner.addWidget(line)
+        runs_form = QFormLayout()
+        runs_row = QHBoxLayout()
+        runs_row.setSpacing(4)
+        self.seg_runs = QComboBox()
+        self.seg_runs.setToolTip("Segmentation runs saved in the results folder (segmentation/<run>/)")
+        self.seg_runs.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.seg_runs.setMinimumContentsLength(10)
+        self.seg_run_show = QPushButton("Show")
+        self.seg_run_show.setToolTip(
+            "Make this run the active one: load it as the editable Segmentation + Outlines. "
+            "Tracking and Load results use the active run."
+        )
+        self.seg_run_show.clicked.connect(lambda: self._show_seg_run())
+        self.seg_run_compare = QPushButton("Compare")
+        self.seg_run_compare.setToolTip(
+            "Overlay this run's outlines as a read-only layer 'Seg · <run>' (own colour) "
+            "to compare it with the active segmentation"
+        )
+        self.seg_run_compare.clicked.connect(lambda: self._compare_seg_run())
+        runs_row.addWidget(self.seg_runs, 1)
+        runs_row.addWidget(self.seg_run_show)
+        runs_row.addWidget(self.seg_run_compare)
+        runs_form.addRow("Runs", runs_row)
+        segment_inner.addLayout(runs_form)
         segment_box.setLayout(segment_inner)
         layout.addWidget(segment_box)
 
@@ -450,7 +590,7 @@ class TissueKitWidget(QWidget):
             tools.addWidget(button)
         outline_inner.addLayout(tools)
         self.seg_start_edit = QPushButton("Start outline editing (for separately imported outlines)")
-        self.seg_start_edit.setToolTip("Only needed for outlines or masks you dragged in yourself and picked above. Not needed after Run segmentation or loading a results folder: editing starts there by itself.")
+        self.seg_start_edit.setToolTip("Only needed for outlines or masks you dragged in yourself and picked above. Not needed after Run locally / Run on cluster or loading a results folder: editing starts there by itself.")
         self.seg_start_edit.clicked.connect(self._start_outline_editing)
         outline_inner.addWidget(self.seg_start_edit)
         self.seg_commit = QPushButton("Apply bond edits (Enter)")
@@ -519,7 +659,7 @@ class TissueKitWidget(QWidget):
         self._seg_stem = self._safe_stem(layer.name)
         self._autosave_outlines_ok = True
         image = _as_tyx(np.asarray(layer.data))
-        batch = int(self.seg_batch.value())
+        batch = int(self.seg_params.values()["batch_size"])
         use_gpu = self.seg_gpu.isChecked()
         work = Path(tempfile.mkdtemp(prefix="tissuekit_seg_"))
         image_path = work / "image.npy"
@@ -527,7 +667,16 @@ class TissueKitWidget(QWidget):
         np.save(image_path, np.asarray(image))
         self._seg_dir = work
         self._seg_out = out_path
+        # Settings of this run (preset + every Cellpose value); the run folder is named when it is saved.
+        self._seg_pending = {**self.seg_params.run_info(), "run_base": self.seg_params.run_base(),
+                             "batch_size": batch, "gpu": use_gpu, "where": "local"}
+        import json
+
+        from .core.seg_params import eval_kwargs
+
+        kwargs_json = json.dumps(eval_kwargs(self.seg_params.values()))
         code = (
+            "import json\n"
             "import numpy as np\n"
             "from napari_tissuekit.core.segmentation import segment_stack\n"
             f"img = np.load({str(image_path)!r})\n"
@@ -535,6 +684,7 @@ class TissueKitWidget(QWidget):
             "    img,\n"
             f"    batch_size={batch},\n"
             f"    use_gpu={use_gpu},\n"
+            f"    eval_kwargs=json.loads({kwargs_json!r}),\n"
             ")\n"
             f"np.save({str(out_path)!r}, masks)\n"
             "print('SEGMENT_DONE', int(masks.max()), flush=True)\n"
@@ -544,7 +694,11 @@ class TissueKitWidget(QWidget):
         self._proc.readyReadStandardOutput.connect(self._seg_output)
         self._proc.finished.connect(self._seg_finished)
         self._set_busy(True)
-        self.status.setText("Starting segmentation...")
+        self.status.setText(
+            f"Starting segmentation (batch size {batch}"
+            + ("; on a laptop GPU this may run out of memory, lower it under Parameters if it fails" if batch > 16 and use_gpu else "")
+            + ")..."
+        )
         self._proc.start(sys.executable, ["-u", "-c", code])
 
     def _seg_output(self) -> None:
@@ -584,6 +738,7 @@ class TissueKitWidget(QWidget):
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
         self._seg_base_masks = masks.copy()
+        self._seg_run = None  # a new run folder is made when it is saved (below)
         self._show_segmentation_layers(
             masks,
             f"Segmentation done. max label {int(np.max(masks))}. "
@@ -591,6 +746,262 @@ class TissueKitWidget(QWidget):
         )
         self._refresh_layers()
         self._autosave_segmentation()
+
+    # ---- cluster (bwUniCluster) segmentation ------------------------------
+    def _remote_settings(self, cfg=None) -> bool:
+        from .core.remote import RemoteConfig
+        from .remote_widget import RemoteSettingsDialog
+
+        cfg = cfg if cfg is not None else RemoteConfig.load()
+        return RemoteSettingsDialog(cfg, self).exec_() == QDialog.Accepted and bool(cfg.user)
+
+    def _remote_cfg(self):
+        from .core.remote import RemoteConfig
+
+        cfg = RemoteConfig.load()
+        if not cfg.user and not self._remote_settings(cfg):
+            self.status.setText("Cluster settings needed (at least your user name).")
+            return None
+        return cfg
+
+    def _remote_movie(self, layer) -> Path:
+        """A .tif to upload: the layer's own file, or its data written to a temp file."""
+        path = next((p for p in self._layer_paths(layer) if p), None)
+        if path and str(path).lower().endswith((".tif", ".tiff")):
+            return Path(path)
+        import tifffile
+
+        work = Path(tempfile.mkdtemp(prefix="tissuekit_remote_"))
+        self._remote_tmp = work
+        out = work / f"{movie_stem(path) if path else self._safe_stem(layer.name)}.tif"
+        tifffile.imwrite(out, _as_tyx(np.asarray(layer.data)))
+        return out
+
+    def _run_remote_segmentation(self) -> None:
+        from .core import remote
+        from .remote_widget import LoginDialog
+
+        if self._remote.busy:
+            self.status.setText("A cluster job is already running.")
+            return
+        layer = self._layer(self.seg_image.currentText())
+        if layer is None:
+            self.status.setText("Select an image layer.")
+            return
+        wf = self._working_folder(layer)
+        if wf is None:
+            self.status.setText("Choose a results folder first (Folder...).")
+            return
+        cfg = self._remote_cfg()
+        if cfg is None:
+            return
+        shape = _as_tyx_shape(layer.data.shape, getattr(layer, "rgb", False))
+        creds = LoginDialog(
+            cfg,
+            f"Segment '{layer.name}' ({shape[0]} frames, {shape[1]}x{shape[2]} px) on {cfg.partition}, "
+            f"time limit {cfg.time} (Settings... to change).",
+            self,
+        ).credentials()
+        if creds is None:
+            return
+        password, otp = creds
+        self.status.setText("[cluster] preparing the movie ...")
+        movie = self._remote_movie(layer)
+        results = Path(wf.root)
+        # Preset, Cellpose values and run folder from this tab (the cluster has no saved presets).
+        from dataclasses import replace
+
+        cfg = replace(cfg, preset=self.seg_params.preset_name().replace(" ", "_"),
+                      batch_size=int(self.seg_params.values()["batch_size"]))
+        run = wf.new_run_name(self.seg_params.run_base())
+        params = self.seg_params.values()
+
+        def work(progress, log):
+            return remote.run_segmentation(
+                cfg, password, otp, movie, results, progress, on_log=log, run=run, params=params
+            )
+
+        self._start_remote(work)
+
+    def _fetch_remote_segmentation(self, job=None) -> None:
+        from .core import remote
+        from .remote_widget import LoginDialog
+
+        if self._remote.busy:
+            self.status.setText("A cluster job is already running.")
+            return
+        if job is None:
+            jobs = remote.load_jobs()
+            if not jobs:
+                self.status.setText("No cluster jobs waiting to be fetched.")
+                return
+            job = jobs[0]
+            if len(jobs) > 1:
+                names = [
+                    f"{j.job_id}  {j.movie_name}  ({time.strftime('%d.%m. %H:%M', time.localtime(j.submitted))})"
+                    for j in jobs
+                ]
+                chosen, ok = QInputDialog.getItem(
+                    self, "Fetch cluster results", "Job:", names, len(names) - 1, False
+                )
+                if not ok:
+                    return
+                job = jobs[names.index(chosen)]
+        cfg = self._remote_cfg()
+        if cfg is None:
+            return
+        creds = LoginDialog(
+            cfg, f"Fetch job {job.job_id} ({job.movie_name}). If it is still running, "
+            "it is watched again and downloaded when it ends.", self,
+        ).credentials()
+        if creds is None:
+            return
+        password, otp = creds
+        self._remote_fetch_job = job
+
+        def work(progress, log):
+            return remote.fetch_job(cfg, job, progress, password, otp, on_log=log)
+
+        self._start_remote(work)
+
+    def _setup_remote(self) -> None:
+        from .core import remote
+        from .remote_widget import LoginDialog
+
+        if self._remote.busy:
+            self.status.setText("A cluster job is already running.")
+            return
+        cfg = self._remote_cfg()
+        if cfg is None:
+            return
+        creds = LoginDialog(
+            cfg, f"One-time setup: install the conda env '{cfg.conda_env}' on the cluster "
+            f"({cfg.setup_partition} job, about 10-20 min).", self,
+        ).credentials()
+        if creds is None:
+            return
+        password, otp = creds
+
+        def work(progress, log):
+            return remote.setup_cluster(cfg, password, otp, progress, on_log=log)
+
+        self._start_remote(work, on_done=self._remote_setup_done)
+
+    def _remote_setup_done(self, summary) -> None:
+        self._remote_finish()
+        self.status.setText(f"[cluster] Set up: {summary}. 'Run on cluster' is ready.")
+
+    def _start_remote(self, work, on_done=None) -> None:
+        for button in (self.seg_remote, self.seg_remote_fetch, self.seg_remote_setup):
+            button.setEnabled(False)
+        self._remote_event_key = ""
+        self._remote_event("---- started")
+        self.seg_remote_bar.setRange(0, 0)  # busy until the first measurable step
+        self.seg_remote_bar.setFormat("%p%")
+        self.seg_remote_bar.show()
+        self._remote.start(
+            work, self._remote_progress, on_done or self._remote_done, self._remote_failed,
+            on_log=self._remote_cluster_log,
+        )
+
+    def _remote_event(self, message: str) -> None:
+        """One timestamped line in the log window (kept while the window is closed)."""
+        line = f"{time.strftime('%H:%M:%S')}  {message}"
+        self._remote_events.append(line)
+        if self._remote_log_dialog is not None:
+            self._remote_log_dialog.add_event(line)
+
+    def _remote_cluster_log(self, text: str) -> None:
+        self._remote_cluster_text = text
+        if self._remote_log_dialog is not None:
+            self._remote_log_dialog.set_cluster_log(text)
+
+    def _show_remote_log(self) -> None:
+        from .remote_widget import RemoteLogDialog
+
+        if self._remote_log_dialog is None:
+            self._remote_log_dialog = RemoteLogDialog(self)
+            for line in self._remote_events:
+                self._remote_log_dialog.add_event(line)
+            if self._remote_cluster_text:
+                self._remote_log_dialog.set_cluster_log(self._remote_cluster_text)
+        self._remote_log_dialog.show()
+        self._remote_log_dialog.raise_()
+
+    def _remote_progress(self, percent: int, message: str) -> None:
+        import re
+
+        self.status.setText(f"[cluster] {percent}% {message}" if percent else f"[cluster] {message}")
+        if percent > 0:
+            self.seg_remote_bar.setRange(0, 100)
+            self.seg_remote_bar.setValue(percent)
+        else:
+            self.seg_remote_bar.setRange(0, 0)  # queued / loading: busy animation
+        # log each new kind of step once (not every MB of an upload or every minute in the queue)
+        key = re.sub(r"\d+", "#", message)
+        if key != self._remote_event_key:
+            self._remote_event_key = key
+            self._remote_event(message)
+
+    def _remote_finish(self) -> None:
+        for button in (self.seg_remote, self.seg_remote_fetch, self.seg_remote_setup):
+            button.setEnabled(True)
+        self.seg_remote_bar.hide()
+        if self._remote_tmp is not None:
+            shutil.rmtree(self._remote_tmp, ignore_errors=True)
+            self._remote_tmp = None
+
+    def _remote_failed(self, exc) -> None:
+        from .core.remote import RemoteError
+
+        self._remote_finish()
+        text = str(exc) if isinstance(exc, RemoteError) else f"{type(exc).__name__}: {exc}"
+        self._remote_event(f"FAILED: {text}")  # full report (job folder, log end) in the Log window
+        self.status.setText(f"[cluster] {text.splitlines()[0]} (details: Log...)")
+
+    def _remote_done(self, result) -> None:
+        self._remote_finish()
+        masks_path = Path(result[1] if isinstance(result, tuple) else result)
+        # .../<movie>_results/segmentation/<run>/<stem>_cp_masks.tif
+        results = next((p.parent for p in masks_path.parents if p.name == "segmentation"), masks_path.parent.parent)
+        here = self.project.root is not None and Path(self.project.root).resolve() == results.resolve()
+        run = masks_path.parent.name if masks_path.parent.parent.name == "segmentation" else "original"
+        self._refresh_seg_runs()
+        if not here or self._job_running():
+            self.status.setText(f"[cluster] Done. Saved run '{run}' in {results}; open it with Folder... / Load results.")
+            return
+        if self._seg_base_masks is not None:
+            answer = QMessageBox.question(
+                self, "Cluster segmentation ready",
+                f"{masks_path.name} is ready (saved in the results folder).\n"
+                "Replace the segmentation shown now with it?",
+            )
+            if answer != QMessageBox.Yes:
+                self.status.setText(f"[cluster] Done. Saved run '{run}' in {results} (pick it under Runs, then Show).")
+                return
+        import tifffile
+
+        from .core.project import SEG_MASK_SUFFIXES, _strip_suffix
+
+        masks = np.asarray(tifffile.imread(masks_path))
+        if masks.ndim == 2:
+            masks = masks[np.newaxis, ...]
+        self._seg_stem = (_strip_suffix(masks_path.name, SEG_MASK_SUFFIXES) or "segmentation").replace("/", "_")
+        self._replace_labels("Segmentation", masks)
+        self._seg_base_masks = masks.copy()
+        self._seg_run = run
+        self._seg_pending = None
+        self.project.set_active_seg_run(run)
+        self._refresh_seg_runs()
+        self._pending_outlines = None
+        self._autosave_outlines_ok = False  # the cluster already wrote the outlines; only Save rewrites them
+        self._show_segmentation_layers(
+            masks, f"[cluster] Segmentation run '{run}' done on the GPU (max label {int(masks.max())}). "
+            "Bonds are being prepared: wait for 100%, then edit / track.",
+        )
+        self._refresh_layers()
+        self._pick(self.seg_masks, "Segmentation")
+        self._pick(self.track_labels, "Segmentation")
 
     def _start_outline_editing(self) -> None:
         masks_ly = self._layer(self.seg_masks.currentText())
@@ -642,6 +1053,9 @@ class TissueKitWidget(QWidget):
         if img_ly is not None and not from_outlines:
             self._seg_stem = self._safe_stem(img_ly.name)
         self._seg_base_masks = masks.copy()
+        # Imported by hand: saved as a new run ("edited", "edited_2" ...), never into an existing one.
+        self._seg_run = None
+        self._seg_pending = None
         # The imported outlines are the starting bonds where they are the plugin's own 1 px bonds; other
         # frames get 1 px TA bonds rebuilt from the masks (the cells between the outlines when there are no masks).
         self._show_segmentation_layers(
@@ -1063,7 +1477,15 @@ class TissueKitWidget(QWidget):
         if wf is None:
             self.status.setText("Not saved: no results folder chosen (use Folder...).")
             return
-        outdir = wf.step_dir("segmentation")
+        new_run = self._seg_run is None
+        if new_run:
+            # A fresh segmentation (or outlines imported by hand) gets its own run folder;
+            # a run loaded from the folder is saved back into its own folder.
+            info = dict(self._seg_pending or {"preset": None, "where": "outlines imported in napari"})
+            self._seg_run = wf.new_run_name(info.pop("run_base", None) or "edited")
+            wf.write_run_params(self._seg_run, info)
+            self._seg_pending = None
+        outdir = wf.seg_run_dir(self._seg_run)
         masks_path = outdir / f"{stem}_cp_masks.tif"
         # Keep the raw movie's pixel size / frame interval in the saved files.
         cal = self._calibration(
@@ -1081,8 +1503,10 @@ class TissueKitWidget(QWidget):
         cell_outlines_path = outdir / f"{stem}_cell_outlines.tif"
         save_tiff(cell_outlines_path, (np.asarray(outline_only) > 0).astype(np.uint8) * 255, cal)
         self._seg_base_masks = masks.copy()
+        wf.set_active_seg_run(self._seg_run)
+        self._refresh_seg_runs()
         self.status.setText(
-            f"Saved {masks_path.name} and {cell_outlines_path.name} → {outdir}"
+            f"Saved run '{self._seg_run}': {masks_path.name} and {cell_outlines_path.name} → {outdir}"
         )
 
     # step -> [(layer name, file tag, dtype or None)] written by "Export TIFF"
@@ -1910,7 +2334,9 @@ class TissueKitWidget(QWidget):
 
         self._track_run = (
             wf,
-            {k: v for k, v in kwargs.items() if k not in ("calibration", "n_jobs")},
+            {**{k: v for k, v in kwargs.items() if k not in ("calibration", "n_jobs")},
+             # which segmentation run was tracked (None: a layer that is not the loaded Segmentation)
+             "segmentation_run": self._seg_run if self.track_labels.currentText() == "Segmentation" else None},
             movie_path,
         )
         self._start(work, self._tracking_done)
@@ -2138,6 +2564,7 @@ class TissueKitWidget(QWidget):
             else "Results: set automatically next to the movie"
         )
         self.folder_label.setToolTip(str(root) if root is not None else "")
+        self._refresh_seg_runs()
 
     def _choose_folder(self) -> None:
         chosen = self._ask_folder()
@@ -2161,10 +2588,13 @@ class TissueKitWidget(QWidget):
         if wf is None:
             self.status.setText(f"{self.status.text()} (not saved: no results folder chosen)")
             return
+        info = dict(self._seg_pending or {})
         self._save_segmentation()
+        info.pop("run_base", None)
         wf.write_settings(
             "segmentation",
-            {"model": "cpsam", "batch_size": int(self.seg_batch.value()), "gpu": self.seg_gpu.isChecked()},
+            {"model": "cpsam", "run": self._seg_run, **info,
+             "batch_size": int(self.seg_params.values()["batch_size"]), "gpu": self.seg_gpu.isChecked()},
             movie=next((p for p in self._layer_paths(self._layer(self.seg_image.currentText())) if p), None),
         )
 
@@ -2190,15 +2620,25 @@ class TissueKitWidget(QWidget):
         except Exception as exc:  # saving must never break the analysis
             self.status.setText(f"{self.status.text()} (T1 events not saved: {exc})")
 
-    def _load_saved_results(self) -> None:
+    def _load_saved_results(self, only_segmentation: bool = False) -> None:
+        """Load the movie, the active segmentation run and the tracking from the results folder.
+
+        ``only_segmentation``: just the active run (Runs > Show); movie and tracking stay as they are."""
         wf = self._working_folder(self._layer(self.seg_image.currentText()), ask=False)
         found = wf.found() if wf is not None else {}
+        if only_segmentation:
+            found = {k: v for k, v in found.items() if k in ("segmentation", "outlines")}
         if not found:
             self.status.setText("No saved results found in the results folder.")
             return
         import tifffile
 
         loaded = []
+        run = wf.active_seg_run()
+        if "segmentation" in found or "outlines" in found:
+            self._seg_run = run
+            self._seg_pending = None
+            loaded.append(f"run '{run}'")
         # e.g. results made on the HPC: no settings.json, so guess from the mask file names
         movie = self.project.movie_path() or self.project.guess_movie()
         movie_layer = None
@@ -2207,7 +2647,7 @@ class TissueKitWidget(QWidget):
                 path = getattr(getattr(ly, "source", None), "path", None)
                 if isinstance(ly, Image) and path and Path(path).resolve() == Path(movie).resolve():
                     movie_layer = ly
-        if movie and Path(movie).is_file() and movie_layer is None:
+        if movie and Path(movie).is_file() and movie_layer is None and not only_segmentation:
             before = {id(ly) for ly in self.viewer.layers}
             try:
                 self.viewer.open(str(movie), plugin="napari")
@@ -2273,8 +2713,126 @@ class TissueKitWidget(QWidget):
                 self._replace_image("Tracked RGB", tifffile.imread(rgb))
             loaded.append("tracking")
         self._refresh_layers()
+        self._refresh_seg_runs()
         self._select_loaded_layers(movie_layer)
-        self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}.{outline_note}")
+        self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}.{outline_note}{self._tracking_run_note(wf)}")
+
+    def _tracking_run_note(self, wf) -> str:
+        """Warning when the saved tracking was made from another segmentation run than the active one."""
+        tracked = ((wf.read_settings().get("tracking") or {}).get("params") or {}).get("segmentation_run")
+        active = wf.active_seg_run()
+        if tracked and active and tracked != active and self._layer("Tracked") is not None:
+            return f" Note: the tracking was made from run '{tracked}', not from the active run '{active}'."
+        return ""
+
+    # ---- segmentation runs -------------------------------------------------------
+    def _next_run_name(self, base: str) -> str:
+        """Next free run name in the results folder (for the Run name hint)."""
+        layer = self._layer(self.seg_image.currentText()) if hasattr(self, "seg_image") else None
+        root = self.project.resolve(self._layer_paths(layer))
+        if root is None:
+            from .core.seg_params import run_name
+
+            return run_name(base)
+        return self.project.new_run_name(base)
+
+    def _refresh_seg_runs(self) -> None:
+        """Fill the Runs box from the results folder (active run selected)."""
+        if not hasattr(self, "seg_runs"):
+            return
+        runs = self.project.seg_runs() if self.project.root is not None else []
+        active = self.project.active_seg_run() if runs else None
+        keep = self.seg_runs.currentData()
+        self.seg_runs.blockSignals(True)
+        try:
+            self.seg_runs.clear()
+            for run in runs:
+                info = self.project.read_run_params(run)
+                self.seg_runs.addItem(f"{run}  (active)" if run == active else run, run)
+                tip = run
+                if info:
+                    vals = ", ".join(f"{k} {v}" for k, v in (info.get("params") or {}).items())
+                    tip = f"{run}: preset {info.get('preset')}; {vals}; {info.get('time', '')}"
+                self.seg_runs.setItemData(self.seg_runs.count() - 1, tip, Qt.ToolTipRole)
+            pick = keep if keep in runs else active
+            if pick is not None:
+                self.seg_runs.setCurrentIndex(runs.index(pick))
+        finally:
+            self.seg_runs.blockSignals(False)
+        for w in (self.seg_run_show, self.seg_run_compare):
+            w.setEnabled(bool(runs))
+        self.seg_params.refresh_run_hint()
+
+    def _segmentation_edited(self) -> bool:
+        seg = self._layer("Segmentation")
+        base = self._seg_base_masks
+        if not isinstance(seg, Labels) or base is None:
+            return False
+        data = np.asarray(seg.data)
+        return data.shape != base.shape or not np.array_equal(data, base)
+
+    def _show_seg_run(self) -> None:
+        """Make the chosen run the active one and load it for editing / tracking."""
+        run = self.seg_runs.currentData()
+        if run is None or self.project.root is None:
+            self.status.setText("No segmentation runs in the results folder yet.")
+            return
+        if self._job_running():
+            self.status.setText("A job is already running.")
+            return
+        if run != self._seg_run and self._segmentation_edited():
+            answer = QMessageBox.question(
+                self, "Unsaved edits",
+                f"The segmentation shown (run '{self._seg_run or 'not saved'}') has unsaved edits.\n"
+                f"Discard them and show run '{run}'?",
+            )
+            if answer != QMessageBox.Yes:
+                return
+        self.project.set_active_seg_run(run)
+        self._load_saved_results(only_segmentation=True)
+
+    _COMPARE_COLORS = ("cyan", "magenta", "lime", "orange", "deepskyblue", "violet", "white")
+
+    def _compare_seg_run(self) -> None:
+        """Overlay a run's outlines as a read-only layer in its own colour."""
+        run = self.seg_runs.currentData()
+        if run is None or self.project.root is None:
+            self.status.setText("No segmentation runs in the results folder yet.")
+            return
+        import tifffile
+
+        found = self.project.found(run=run)
+        if "outlines" in found:
+            from .core.outline_io import rgb_or_labels_to_outline_labels
+
+            lines = rgb_or_labels_to_outline_labels(tifffile.imread(found["outlines"][0])) > 0
+        elif "segmentation" in found:
+            from .core.outline_io import masks_to_outline_labels
+
+            lines = masks_to_outline_labels(np.asarray(tifffile.imread(found["segmentation"][0]))) > 0
+        else:
+            self.status.setText(f"Run '{run}' has no masks or outlines.")
+            return
+        name = f"Seg · {run}"
+        if name in self.viewer.layers:
+            self.viewer.layers.remove(name)
+        used = {ly.metadata.get("compare_color") for ly in self.viewer.layers if ly.name.startswith("Seg · ")}
+        color = next((c for c in self._COMPARE_COLORS if c not in used), "white")
+        active = self.viewer.layers.selection.active
+        layer = self.viewer.add_labels(
+            lines.astype(np.uint8), name=name, opacity=1.0,
+            metadata={"compare_color": color, "segmentation_run": run},  # set before "inserted" fires
+        )
+        try:
+            from napari.utils.colormaps import DirectLabelColormap
+
+            layer.colormap = DirectLabelColormap(color_dict={0: "transparent", 1: color, None: "transparent"})
+        except Exception:
+            pass
+        layer.editable = False
+        if active is not None:  # keep painting on the layer that was selected (e.g. Outlines)
+            self.viewer.layers.selection.active = active
+        self.status.setText(f"Added run '{run}' as '{name}' ({color} outlines, read-only).")
 
     @staticmethod
     def _pick(box: QComboBox, name: str | None) -> None:

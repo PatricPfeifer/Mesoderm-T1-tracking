@@ -3,7 +3,7 @@
 Every step reads and writes the same results folder the napari widget uses, so a
 job run on the HPC can be opened with "Folder..." / "Load results" afterwards::
 
-    tissuekit segment movie.tif --preset cellflow     # -> movie_results/segmentation/
+    tissuekit segment movie.tif --preset cellflow     # -> movie_results/segmentation/cellflow/
     tissuekit track   movie.tif                       # -> movie_results/tracking/
     tissuekit t1      movie.tif                       # -> movie_results/t1/
 
@@ -45,7 +45,7 @@ def _movie(wf: WorkingFolder, movie: Path | None) -> Path | None:
 
 
 def _need(wf: WorkingFolder, step: str, hint: str) -> Path:
-    files = wf.found().get(step)
+    files = wf.found().get(step)  # segmentation: the active run
     if not files:
         raise SystemExit(f"no {step} result in {wf.root}. Run `{hint}` first.")
     if len(files) > 1:
@@ -59,17 +59,30 @@ def cmd_segment(args, extra) -> None:
     wf, movie = _folder(args.target, args.results)
     if movie is None:
         raise SystemExit("segment needs the movie file as TARGET")
-    out = wf.step_dir("segmentation")
+    params = segmentation.resolve_all(args.preset, args.params)  # fails early on a bad preset
+    batch = args.batch_size or params["batch_size"]  # --batch-size wins over the preset
+    # Each parameter set is its own run folder. Without --run a new name is picked (never
+    # overwrites); an explicit --run reuses that folder, so a timed-out cluster job resumes.
+    if args.run:
+        from .core.seg_params import run_name
+
+        run = run_name(args.run)
+    else:
+        run = wf.new_run_name(args.preset)
+    out = wf.seg_run_dir(run)
+    print(f"segmentation run: {run} -> {out}", flush=True)
     argv = ["--input", str(movie), "--output-dir", str(out), "--preset", args.preset,
-            "--batch-size", str(args.batch_size)]
+            "--batch-size", str(batch)]
+    if args.params:
+        argv += ["--params", args.params]
     if args.force_cpu:
         argv.append("--force-cpu")
     segmentation.main(argv + extra)
-    wf.write_settings(
-        "segmentation",
-        {"preset": args.preset, "batch_size": args.batch_size, "gpu": not args.force_cpu},
-        movie=str(movie),
-    )
+    run_info = {"preset": args.preset, "params": {**params, "batch_size": batch},
+                "batch_size": batch, "gpu": not args.force_cpu}
+    wf.write_run_params(run, run_info)
+    wf.set_active_seg_run(run)
+    wf.write_settings("segmentation", {"run": run, **run_info}, movie=str(movie))
 
 
 def cmd_track(args, extra) -> None:
@@ -82,7 +95,8 @@ def cmd_track(args, extra) -> None:
     if movie is not None:
         argv += ["--intensity", str(movie)]
     tracking.main(argv + extra)
-    wf.write_settings("tracking", {"extra_args": extra}, movie=str(movie) if movie else None)
+    wf.write_settings("tracking", {"extra_args": extra, "segmentation_run": wf.active_seg_run(),
+                                   "masks": str(masks)}, movie=str(movie) if movie else None)
 
 
 def cmd_t1(args, extra) -> None:
@@ -110,8 +124,14 @@ def build_parser() -> argparse.ArgumentParser:
         return sp
 
     seg = add("segment", cmd_segment, "Cellpose segmentation of a movie")
-    seg.add_argument("--preset", choices=("default", "cellflow"), default="default")
-    seg.add_argument("--batch-size", type=int, default=8)
+    seg.add_argument("--preset", default="default",
+                     help="default, cellflow or a preset saved in the plugin")
+    seg.add_argument("--params", default=None,
+                     help="JSON of Cellpose settings over the preset, e.g. {\"cellprob_threshold\": 0.5}")
+    seg.add_argument("--run", default=None,
+                     help="run folder name; an existing one is reused (default: the preset name, _2, _3 ... if taken)")
+    seg.add_argument("--batch-size", type=int, default=None,
+                     help="256x256 px tiles per GPU pass (default: the preset's, else 8)")
     seg.add_argument("--force-cpu", action="store_true")
     add("track", cmd_track, "track the saved segmentation")
     add("t1", cmd_t1, "detect T1 events on the saved tracking")

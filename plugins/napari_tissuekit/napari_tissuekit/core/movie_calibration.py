@@ -20,6 +20,9 @@ import tifffile
 
 _SEARCH_DIRS = ("input", "input files")
 
+# Files save_tiff writes losslessly compressed (zlib/Deflate; readable by tifffile and Fiji).
+COMPRESSED_SUFFIXES = ("_cp_masks.tif", "_cell_outlines.tif")
+
 _UM_UNITS = {"micron", "microns", "um", "µm", "μm", "micrometer", "micrometre"}
 _TIME_TO_S = {
     "": 1.0, "s": 1.0, "sec": 1.0, "second": 1.0, "seconds": 1.0,
@@ -192,9 +195,15 @@ def save_tiff(path: Path | str, data: np.ndarray, cal: Calibration | None = None
     (e.g. uint32 track labels, which ImageJ files cannot hold) are saved as
     plain TIFFs with resolution tags in µm and ``finterval`` in a JSON
     description. Without a calibration this is a plain ``imwrite``.
+
+    Segmentation outputs (``*_cp_masks.tif``, ``*_cell_outlines.tif``) are written
+    with lossless zlib (Deflate) compression, ~50x smaller; pass
+    ``compression=None`` to override.
     """
     path = Path(path)
     arr = np.asarray(data)
+    if "compression" not in kwargs and path.name.lower().endswith(COMPRESSED_SUFFIXES):
+        kwargs["compression"] = "zlib"
     if cal is None or cal.is_empty:
         tifffile.imwrite(path, arr, **kwargs)
         return
