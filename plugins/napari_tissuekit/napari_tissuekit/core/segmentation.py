@@ -21,6 +21,7 @@ from cellpose import models
 from tifffile import imread, imwrite
 
 from .cell_size import MIN_CELL_AREA
+from .holes import fill_enclosed_holes
 from .outline_io import hand_stack_to_outline
 from .ta_bond_edit import thin_hand_stack
 
@@ -62,6 +63,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Disable GPU even if available.",
     )
     p.add_argument(
+        "--no-fill-holes",
+        dest="fill_holes",
+        action="store_false",
+        help="Do not give empty space enclosed by cells (not touching the image edge) a new cell id (default: it does).",
+    )
+    p.add_argument(
         "--preset",
         choices=sorted(PRESETS),
         default="default",
@@ -89,8 +96,12 @@ def segment_stack(
     masks: np.ndarray | None = None,
     on_frame: Callable[[int, np.ndarray], None] | None = None,
     eval_kwargs: dict | None = None,
+    fill_holes: bool = True,
 ) -> np.ndarray:
-    """Segment each frame with Cellpose cpsam. Shared by the CLI and napari plugin."""
+    """Segment each frame with Cellpose cpsam. Shared by the CLI and napari plugin.
+
+    ``fill_holes`` (on by default): every empty region enclosed by cells (touching no image edge) becomes a cell of its own,
+    see :func:`napari_tissuekit.core.holes.fill_enclosed_holes`."""
     img = as_stack(img)
     eval_kwargs = {"min_size": MIN_CELL_AREA, **(eval_kwargs or {})}  # Cellpose drops regions below min_size px
     n_frames, ly, lx = img.shape
@@ -104,6 +115,10 @@ def segment_stack(
         print(f"frame {t + 1}/{n_frames}", flush=True)
         m = model.eval(img[t], batch_size=batch_size, **eval_kwargs)[0]
         masks[t] = np.asarray(m, dtype=np.uint16)
+        if fill_holes:
+            masks[t], n_new = fill_enclosed_holes(masks[t])
+            if n_new:
+                print(f"  filled {n_new} enclosed holes as new cells", flush=True)
         if on_frame is not None:
             on_frame(t, masks)
         print(f"  labels={int(masks[t].max())}", flush=True)
@@ -167,6 +182,7 @@ def main(argv=None) -> None:
         masks=masks,
         on_frame=_checkpoint,
         eval_kwargs=PRESETS[args.preset],
+        fill_holes=args.fill_holes,
     )
     save_tiff(out, masks, cal)
     print("wrote", out, "max_label", int(masks.max()), flush=True)

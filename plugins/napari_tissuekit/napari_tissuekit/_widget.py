@@ -116,10 +116,10 @@ HELP_HTML = """
 
 <h3>Segmentation tab</h3>
 <ul>
-<li><b>Image</b>: the movie. <b>Run segmentation</b> finds the cells (Cellpose). <i>Batch size</i>: frames at once. <i>Use GPU</i>: only if one is available.</li>
+<li><b>Image</b>: the movie. <b>Run segmentation</b> finds the cells (Cellpose). <i>Batch size</i>: frames at once. <i>Use GPU</i>: only if one is available. <i>Fill enclosed holes as new cells</i>: empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does).</li>
 <li><b>Masks / Outlines</b>: the cell layer and the outline layer to edit (set automatically after loading).</li>
 <li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run segmentation or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
-<li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one.</li>
+<li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one. With Paint, the <b>right mouse button</b> erases.</li>
 <li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
 <li><b>Save segmentation (Ctrl+S)</b>: write the masks and the 1 px outlines (<code>*_cp_masks.tif</code>, <code>*_cell_outlines.tif</code>).</li>
 <li><b>Export TIFF</b>: same as Save.</li>
@@ -143,7 +143,7 @@ HELP_HTML = """
 <h3>T1 tab</h3>
 <ul>
 <li><b>Labels</b>: the Tracked layer. <b>RGB</b>: the Tracked RGB image used for the overlay.</li>
-<li><b>Run T1</b>: detect T1 transitions. Needs the pixel size and frame interval stored in the movie.</li>
+<li><b>Run T1</b>: detect T1 transitions. Needs the pixel size and frame interval. They are read from the movie or from the results files (also ones made on a server); the line under <i>RGB</i> shows what was found. If a value is missing, type it in the boxes.</li>
 <li><b>T1 filter</b>: show all counted events, only clean ones, flicker resolved, or flicker aborted.</li>
 <li><b>Overlay pre / post</b>: frames shown before and after each event. <b>Expand</b>: how far cells are grown to find contacts.</li>
 <li><b>Exclude dividing cells</b>: leave out mothers and daughters (needs tracking with Divisions).</li>
@@ -151,9 +151,9 @@ HELP_HTML = """
 </ul>
 
 <h3>Export Cell Props tab</h3>
-<p>Measure cell properties on the Tracked layer. Set the pixel size and frame interval, click cells (<i>Select cells</i>) or use <b>Select all cells</b>,
+<p>Measure cell properties on the Tracked layer. The pixel size and frame interval are filled in from the movie (change them if needed). Click cells (<i>Select cells</i>) or use <b>Select all cells</b>,
 tick the features you want and use <b>Color</b> to colour the cells by a feature. <b>Feature guide</b> explains each feature.
-<b>Export CSV...</b> writes the table. <b>Save selection...</b> / <b>Load selection...</b> keep your chosen cells for later.</p>
+<b>Export CSV...</b> writes the table. <b>Add junction</b>: click it, then click two neighbouring cells; the length of the junction between them is measured in every frame in which they touch (listed under <i>Junction length over time</i>, exported as CSV + plot with <b>Export junction lengths...</b>). <b>Save selection...</b> / <b>Load selection...</b> keep your chosen cells for later.</p>
 """
 
 TRACK_TIPS = {
@@ -216,6 +216,7 @@ class TissueKitWidget(QWidget):
         self._seg_base_outlines: np.ndarray | None = None
         self._autosave_outlines_ok = True  # False while editing outlines loaded from a file: never rewrite the file before the user saves
         self._pending_outlines: np.ndarray | None = None  # imported outlines shown after the bonds are built; their differences apply on Enter
+        self._session_cal = None  # pixel size / frame interval of the movie in use (from any file read or run)
         self._seg_cal = None  # calibration read from a loaded outlines file (pixel size / frame interval)
         # True while the plugin itself pushes masks into the correction widget, so
         # only the user's cell edits are mirrored onto the Outlines layer.
@@ -301,6 +302,7 @@ class TissueKitWidget(QWidget):
         self._fill(self.track_intensity, ["(none)", *images], keep=True)
         self._fill(self.t1_labels, labels, keep=True)
         self._fill(self.t1_rgb, ["(none)", *images], keep=True)
+        self._show_calibration()
 
     @staticmethod
     def _fill(box: QComboBox, names: list[str], *, keep: bool) -> None:
@@ -375,9 +377,16 @@ class TissueKitWidget(QWidget):
         self.seg_batch.setValue(8)
         self.seg_gpu = QCheckBox("Use GPU")
         self.seg_gpu.setChecked(False)
+        self.seg_fill_holes = QCheckBox("Fill enclosed holes as new cells")
+        self.seg_fill_holes.setToolTip(
+            "Empty space that is closed in by cells becomes a cell of its own. Space that reaches the image edge "
+            "(the outside of the embryo) is never filled."
+        )
+        self.seg_fill_holes.setChecked(True)
         form.addRow("Image", self.seg_image)
         form.addRow("Batch size", self.seg_batch)
         form.addRow("", self.seg_gpu)
+        form.addRow("", self.seg_fill_holes)
         layout.addLayout(form)
         self.seg_run = QPushButton("Run segmentation")
         self.seg_run.clicked.connect(self._run_segmentation)
@@ -386,7 +395,7 @@ class TissueKitWidget(QWidget):
         outline_box = QGroupBox("Outline correction (Tissue Analyzer style)")
         outline_inner = QVBoxLayout()
         outline_help = QLabel(
-            "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines. "
+            "Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines (right mouse button erases while Paint is on). "
             "Enter = Apply (local watershed, like TA). "
             "M = toggle Outlines. Ctrl+S / Save writes the masks (*_cp_masks.tif) and the 1 px outlines (*_cell_outlines.tif). Deleting a cell below also redraws the outlines."
         )
@@ -470,9 +479,11 @@ class TissueKitWidget(QWidget):
             return
         self._seg_stem = self._safe_stem(layer.name)
         self._autosave_outlines_ok = True
+        self._remember_calibration(layer)
         image = _as_tyx(np.asarray(layer.data))
         batch = int(self.seg_batch.value())
         use_gpu = self.seg_gpu.isChecked()
+        fill_holes = self.seg_fill_holes.isChecked()
         work = Path(tempfile.mkdtemp(prefix="tissuekit_seg_"))
         image_path = work / "image.npy"
         out_path = work / "masks.npy"
@@ -487,6 +498,7 @@ class TissueKitWidget(QWidget):
             "    img,\n"
             f"    batch_size={batch},\n"
             f"    use_gpu={use_gpu},\n"
+            f"    fill_holes={fill_holes},\n"
             ")\n"
             f"np.save({str(out_path)!r}, masks)\n"
             "print('SEGMENT_DONE', int(masks.max()), flush=True)\n"
@@ -747,9 +759,26 @@ class TissueKitWidget(QWidget):
         ol.mode = mode
         self.status.setText(f"Outlines: {mode.replace('_', '/')} tool active. Enter applies the edit.")
 
+    @staticmethod
+    def _right_click_erase(layer, event):
+        """Right mouse button erases while the Paint tool is active (like Tissue Analyzer); the tool buttons stay."""
+        if getattr(event, "button", 1) not in (2, "right") or getattr(layer, "mode", "") != "paint":
+            return
+        from napari.layers.labels._labels_constants import Mode
+
+        layer._mode = Mode.ERASE  # napari's brush reads this when the stroke starts; the tool buttons do not change
+        try:
+            yield
+            while event.type == "mouse_move":
+                yield
+        finally:
+            layer._mode = Mode.PAINT
+
     def _style_outlines_layer(self, ol) -> None:
         """Yellow 1 px outlines, brush ready for painting."""
         if isinstance(ol, Labels):
+            if self._right_click_erase not in ol.mouse_drag_callbacks:
+                ol.mouse_drag_callbacks.insert(0, self._right_click_erase)  # before napari's own brush
             ol.opacity = 1.0
             ol.visible = True
             try:
@@ -1083,14 +1112,49 @@ class TissueKitWidget(QWidget):
         try:
             from .core.movie_calibration import calibration_for
 
+            from .core.movie_calibration import merge_calibrations
+
             paths = []
             for ly in layers:
                 path = getattr(getattr(ly, "source", None), "path", None)
                 if path:
                     paths.append(path)
-            return calibration_for(*paths, stem=stem)
+            cal = calibration_for(*paths, stem=stem)
+            # Layers made inside the plugin (Tracked, Segmentation, ...) have no source file: what the movie,
+            # a loaded results folder or the last run gave is used for whatever is still missing.
+            return merge_calibrations(cal, self._session_cal)
         except Exception:
             return None
+
+    def _remember_calibration(self, *sources) -> None:
+        """Remember the pixel size / frame interval found in these layers or files (the newest source wins)."""
+        try:
+            from .core.movie_calibration import calibration_for, merge_calibrations
+
+            paths = []
+            for src in sources:
+                path = getattr(getattr(src, "source", None), "path", None) if not isinstance(src, (str, Path)) else src
+                if path:
+                    paths.append(path)
+            found = calibration_for(*paths) if paths else None
+            if found is not None:
+                self._session_cal = merge_calibrations(found, self._session_cal)
+        except Exception:
+            pass
+        self._show_calibration()
+
+    def _show_calibration(self) -> None:
+        """Show what was found in the T1 tab and fill the Cell props boxes."""
+        cal = self._calibration(self._layer(self.t1_labels.currentText()) if hasattr(self, "t1_labels") else None)
+        um = getattr(cal, "um_per_px", None)
+        dt = getattr(cal, "s_per_frame", None)
+        if hasattr(self, "t1_cal_label"):
+            parts = [f"{um:.4g} \u00b5m/px" if um else "pixel size not found",
+                     f"{dt:.4g} s/frame" if dt else "frame interval not found"]
+            note = "" if (um and dt) else " - type the missing value(s) below"
+            self.t1_cal_label.setText("Movie calibration: " + ", ".join(parts) + note)
+        if hasattr(self, "cell_props"):
+            self.cell_props.autofill_calibration(um, dt)
 
     @staticmethod
     def _safe_stem(name: str) -> str:
@@ -1161,7 +1225,7 @@ class TissueKitWidget(QWidget):
         self.track_edit = QCheckBox("Edit tracks")
         self.track_edit.toggled.connect(self._track_edit_toggled)
         inner.addWidget(self.track_edit)
-        modes = QGridLayout()
+        modes = QVBoxLayout()  # one way to correct per line
         self.track_modes = QButtonGroup(self)
         self.track_modes.setExclusive(True)
         for i, (key, label) in enumerate(
@@ -1177,7 +1241,7 @@ class TissueKitWidget(QWidget):
             button.toggled.connect(self._on_track_mode_toggled)
             # `clicked` fires only for the user, not for setChecked() at start-up
             button.clicked.connect(self._enable_track_editing)
-            modes.addWidget(button, i // 2, i % 2)
+            modes.addWidget(button)
         inner.addLayout(modes)
         self.track_help = QLabel("")
         self.track_help.setWordWrap(True)
@@ -1805,6 +1869,7 @@ class TissueKitWidget(QWidget):
             (p for p in self._layer_paths(intensity_layer, labels) if p), None
         )
         stem = movie_stem(movie_path) if movie_path else labels.name
+        self._remember_calibration(intensity_layer, labels)
         cal = self._calibration(intensity_layer, labels)
         wf = None
         out_dir = Path(out_text) if out_text else None
@@ -1900,8 +1965,24 @@ class TissueKitWidget(QWidget):
         self.t1_filter.currentIndexChanged.connect(self._apply_t1_filter)
         self.t1_pre = self._spin(0, 40, 3)
         self.t1_post = self._spin(0, 40, 3)
+        self.t1_um = QDoubleSpinBox()
+        self.t1_um.setDecimals(4)
+        self.t1_um.setRange(0.0, 1000.0)
+        self.t1_um.setSpecialValueText("from the movie")
+        self.t1_um.setToolTip("Pixel size in micrometre. Only needed when the movie's own value was not found.")
+        self.t1_dt = QDoubleSpinBox()
+        self.t1_dt.setDecimals(3)
+        self.t1_dt.setRange(0.0, 1e6)
+        self.t1_dt.setSpecialValueText("from the movie")
+        self.t1_dt.setToolTip("Time between frames in seconds. Only needed when the movie's own value was not found.")
+        self.t1_cal_label = QLabel("")
+        self.t1_cal_label.setWordWrap(True)
+        self.t1_cal_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         form.addRow("Labels", self.t1_labels)
         form.addRow("RGB", self.t1_rgb)
+        form.addRow(self.t1_cal_label)
+        form.addRow("Pixel size (\u00b5m)", self.t1_um)
+        form.addRow("Frame interval (s)", self.t1_dt)
         form.addRow("Expand", self.t1_expand)
         form.addRow("T1 filter", self.t1_filter)
         form.addRow("Overlay pre", self.t1_pre)
@@ -1937,12 +2018,13 @@ class TissueKitWidget(QWidget):
         if isinstance(rgb_layer, Image):
             rgb = _as_rgb(np.asarray(rgb_layer.data)).copy()
         cal = self._calibration(labels, rgb_layer)
-        um = getattr(cal, "um_per_px", None)
-        dt = getattr(cal, "s_per_frame", None)
+        um = float(self.t1_um.value()) or getattr(cal, "um_per_px", None)  # typed value wins over the movie's
+        dt = float(self.t1_dt.value()) or getattr(cal, "s_per_frame", None)
         if not um or not dt:
+            missing = " and ".join(n for n, v in (("pixel size", um), ("frame interval", dt)) if not v)
             self.status.setText(
-                "The T1 definition needs the pixel size and the frame interval of the movie (not found). "
-                "Save the movie with its calibration."
+                f"The T1 definition needs the {missing} of the movie. It was not found in the movie or in the "
+                "results files: type it in the boxes above Run T1."
             )
             return
         exclude = set(self._division_ids) if (
@@ -2077,7 +2159,8 @@ class TissueKitWidget(QWidget):
         self._save_segmentation()
         wf.write_settings(
             "segmentation",
-            {"model": "cpsam", "batch_size": int(self.seg_batch.value()), "gpu": self.seg_gpu.isChecked()},
+            {"model": "cpsam", "batch_size": int(self.seg_batch.value()), "gpu": self.seg_gpu.isChecked(),
+             "fill_holes": self.seg_fill_holes.isChecked()},
             movie=next((p for p in self._layer_paths(self._layer(self.seg_image.currentText())) if p), None),
         )
 
@@ -2129,6 +2212,9 @@ class TissueKitWidget(QWidget):
                 self.viewer.add_image(tifffile.imread(movie), name=movie_stem(movie))
             movie_layer = next((ly for ly in self.viewer.layers if id(ly) not in before and isinstance(ly, Image)), None)
             loaded.append("movie")
+        # Pixel size / frame interval: from the movie, else from the result files (also those made on a server)
+        self._session_cal = None
+        self._remember_calibration(*([movie] if movie else []), *(f for files in found.values() for f in files[:1]))
         if "segmentation" in found:
             masks = tifffile.imread(found["segmentation"][0])
             self._replace_labels("Segmentation", masks)

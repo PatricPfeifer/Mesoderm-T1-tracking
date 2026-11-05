@@ -32,11 +32,13 @@ from qtpy.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 from skimage.measure import regionprops
+from skimage.segmentation import expand_labels
 
 STATE_VERSION = 1
 HELP_DIR = Path(__file__).parent / "feature_help"
@@ -161,6 +163,38 @@ def compute_properties(
     return pd.DataFrame(rows).sort_values(["track_id", "frame"]).reset_index(drop=True)
 
 
+JUNCTION_EXPAND = 3  # px: cells are grown by this much before their contact is counted (the T1 tab's Expand)
+
+
+def junction_lengths(stack: np.ndarray, a: int, b: int, expand: int = JUNCTION_EXPAND) -> pd.DataFrame:
+    """Length of the junction between tracks ``a`` and ``b`` in every frame in which they touch.
+
+    The same measure as the T1 tab: both cells (with their neighbours) are grown by ``expand`` px to close the
+    gaps between segmented cells, then the 4-connected contact pixels between the two are counted. Frames in which
+    they do not touch (or one is missing) have no row. Columns: frame, contact_px.
+    """
+    stack = as_tyx(stack)
+    a, b = int(a), int(b)
+    pad = int(expand) + 2
+    rows = []
+    for t in range(stack.shape[0]):
+        frame = stack[t]
+        mask = (frame == a) | (frame == b)
+        if not (np.any(frame == a) and np.any(frame == b)):
+            continue
+        ys, xs = np.nonzero(mask)
+        y0, y1 = max(0, ys.min() - pad), min(frame.shape[0], ys.max() + 1 + pad)
+        x0, x1 = max(0, xs.min() - pad), min(frame.shape[1], xs.max() + 1 + pad)
+        crop = frame[y0:y1, x0:x1]
+        grown = expand_labels(crop, distance=expand) if expand > 0 else crop
+        ga, gb = grown == a, grown == b
+        n = int(np.count_nonzero(ga[:, :-1] & gb[:, 1:]) + np.count_nonzero(gb[:, :-1] & ga[:, 1:])
+                + np.count_nonzero(ga[:-1] & gb[1:]) + np.count_nonzero(gb[:-1] & ga[1:]))
+        if n > 0:
+            rows.append({"frame": t, "contact_px": n})
+    return pd.DataFrame(rows, columns=["frame", "contact_px"])
+
+
 def feature_cards() -> list[Path]:
     """Help card per feature, in FEATURES order (missing ones are skipped)."""
     out = []
@@ -233,6 +267,9 @@ class CellPropertiesWidget(QWidget):
         self.color_feature: str | None = None
         self._hover_id = 0
         self._dimmed: tuple[Labels, float] | None = None
+        self._junctions: list[tuple[int, int]] = []  # pairs of track IDs whose junction length is followed
+        self._picking: list[int] | None = None  # None = not adding a junction; else the cell(s) clicked so far
+        self._auto_cal = (0.0, 0.0)  # what was last filled in automatically (pixel size, frame interval)
 
         self.labels_combo = QComboBox()
         self.pixel_size = QDoubleSpinBox()
@@ -317,6 +354,38 @@ class CellPropertiesWidget(QWidget):
         llay.addWidget(self.zero_cb)
         self.legend_box.setLayout(llay)
 
+        jbox = QGroupBox("Junction length over time")
+        jlay = QVBoxLayout()
+        self.junction_add = QPushButton("Add junction")
+        self.junction_add.setCheckable(True)
+        self.junction_add.setToolTip(
+            "Click, then click two neighbouring cells. The junction between them is measured in every frame in "
+            "which they touch."
+        )
+        self.junction_add.toggled.connect(self._junction_add_toggled)
+        self.junction_expand = QSpinBox()
+        self.junction_expand.setRange(0, 20)
+        self.junction_expand.setValue(JUNCTION_EXPAND)
+        self.junction_expand.setToolTip("Cells are grown by this many pixels before their contact is counted (as the T1 tab's Expand).")
+        jform = QFormLayout()
+        jform.addRow("Expand (px)", self.junction_expand)
+        self.junction_list = QListWidget()
+        self.junction_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.junction_list.setMinimumHeight(70)
+        self.junction_list.itemDoubleClicked.connect(self._jump_to_junction)
+        junction_remove = QPushButton("Remove highlighted")
+        junction_remove.clicked.connect(self._remove_junctions)
+        junction_export = QPushButton("Export junction lengths...")
+        junction_export.setToolTip("Writes a CSV (one row per junction and frame) and a PNG plot of length over time.")
+        junction_export.clicked.connect(self._export_junctions)
+        jlay.addWidget(self.junction_add)
+        jlay.addLayout(jform)
+        jlay.addWidget(QLabel("Junctions (double-click: jump to the first frame they touch)"))
+        jlay.addWidget(self.junction_list)
+        jlay.addWidget(junction_remove)
+        jlay.addWidget(junction_export)
+        jbox.setLayout(jlay)
+
         export = QPushButton("Export CSV...")
         export.clicked.connect(self._export_csv)
         save = QPushButton("Save selection...")
@@ -340,6 +409,7 @@ class CellPropertiesWidget(QWidget):
         lay.addLayout(row)
         lay.addWidget(fbox)
         lay.addWidget(self.legend_box)
+        lay.addWidget(jbox)
         lay.addWidget(export)
         lay.addLayout(srow)
         lay.addWidget(self.status)
@@ -350,10 +420,21 @@ class CellPropertiesWidget(QWidget):
         self.viewer.layers.events.inserted.connect(self._refresh_layers)
         self.viewer.layers.events.removed.connect(self._refresh_layers)
         self.labels_combo.currentTextChanged.connect(lambda *_: self._rebuild())
+        self.labels_combo.currentTextChanged.connect(lambda *_: self._junctions_changed())
         self.viewer.dims.events.current_step.connect(self._on_frame_change)
         self.viewer.mouse_move_callbacks.append(self._on_move)
         self.viewer.mouse_drag_callbacks.append(self._on_click)
         self._refresh_layers()
+
+    def autofill_calibration(self, um_per_px, s_per_frame) -> None:
+        """Fill the pixel size / frame interval boxes from the movie. A value typed by hand is left alone;
+        a value that was filled in automatically before is replaced when another movie is loaded."""
+        old_um, old_dt = self._auto_cal
+        for box, value, old in ((self.pixel_size, um_per_px, old_um), (self.interval, s_per_frame, old_dt)):
+            if value and (box.value() == 0.0 or abs(box.value() - old) < 1e-9):
+                box.setValue(float(value))
+        self._auto_cal = (float(um_per_px or 0.0) if self.pixel_size.value() else 0.0,
+                          float(s_per_frame or 0.0) if self.interval.value() else 0.0)
 
     # ---- layers -----------------------------------------------------
     def _labels_layer(self) -> Labels | None:
@@ -400,7 +481,7 @@ class CellPropertiesWidget(QWidget):
         return int(val) if val is not None else 0
 
     def _on_move(self, viewer, event) -> None:
-        if not self.select_cb.isChecked():
+        if not (self.select_cb.isChecked() or self._picking is not None):
             return
         v = self._value_at(event)
         if v == 0:
@@ -465,7 +546,7 @@ class CellPropertiesWidget(QWidget):
             self._dimmed = None
 
     def _on_click(self, viewer, event):
-        if not self.select_cb.isChecked() or "Shift" in event.modifiers:
+        if not (self.select_cb.isChecked() or self._picking is not None) or "Shift" in event.modifiers:
             return
         moved = False
         yield
@@ -476,6 +557,9 @@ class CellPropertiesWidget(QWidget):
             return
         v = self._value_at(event)
         if v == 0:
+            return
+        if self._picking is not None:
+            self._junction_clicked(v)
             return
         if v in self._selected:
             self._selected.remove(v)
@@ -495,6 +579,138 @@ class CellPropertiesWidget(QWidget):
             self._hover_id = 0
             self._clear_hover()
             self.status.setText("Select mode off.")
+
+    # ---- junctions --------------------------------------------------
+    def _junction_add_toggled(self, on: bool) -> None:
+        if on:
+            layer = self._labels_layer()
+            if layer is None:
+                self.junction_add.blockSignals(True)
+                self.junction_add.setChecked(False)
+                self.junction_add.blockSignals(False)
+                self.status.setText("Select a tracked labels layer first.")
+                return
+            self._picking = []
+            self.viewer.layers.selection.active = layer
+            self.junction_add.setText("Click the first cell...")
+            self.status.setText("Click the first of the two cells.")
+        else:
+            self._picking = None
+            self.junction_add.setText("Add junction")
+            self.hover.setText("Hover: -")
+            self._hover_id = 0
+            if not self.select_cb.isChecked():
+                self._clear_hover()
+
+    def _junction_clicked(self, track_id: int) -> None:
+        if not self._picking:
+            self._picking = [int(track_id)]
+            self.junction_add.setText("Click the second cell...")
+            self.status.setText(f"Cell {track_id} picked. Click the cell it shares a junction with.")
+            return
+        first = self._picking[0]
+        if int(track_id) == first:
+            self.status.setText("That is the same cell: click a different one.")
+            return
+        pair = (min(first, int(track_id)), max(first, int(track_id)))
+        self.junction_add.setChecked(False)  # also resets the picking state
+        if pair in self._junctions:
+            self.status.setText(f"Junction {pair[0]}-{pair[1]} is already in the list.")
+            return
+        self._junctions.append(pair)
+        self._junctions_changed()
+        df = self._junction_table(pair)
+        if df.empty:
+            self.status.setText(
+                f"Added {pair[0]}-{pair[1]}, but these cells never touch (try a larger Expand if they should)."
+            )
+        else:
+            self.status.setText(
+                f"Added junction {pair[0]}-{pair[1]}: touching in {len(df)} frames ({int(df.frame.min())}-{int(df.frame.max())})."
+            )
+
+    def _junction_table(self, pair) -> pd.DataFrame:
+        stack = self._stack()
+        if stack is None:
+            return pd.DataFrame(columns=["frame", "contact_px"])
+        return junction_lengths(stack, pair[0], pair[1], int(self.junction_expand.value()))
+
+    def _junctions_changed(self) -> None:
+        self.junction_list.clear()
+        for pair in self._junctions:
+            df = self._junction_table(pair)
+            if df.empty:
+                text = f"Junction {pair[0]} - {pair[1]}: never touching"
+            else:
+                f0, f1 = int(df.frame.min()), int(df.frame.max())
+                text = f"Junction {pair[0]} - {pair[1]}: frames {f0}-{f1} ({len(df)} touching)"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, pair)
+            self.junction_list.addItem(item)
+        self._autosave()
+
+    def _jump_to_junction(self, item) -> None:
+        df = self._junction_table(item.data(Qt.UserRole))
+        if not df.empty:
+            self.viewer.dims.set_point(0, int(df.frame.min()))
+
+    def _remove_junctions(self) -> None:
+        for item in self.junction_list.selectedItems():
+            pair = tuple(item.data(Qt.UserRole))
+            if pair in self._junctions:
+                self._junctions.remove(pair)
+        self._junctions_changed()
+
+    def junction_long_table(self) -> pd.DataFrame:
+        """One row per junction and frame in which the two cells touch."""
+        um = self.pixel_size.value()
+        dt = self.interval.value()
+        parts = []
+        for a, b in self._junctions:
+            df = self._junction_table((a, b))
+            if df.empty:
+                continue
+            df.insert(0, "cell_b", b)
+            df.insert(0, "cell_a", a)
+            if dt > 0:
+                df.insert(3, "time_s", df["frame"] * dt)
+            df["length_um" if um > 0 else "length_px"] = df["contact_px"] * (um if um > 0 else 1.0)
+            parts.append(df)
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    def _export_junctions(self) -> None:
+        df = self.junction_long_table()
+        if df.empty:
+            self.status.setText("Add at least one junction whose cells touch.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export junction lengths", str(self._default_dir() / "junction_lengths.csv"), "CSV (*.csv)"
+        )
+        if not path:
+            return
+        df.to_csv(path, index=False)
+        png = Path(path).with_suffix(".png")
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            xcol = "time_s" if "time_s" in df else "frame"
+            ycol = "length_um" if "length_um" in df else "length_px"
+            fig, ax = plt.subplots(figsize=(7, 4))
+            for (a, b), grp in df.groupby(["cell_a", "cell_b"]):
+                ax.plot(grp[xcol], grp[ycol], marker="o", ms=3, label=f"{a} - {b}")
+            ax.set_xlabel("time (s)" if xcol == "time_s" else "frame")
+            ax.set_ylabel("junction length (um)" if ycol == "length_um" else "junction length (px)")
+            ax.legend(title="cells", fontsize=8)
+            fig.tight_layout()
+            fig.savefig(png, dpi=150)
+            plt.close(fig)
+            tail = f" and plot {png.name}"
+        except Exception as exc:  # the CSV is what matters
+            tail = f" (plot not written: {exc})"
+        self.status.setText(f"Wrote {len(df)} rows for {len(self._junctions)} junction(s) to {path}{tail}")
 
     # ---- selection --------------------------------------------------
     def _changed(self) -> None:
@@ -694,6 +910,8 @@ class CellPropertiesWidget(QWidget):
             "features": self._features(),
             "pixel_size_um": self.pixel_size.value(),
             "frame_interval_s": self.interval.value(),
+            "junctions": [list(p) for p in self._junctions],
+            "junction_expand": int(self.junction_expand.value()),
             "labels_fingerprint": fingerprint(stack) if stack is not None else None,
         }
 
@@ -717,7 +935,10 @@ class CellPropertiesWidget(QWidget):
                 " Warning: the tracked labels differ from when this selection was saved "
                 "(track IDs may have changed); check each track."
             )
+        self._junctions = [tuple(sorted(int(i) for i in p)) for p in state.get("junctions", [])]
+        self.junction_expand.setValue(int(state.get("junction_expand", JUNCTION_EXPAND)))
         self._rebuild()
+        self._junctions_changed()
         return msg
 
     def _autosave(self, *_a) -> None:
