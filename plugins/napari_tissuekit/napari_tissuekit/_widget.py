@@ -133,7 +133,7 @@ HELP_HTML = """
 
 <h3>Segmentation tab</h3>
 <ul>
-<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). <i>Use GPU</i> (also under Parameters, not saved in presets): this computer's GPU, only if one is available. <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
+<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). <i>Use GPU</i> (also under Parameters, not saved in presets): this computer's GPU, on by default (falls back to the CPU when there is none). <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
 <li><b>Masks / Outlines</b>: the cell layer and the outline layer to edit (set automatically after loading).</li>
 <li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run locally / Run on cluster or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one. With Paint, the <b>right mouse button</b> erases.</li>
@@ -468,10 +468,10 @@ class TissueKitWidget(QWidget):
         self.seg_image = QComboBox()
         self.seg_gpu = QCheckBox("Use GPU")
         self.seg_gpu.setToolTip(
-            "Use this computer's GPU for 'Run locally' (only if one is available). Not saved in presets; "
-            "cluster runs always use the cluster's GPU."
+            "Use this computer's GPU for 'Run locally' (on by default; Cellpose falls back to the CPU when "
+            "there is no GPU). Not saved in presets; cluster runs always use the cluster's GPU."
         )
-        self.seg_gpu.setChecked(False)
+        self.seg_gpu.setChecked(True)
         self.seg_fill_holes = QCheckBox("Fill enclosed holes as new cells")
         self.seg_fill_holes.setToolTip(
             "Empty space that is closed in by cells becomes a cell of its own. Space that reaches the image edge "
