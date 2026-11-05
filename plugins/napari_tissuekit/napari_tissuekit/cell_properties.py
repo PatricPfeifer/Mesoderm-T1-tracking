@@ -282,8 +282,9 @@ class CellPropertiesWidget(QWidget):
 
         self.feature_boxes: dict[str, QCheckBox] = {}
         self.color_buttons: dict[str, QToolButton] = {}
-        fbox = QGroupBox("Features  (tick = export, Color = paint cells)")
+        fbox = QGroupBox("2 · Features")
         flay = QVBoxLayout()
+        flay.addWidget(QLabel("Tick = export, Color = paint cells"))
         for key, (label, default) in FEATURES.items():
             cb = QCheckBox(label)
             cb.setChecked(default)
@@ -350,17 +351,27 @@ class CellPropertiesWidget(QWidget):
         self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
+        select_box = QGroupBox("1 · Select cells")
+        sel_lay = QVBoxLayout()
+        sel_lay.addLayout(form)
+        sel_lay.addWidget(self.select_cb)
+        sel_lay.addWidget(self.hover)
+        sel_lay.addWidget(QLabel("Selected tracks (double-click: jump to first frame)"))
+        sel_lay.addWidget(self.list)
+        sel_lay.addLayout(row)
+        select_box.setLayout(sel_lay)
+
+        export_box = QGroupBox("3 · Export")
+        exp_lay = QVBoxLayout()
+        exp_lay.addWidget(export)
+        exp_lay.addLayout(srow)
+        export_box.setLayout(exp_lay)
+
         lay = QVBoxLayout()
-        lay.addLayout(form)
-        lay.addWidget(self.select_cb)
-        lay.addWidget(self.hover)
-        lay.addWidget(QLabel("Selected tracks (double-click: jump to first frame)"))
-        lay.addWidget(self.list)
-        lay.addLayout(row)
+        lay.addWidget(select_box)
         lay.addWidget(fbox)
         lay.addWidget(self.legend_box)
-        lay.addWidget(export)
-        lay.addLayout(srow)
+        lay.addWidget(export_box)
         lay.addWidget(self.status)
         lay.addStretch(1)
         self.setLayout(lay)
