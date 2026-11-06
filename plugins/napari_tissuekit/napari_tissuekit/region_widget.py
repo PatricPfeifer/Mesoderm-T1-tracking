@@ -25,6 +25,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from .core.project import LEGACY_RUN
 from .core.region import (
     REGION_FILE, TRACKING_REQUIRED, Anchor, Geometry, Pick, Region, cell_position, has_tracking, keep_stack,
     parents_from_lineage, positions_from_stack, region_hash,
@@ -44,6 +45,9 @@ class AnalysisRegionWidget(QWidget):
         self.tracked_provider = lambda: None  # -> Labels layer with the tracked stack
         self.dir_provider = lambda: None  # -> results folder (Path) or None
         self.project_provider = lambda: None  # -> WorkingFolder (for settings.json) or None
+        self.run_provider = lambda: None  # -> name of the segmentation run the shown tracking belongs to
+        self.tracking_dir_provider = lambda: None  # -> folder of the shown tracking (lineage.csv lives there)
+        self._region_run = None  # run the lines/areas on screen were picked on (track IDs differ between runs)
         self.on_changed = None  # called after the region changed (stale-results reminder)
         self.lines: list[list[Pick]] = []
         self.anchors: list[Anchor] = []
@@ -320,13 +324,13 @@ class AnalysisRegionWidget(QWidget):
             self._rebuild()
 
     def _parents(self) -> dict:
-        root = self.dir_provider()
-        if root is None:
+        folder = self.tracking_dir_provider()
+        if folder is None:
             return {}
         try:
             import pandas as pd
 
-            found = sorted((Path(root) / "tracking").glob("*_lineage.csv"))
+            found = sorted(Path(folder).glob("*_lineage.csv"))
             return parents_from_lineage(pd.read_csv(found[0])) if found else {}
         except Exception:
             return {}
@@ -503,8 +507,33 @@ class AnalysisRegionWidget(QWidget):
 
     # ---- save / load -------------------------------------------------------------------------------------------
     def _folder(self):
+        """analysis_region/<segmentation run>/: track IDs belong to one run's tracking, so the region does too."""
         root = self.dir_provider()
-        return None if root is None else Path(root) / "analysis_region"
+        return None if root is None else Path(root) / "analysis_region" / (self.run_provider() or LEGACY_RUN)
+
+    def tracking_changed(self) -> None:
+        """Call after tracking was run or loaded. Lines and areas picked on another run's track IDs are dropped (they
+        would point at different cells); a region saved for this run is loaded again."""
+        run = self.run_provider()
+        if run != self._region_run:
+            self._reset_state()
+            self._region_run = run
+        self.refresh_gate()
+        folder = self._folder()
+        if self._tracking_ok and not self.lines and folder is not None and (folder / REGION_FILE).is_file():
+            self.load()
+        self._notify()
+
+    def _reset_state(self) -> None:
+        self.lines, self.anchors, self.active_line = [], [], None
+        self._set_mode(None)
+        self.geom = None
+        self._pos_cache = None
+        for name in (LINES_LAYER, CELLS_LAYER, AREA_LAYER):
+            layer = self._layer(name)
+            if layer is not None:
+                self.viewer.layers.remove(layer)
+        self._refresh_lists()
 
     def save(self) -> None:
         geom = self.geometry()
@@ -555,14 +584,7 @@ class AnalysisRegionWidget(QWidget):
         self.status.setText(f"Loaded {path.name}: {len(self.lines)} line(s), {len(self.anchors)} area click(s).")
 
     def clear(self) -> None:
-        self.lines, self.anchors, self.active_line = [], [], None
-        self._set_mode(None)
-        self.geom = None
-        for name in (LINES_LAYER, CELLS_LAYER, AREA_LAYER):
-            layer = self._layer(name)
-            if layer is not None:
-                self.viewer.layers.remove(layer)
-        self._refresh_lists()
+        self._reset_state()
         folder = self._folder()
         saved = folder is not None and (folder / REGION_FILE).is_file()
         self.status.setText("Region cleared." + (" The saved file is kept until you press Save region." if saved else ""))

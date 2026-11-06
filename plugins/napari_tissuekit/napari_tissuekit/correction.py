@@ -343,6 +343,9 @@ class CellCorrectionWidget(QWidget):
         # Outlines layer from the plugin and made the edit tools work on the wrong layer.
         if layer.name.split(" [")[0] in self.OWN_LAYERS:
             return
+        # "Seg · <run>": read-only overlays of other segmentation runs, never the masks being edited.
+        if layer.name.startswith("Seg · ") or layer.metadata.get("segmentation_run"):
+            return
         if isinstance(layer, napari.layers.Labels):
             try:
                 self._updating = True

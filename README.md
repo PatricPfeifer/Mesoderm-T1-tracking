@@ -73,7 +73,7 @@ Walkthrough of the steps below (load, segment, track, select cells, colour by fe
 https://github.com/user-attachments/assets/eeccd6eb-240b-4ec5-82f8-67aea8ade14d
 
 1. **Open the movie** (File > Open File(s)...), then **Plugins > TissueKit**.
-2. **Segmentation** tab: *Image* = `movie_cut`, press **Run segmentation**.
+2. **Segmentation** tab: *Image* = `movie_cut`, press **Run locally** (or **Run on cluster**).
    The status line at the bottom shows progress. When done, the layers `Segmentation` and
    `Outlines` appear. Leave the other settings as they are.
 3. **Tracking** tab: *Labels* = `Segmentation`, *Intensity* = `movie_cut`
@@ -90,12 +90,17 @@ Everything lands in `<movie>_results/`:
 
 ```
 movie_cut_results/
-  segmentation/   masks, outlines and 1 px cell outlines (.tif)
-  tracking/       tracked labels, tracked RGB, tracks / links / events (.csv), qc.json
-  t1/             t1_events.csv
-  cell_props/     exported measurements and cell selections
-  settings.json   parameters of each step
+  segmentation/<run>/  masks, outlines and 1 px cell outlines (.tif), params.json
+  tracking/<run>/      tracked labels, tracked RGB, tracks / links / events (.csv), qc.json
+  t1/<run>/            t1_events.csv
+  cell_props/          exported measurements and cell selections
+  settings.json        parameters of each step, active run
 ```
+
+Every segmentation run (one per parameter set, e.g. `cellflow`, `Custom1`) keeps its own tracking
+and T1, so tracking one run never overwrites the tracking of another. Choosing a run under *Runs*
+and pressing **Show** loads that run with its tracking. Older results folders with one flat
+`tracking/` folder still load.
 
 ### Skip the computing: load ready-made results
 
@@ -109,12 +114,32 @@ The folder `tests/data/` already holds finished results for the test movie.
 **Load results** works the same way for any `<movie>_results` folder, also one copied back from
 the HPC.
 
+### Many eggs at once: the Batch tab
+
+Put the egg movies (`.tif`) in one folder. In the **Batch** tab, press **Folder...** and pick it.
+Rows are eggs, columns are the checked profiles (the segmentation presets you saved in the
+Segmentation tab). A cell shows ✓ and the run name when that egg already has a run with the
+profile's Cellpose values; ★ marks the egg's active run.
+
+1. **Finding the profile:** tick one or two eggs and several profiles, **Run on cluster**, then
+   double-click a ✓ cell to open the egg with that run and switch runs under *Runs* to compare.
+2. **Production:** tick only the chosen profile, press **Missing** (ticks every egg that lacks it),
+   **Run on cluster**.
+
+All items run one after another in **one** GPU job (one login, one queue wait). Each item is
+downloaded into `<egg>_results/segmentation/<profile>/` as soon as it is finished; a failed item
+does not stop the others. **Preview...** shows the items and the Slurm script without sending
+anything. The job's time limit is *Time limit per item* (Cluster settings) times the number of
+items; the `dev_*` queues allow 30 min at most, so use `gpu_h100` for longer batches. If the
+connection drops, the job keeps running: **Cluster settings > Fetch cluster results** downloads
+the rest later.
+
 ## 4. Command line (laptop or HPC)
 
 ```bash
 tissuekit segment movie.tif [--preset cellflow] [--force-cpu]   # -> movie_results/segmentation/
-tissuekit track   movie.tif                                     # -> movie_results/tracking/
-tissuekit t1      movie.tif                                     # -> movie_results/t1/
+tissuekit track   movie.tif                                     # -> movie_results/tracking/<active run>/
+tissuekit t1      movie.tif                                     # -> movie_results/t1/<active run>/
 ```
 
 On the HPC, `t1` needs a Slurm job (or `ALLOW_LOGIN_NODE=1`). Copy `<movie>_results/` back

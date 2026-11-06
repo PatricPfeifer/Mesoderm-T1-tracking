@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # The napari widget. Not needed for `tissuekit` on a headless HPC node.
-gui = ["napari[pyqt5]>=0.4.18", "qtpy"]
+gui = ["napari[pyqt5]>=0.4.18", "qtpy", "paramiko>=3"]  # paramiko: "Run on cluster GPU"
 
 [project.scripts]
 tissuekit = "napari_tissuekit.cli:main"

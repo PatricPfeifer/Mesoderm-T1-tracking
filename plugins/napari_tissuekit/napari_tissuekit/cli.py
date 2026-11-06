@@ -3,9 +3,9 @@
 Every step reads and writes the same results folder the napari widget uses, so a
 job run on the HPC can be opened with "Folder..." / "Load results" afterwards::
 
-    tissuekit segment movie.tif --preset cellflow     # -> movie_results/segmentation/
-    tissuekit track   movie.tif                       # -> movie_results/tracking/
-    tissuekit t1      movie.tif                       # -> movie_results/t1/
+    tissuekit segment movie.tif --preset cellflow     # -> movie_results/segmentation/cellflow/
+    tissuekit track   movie.tif                       # -> movie_results/tracking/<run>/ (active run)
+    tissuekit t1      movie.tif                       # -> movie_results/t1/<run>/
 
 ``TARGET`` is the movie (results folder = ``<movie_dir>/<movie_stem>_results``) or an
 existing results folder. Options this wrapper does not know are passed on to the step
@@ -45,7 +45,7 @@ def _movie(wf: WorkingFolder, movie: Path | None) -> Path | None:
 
 
 def _need(wf: WorkingFolder, step: str, hint: str) -> Path:
-    files = wf.found().get(step)
+    files = wf.found().get(step)  # segmentation: the active run
     if not files:
         raise SystemExit(f"no {step} result in {wf.root}. Run `{hint}` first.")
     if len(files) > 1:
@@ -59,20 +59,32 @@ def cmd_segment(args, extra) -> None:
     wf, movie = _folder(args.target, args.results)
     if movie is None:
         raise SystemExit("segment needs the movie file as TARGET")
-    out = wf.step_dir("segmentation")
+    params = segmentation.resolve_all(args.preset, args.params)  # fails early on a bad preset
+    batch = args.batch_size or params["batch_size"]  # --batch-size wins over the preset
+    # Each parameter set is its own run folder. Without --run a new name is picked (never
+    # overwrites); an explicit --run reuses that folder, so a timed-out cluster job resumes.
+    if args.run:
+        from .core.seg_params import run_name
+
+        run = run_name(args.run)
+    else:
+        run = wf.new_run_name(args.preset)
+    out = wf.seg_run_dir(run)
+    print(f"segmentation run: {run} -> {out}", flush=True)
     argv = ["--input", str(movie), "--output-dir", str(out), "--preset", args.preset,
-            "--batch-size", str(args.batch_size)]
+            "--batch-size", str(batch)]
+    if args.params:
+        argv += ["--params", args.params]
     if args.force_cpu:
         argv.append("--force-cpu")
     if not args.fill_holes:
         argv.append("--no-fill-holes")
     segmentation.main(argv + extra)
-    wf.write_settings(
-        "segmentation",
-        {"preset": args.preset, "batch_size": args.batch_size, "gpu": not args.force_cpu,
-         "fill_holes": args.fill_holes},
-        movie=str(movie),
-    )
+    run_info = {"preset": args.preset, "params": {**params, "batch_size": batch},
+                "batch_size": batch, "gpu": not args.force_cpu, "fill_holes": args.fill_holes}
+    wf.write_run_params(run, run_info)
+    wf.set_active_seg_run(run)
+    wf.write_settings("segmentation", {"run": run, **run_info}, movie=str(movie))
 
 
 def cmd_track(args, extra) -> None:
@@ -81,11 +93,15 @@ def cmd_track(args, extra) -> None:
     wf, movie = _folder(args.target, args.results)
     masks = _need(wf, "segmentation", f"tissuekit segment {args.target}")
     movie = _movie(wf, movie)
-    argv = ["--masks", str(masks), "--output-dir", str(wf.step_dir("tracking"))]
+    run = wf.active_seg_run()  # each segmentation run keeps its own tracking: tracking/<run>/
+    out = wf.run_step_dir("tracking", run)
+    print(f"tracking of run {out.name} -> {out}", flush=True)
+    argv = ["--masks", str(masks), "--output-dir", str(out)]
     if movie is not None:
         argv += ["--intensity", str(movie)]
     tracking.main(argv + extra)
-    wf.write_settings("tracking", {"extra_args": extra}, movie=str(movie) if movie else None)
+    wf.write_step_params("tracking", out.name, {"extra_args": extra, "masks": str(masks)},
+                         movie=str(movie) if movie else None)
 
 
 def cmd_t1(args, extra) -> None:
@@ -93,12 +109,13 @@ def cmd_t1(args, extra) -> None:
 
     wf, _ = _folder(args.target, args.results)
     labels = _need(wf, "tracking", f"tissuekit track {args.target}")
-    argv = ["--labels", str(labels), "--output-dir", str(wf.step_dir("t1"))]
+    out = wf.run_step_dir("t1")  # T1 of the active run's tracking: t1/<run>/
+    argv = ["--labels", str(labels), "--output-dir", str(out)]
     rgb = labels.with_name(labels.name.replace("_tracked_labels", "_tracked_rgb"))
     if rgb.is_file():
         argv += ["--rgb", str(rgb)]
     run_tm_t1.main(argv + extra)
-    wf.write_settings("t1", {"extra_args": extra})
+    wf.write_step_params("t1", out.name, {"extra_args": extra, "labels": str(labels)})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -113,8 +130,14 @@ def build_parser() -> argparse.ArgumentParser:
         return sp
 
     seg = add("segment", cmd_segment, "Cellpose segmentation of a movie")
-    seg.add_argument("--preset", choices=("default", "cellflow"), default="default")
-    seg.add_argument("--batch-size", type=int, default=8)
+    seg.add_argument("--preset", default="default",
+                     help="default, cellflow or a preset saved in the plugin")
+    seg.add_argument("--params", default=None,
+                     help="JSON of Cellpose settings over the preset, e.g. {\"cellprob_threshold\": 0.5}")
+    seg.add_argument("--run", default=None,
+                     help="run folder name; an existing one is reused (default: the preset name, _2, _3 ... if taken)")
+    seg.add_argument("--batch-size", type=int, default=None,
+                     help="256x256 px tiles per GPU pass (default: the preset's, else 8)")
     seg.add_argument("--force-cpu", action="store_true")
     seg.add_argument("--no-fill-holes", dest="fill_holes", action="store_false",
                      help="leave empty space enclosed by cells empty (default: it becomes a new cell)")
