@@ -5,8 +5,10 @@ Layout (next to the input movie by default)::
     <movie_dir>/<movie_stem>_results/
         segmentation/   one folder per run (parameter set): <run>/ masks + outlines + params.json;
                         files directly in segmentation/ (older layout, cluster/HPC) are the run "original"
-        tracking/       tracked labels, RGB, tracks/links/events CSVs, qc.json
-        t1/             T1 events
+        tracking/<run>/ tracking of one segmentation run: tracked labels, RGB, tracks/links/events
+                        CSVs, qc.json, params.json. Files directly in tracking/ (older layout: one
+                        tracking per egg) belong to the run named in settings.json, if any.
+        t1/<run>/       T1 events of that run's tracking (files directly in t1/: older layout)
         cell_props/     exports and selections from "Export Cell Props"
         settings.json   parameters and time of the last run of every step, active segmentation run
 
@@ -40,6 +42,8 @@ LEGACY_FOLDER_GLOBS = {
     "segmentation": ("*_cp_seg", "*_cf_seg"),
     "tracking": ("*_cp_track", "*_cf_track"),
 }
+# Steps that are kept per segmentation run: <step>/<run>/ (files directly in <step>/ = older layout).
+PER_RUN_STEPS = ("tracking", "t1")
 # Segmentation runs: files directly in the segmentation folder(s) form this run.
 LEGACY_RUN = "original"
 RUN_PARAMS = "params.json"
@@ -132,6 +136,41 @@ class WorkingFolder:
         if create:
             d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def run_step_dir(self, step: str, run: str | None = None, create: bool = True) -> Path:
+        """``tracking/<run>/`` or ``t1/<run>/``: every segmentation run keeps its own (``run``: else the active run)."""
+        assert self.root is not None, "no working folder set"
+        assert step in PER_RUN_STEPS, step
+        d = self.root / step / (run or self.active_seg_run() or LEGACY_RUN)
+        if create:
+            d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def write_step_params(self, step: str, run: str | None, params: dict, movie: str | None = None) -> Path:
+        """``params.json`` of a per-run step (and the movie in settings.json)."""
+        d = self.run_step_dir(step, run)
+        data = {"segmentation_run": d.name, "time": datetime.now().isoformat(timespec="seconds"), "params": params}
+        (d / RUN_PARAMS).write_text(json.dumps(data, indent=2, default=str) + "\n", encoding="utf-8")
+        if movie:
+            settings = self.read_settings()
+            settings["movie"] = self._relative_movie(movie)
+            self.settings_path.write_text(json.dumps(settings, indent=2, default=str) + "\n", encoding="utf-8")
+        return d / RUN_PARAMS
+
+    def legacy_tracking_run(self) -> str | None:
+        """The run an older, flat ``tracking/`` folder was made from (settings.json), if recorded."""
+        return ((self.read_settings().get("tracking") or {}).get("params") or {}).get("segmentation_run")
+
+    def _per_run_dirs(self, step: str, run: str | None) -> list[Path]:
+        """Where ``step`` of ``run`` is: its own folder if it holds files, else an older flat folder
+        when that one belongs to ``run`` (or to no recorded run)."""
+        own = self.root / step / run if run else None
+        if own is not None and own.is_dir() and any(f.is_file() for f in own.iterdir()):
+            return [own]
+        owner = self.legacy_tracking_run()
+        if owner is None or owner == run:
+            return _step_dirs(self.root, step)
+        return []
 
     # ---- settings.json -----------------------------------------------------
     @property
@@ -271,20 +310,21 @@ class WorkingFolder:
     def found(self, run: str | None = None) -> dict[str, list[Path]]:
         """Result files already in the folder, per step (empty lists omitted).
 
-        Segmentation masks and outlines come from one run: ``run``, else the active run.
+        Segmentation masks and outlines, tracking and T1 come from one run: ``run``, else the active run.
         """
         out: dict[str, list[Path]] = {}
         if self.root is None or not self.root.is_dir():
             return out
+        run = run or self.active_seg_run()
         seg_dirs = self._run_dirs(run)
         masks = sorted({f for d in seg_dirs for s in SEG_MASK_SUFFIXES for f in d.glob(f"*{s}")})
         if masks:
             out["segmentation"] = masks
-        tracks = sorted({f for d in _step_dirs(self.root, "tracking") for s in TRACK_LABEL_SUFFIXES
+        tracks = sorted({f for d in self._per_run_dirs("tracking", run) for s in TRACK_LABEL_SUFFIXES
                          for f in d.glob(f"*{s}")})
         if tracks:
             out["tracking"] = tracks
-        t1 = sorted({f for d in _step_dirs(self.root, "t1") for f in d.glob(T1_PATTERN)})
+        t1 = sorted({f for d in self._per_run_dirs("t1", run) for f in d.glob(T1_PATTERN)})
         if t1:
             out["t1"] = t1
         outlines = sorted(

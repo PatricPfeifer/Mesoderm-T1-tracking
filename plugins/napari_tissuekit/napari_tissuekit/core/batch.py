@@ -88,12 +88,20 @@ class EggStatus:
     def name(self) -> str:
         return movie_stem(self.movie)
 
-    def run_for(self, profile_values: dict) -> RunInfo | None:
-        """The run made with these Cellpose values (the active one if several, else the newest)."""
+    def run_for(self, profile_values: dict, profile: str | None = None) -> RunInfo | None:
+        """The run made with these Cellpose values.
+
+        Two profiles with the same values match the same runs, so among the hits prefer the run
+        named after ``profile`` (or made from that preset), then the active run, then the newest.
+        """
         want = quality_values(profile_values)
         hits = [r for r in self.runs if r.values == want]
         if not hits:
             return None
+        if profile:
+            own = [r for r in hits if r.name == profile] or [r for r in hits if r.preset == profile]
+            if own:
+                hits = own
         active = next((r for r in hits if r.name == self.active_run), None)
         return active or max(hits, key=lambda r: r.time)
 
@@ -160,7 +168,7 @@ def plan_items(eggs: list[EggStatus], profiles: dict[str, dict], *, rerun: bool 
         wf.set_manual(egg.results)
         taken: set[str] = set()
         for profile, values in profiles.items():
-            done = egg.run_for(values)
+            done = egg.run_for(values, profile)
             if done is not None and not rerun:
                 skipped.append((egg.name, profile, done.name))
                 continue

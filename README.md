@@ -90,12 +90,17 @@ Everything lands in `<movie>_results/`:
 
 ```
 movie_cut_results/
-  segmentation/   masks, outlines and 1 px cell outlines (.tif)
-  tracking/       tracked labels, tracked RGB, tracks / links / events (.csv), qc.json
-  t1/             t1_events.csv
-  cell_props/     exported measurements and cell selections
-  settings.json   parameters of each step
+  segmentation/<run>/  masks, outlines and 1 px cell outlines (.tif), params.json
+  tracking/<run>/      tracked labels, tracked RGB, tracks / links / events (.csv), qc.json
+  t1/<run>/            t1_events.csv
+  cell_props/          exported measurements and cell selections
+  settings.json        parameters of each step, active run
 ```
+
+Every segmentation run (one per parameter set, e.g. `cellflow`, `Custom1`) keeps its own tracking
+and T1, so tracking one run never overwrites the tracking of another. Choosing a run under *Runs*
+and pressing **Show** loads that run with its tracking. Older results folders with one flat
+`tracking/` folder still load.
 
 ### Skip the computing: load ready-made results
 
@@ -133,8 +138,8 @@ the rest later.
 
 ```bash
 tissuekit segment movie.tif [--preset cellflow] [--force-cpu]   # -> movie_results/segmentation/
-tissuekit track   movie.tif                                     # -> movie_results/tracking/
-tissuekit t1      movie.tif                                     # -> movie_results/t1/
+tissuekit track   movie.tif                                     # -> movie_results/tracking/<active run>/
+tissuekit t1      movie.tif                                     # -> movie_results/t1/<active run>/
 ```
 
 On the HPC, `t1` needs a Slurm job (or `ALLOW_LOGIN_NODE=1`). Copy `<movie>_results/` back

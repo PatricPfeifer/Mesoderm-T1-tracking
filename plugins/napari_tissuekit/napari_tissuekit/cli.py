@@ -4,8 +4,8 @@ Every step reads and writes the same results folder the napari widget uses, so a
 job run on the HPC can be opened with "Folder..." / "Load results" afterwards::
 
     tissuekit segment movie.tif --preset cellflow     # -> movie_results/segmentation/cellflow/
-    tissuekit track   movie.tif                       # -> movie_results/tracking/
-    tissuekit t1      movie.tif                       # -> movie_results/t1/
+    tissuekit track   movie.tif                       # -> movie_results/tracking/<run>/ (active run)
+    tissuekit t1      movie.tif                       # -> movie_results/t1/<run>/
 
 ``TARGET`` is the movie (results folder = ``<movie_dir>/<movie_stem>_results``) or an
 existing results folder. Options this wrapper does not know are passed on to the step
@@ -93,12 +93,15 @@ def cmd_track(args, extra) -> None:
     wf, movie = _folder(args.target, args.results)
     masks = _need(wf, "segmentation", f"tissuekit segment {args.target}")
     movie = _movie(wf, movie)
-    argv = ["--masks", str(masks), "--output-dir", str(wf.step_dir("tracking"))]
+    run = wf.active_seg_run()  # each segmentation run keeps its own tracking: tracking/<run>/
+    out = wf.run_step_dir("tracking", run)
+    print(f"tracking of run {out.name} -> {out}", flush=True)
+    argv = ["--masks", str(masks), "--output-dir", str(out)]
     if movie is not None:
         argv += ["--intensity", str(movie)]
     tracking.main(argv + extra)
-    wf.write_settings("tracking", {"extra_args": extra, "segmentation_run": wf.active_seg_run(),
-                                   "masks": str(masks)}, movie=str(movie) if movie else None)
+    wf.write_step_params("tracking", out.name, {"extra_args": extra, "masks": str(masks)},
+                         movie=str(movie) if movie else None)
 
 
 def cmd_t1(args, extra) -> None:
@@ -106,12 +109,13 @@ def cmd_t1(args, extra) -> None:
 
     wf, _ = _folder(args.target, args.results)
     labels = _need(wf, "tracking", f"tissuekit track {args.target}")
-    argv = ["--labels", str(labels), "--output-dir", str(wf.step_dir("t1"))]
+    out = wf.run_step_dir("t1")  # T1 of the active run's tracking: t1/<run>/
+    argv = ["--labels", str(labels), "--output-dir", str(out)]
     rgb = labels.with_name(labels.name.replace("_tracked_labels", "_tracked_rgb"))
     if rgb.is_file():
         argv += ["--rgb", str(rgb)]
     run_tm_t1.main(argv + extra)
-    wf.write_settings("t1", {"extra_args": extra})
+    wf.write_step_params("t1", out.name, {"extra_args": extra, "labels": str(labels)})
 
 
 def build_parser() -> argparse.ArgumentParser:
