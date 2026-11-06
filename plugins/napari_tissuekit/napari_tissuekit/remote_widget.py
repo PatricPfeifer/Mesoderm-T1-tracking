@@ -27,7 +27,8 @@ _FIELDS = (
     ("partition", "Partition", "Slurm GPU queue: dev_gpu_h100 (starts fast, max 30 min) or gpu_h100 (up to 72 h)"),
     ("gres", "GPUs (--gres)", "e.g. gpu:1"),
     ("mem", "Memory", "e.g. 32G"),
-    ("time", "Time limit", "hh:mm:ss per job (one movie). 5 min is plenty for normal movies; dev queue max 00:30:00"),
+    ("time", "Time limit per item", "hh:mm:ss for one movie with one profile. 5 min is plenty for normal movies. "
+     "A batch job gets this times its number of items; dev queues allow 00:30:00 at most (use gpu_h100 for longer batches)"),
     ("setup_partition", "Setup partition", "CPU partition for the one-time env install, e.g. cpu, dev_cpu"),
     ("setup_time", "Setup time limit", "hh:mm:ss for the one-time env install"),
 )

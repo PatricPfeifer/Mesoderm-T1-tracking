@@ -25,6 +25,7 @@ from qtpy.QtWidgets import (
     QHeaderView,
     QLabel,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QTableWidget,
@@ -78,6 +79,7 @@ class BatchPanel(QWidget):
         fill_holes: Callable[[], bool],
         open_egg: Callable[[core_batch.EggStatus, str | None], None],
         run_items: Callable[[list[core_batch.BatchItem], list], None],
+        preview_items: Callable[[list[core_batch.BatchItem], list], None] | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -85,6 +87,7 @@ class BatchPanel(QWidget):
         self._fill_holes = fill_holes
         self._open_egg = open_egg
         self._run_items = run_items
+        self._preview_items = preview_items
         state = _load_state()
         self.folder: Path | None = Path(state["folder"]) if state.get("folder") else None
         self._checked_profiles: set[str] = set(state.get("profiles") or ["default"])
@@ -92,8 +95,9 @@ class BatchPanel(QWidget):
         self._egg_checked: set[str] = set()
         self._profile_boxes: dict[str, QCheckBox] = {}
         self._profiles: dict[str, dict] = {}
-        self.live: dict[tuple[str, str], str] = {}  # (egg, profile) -> queued / running / failed (step 2)
+        self.live: dict[tuple[str, str], str] = {}  # (egg, profile) -> queued / running / failed
         self._scan_error = ""
+        self._remembered: dict[tuple[str, str], str] = {}
 
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
@@ -175,12 +179,24 @@ class BatchPanel(QWidget):
         self.run_button = QPushButton("Run on cluster")
         self.run_button.setToolTip("All ticked eggs x checked profiles, one after another in one GPU job")
         self.run_button.clicked.connect(self._run)
+        self.preview_button = QPushButton("Preview…")
+        self.preview_button.setToolTip("Show the items, the time limit and the Slurm script; nothing is sent")
+        self.preview_button.clicked.connect(self._preview)
         self.open_button = QPushButton("Open egg")
         self.open_button.setToolTip("Open the selected egg in the viewer (movie and its active run)")
         self.open_button.clicked.connect(lambda: self._open_selected())
         buttons.addWidget(self.run_button, 1)
+        buttons.addWidget(self.preview_button)
         buttons.addWidget(self.open_button)
         layout.addLayout(buttons)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(True)
+        self.bar.hide()  # shown while a batch runs
+        self.bar_text = QLabel()
+        self.bar_text.setWordWrap(True)
+        self.bar_text.hide()
+        layout.addWidget(self.bar)
+        layout.addWidget(self.bar_text)
         self.setLayout(layout)
 
         self.reload_profiles()
@@ -252,7 +268,20 @@ class BatchPanel(QWidget):
                 self.eggs = []
                 self._scan_error = str(exc)
         self._egg_checked &= {e.name for e in self.eggs}
+        self._remembered = self._remembered_items()
         self._fill_table()
+
+    @staticmethod
+    def _remembered_items() -> dict[tuple[str, str], str]:
+        """(egg, profile) of batch items still on the cluster -> job id (fetch them later)."""
+        try:
+            from .core.project import movie_stem
+            from .core.remote import load_jobs
+
+            return {(movie_stem(it["movie_name"]), it["profile"]): j.job_id
+                    for j in load_jobs() for it in j.items if it.get("status") == "pending"}
+        except Exception:
+            return {}
 
     def _profile_columns(self) -> list[str]:
         return [n for n in self._profiles if n in self._checked_profiles]
@@ -334,8 +363,14 @@ class BatchPanel(QWidget):
     def _cell(self, egg: core_batch.EggStatus, profile: str) -> QTableWidgetItem:
         live = self.live.get((egg.name, profile))
         done = egg.run_for(self._profiles[profile])
+        waiting = self._remembered.get((egg.name, profile))
         if live:
-            text, color, tip = live, COLORS.get(live.split()[0]), f"{profile} on {egg.name}: {live}"
+            text = "running…" if live == "running" else live
+            text, color, tip = text, COLORS.get(live), f"{profile} on {egg.name}: {live}"
+        elif waiting and done is None:
+            text, color = "on cluster", COLORS["queued"]
+            tip = (f"Submitted in batch job {waiting}, not downloaded yet: "
+                   "Cluster settings > Fetch cluster results picks it up.")
         elif done is not None:
             star = " ★" if done.name == egg.active_run else ""
             text, color = f"✓ {done.name}{star}", COLORS["done"]
@@ -404,13 +439,56 @@ class BatchPanel(QWidget):
                 text += f" · (time limit: {exc})"
         self.summary.setText(text)
 
-    def _run(self) -> None:
+    def _planned(self):
         items, skipped = self.plan()
         if not items:
             self.summary.setText("Nothing to run: tick eggs and profiles (done pairs are skipped "
                                  "unless 'Re-run' is ticked).")
+            return None
+        return items, skipped
+
+    def _run(self) -> None:
+        planned = self._planned()
+        if planned:
+            self._run_items(*planned)
+
+    def _preview(self) -> None:
+        planned = self._planned()
+        if planned and self._preview_items is not None:
+            self._preview_items(*planned)
+
+    # ---- a batch on the cluster --------------------------------------------------------------
+    def set_live(self, states: dict | None, refresh_egg: str | None = None) -> None:
+        """Cluster state per (egg, profile): "queued", "running", "failed"; None removes it.
+
+        ``states=None`` clears all. ``refresh_egg``: read that egg's folder again (an item came in).
+        """
+        if states is None:
+            self.live.clear()
+        else:
+            for key, value in states.items():
+                if value is None:
+                    self.live.pop(key, None)
+                else:
+                    self.live[key] = value
+        if refresh_egg is not None:
+            self.eggs = [core_batch.egg_status(e.movie) if e.name == refresh_egg else e for e in self.eggs]
+        self._fill_table()
+
+    def show_progress(self, percent: int | None, message: str) -> None:
+        """The batch's progress bar under the buttons (``percent=None`` hides it)."""
+        if percent is None:
+            self.bar.hide()
+            self.bar_text.hide()
             return
-        self._run_items(items, skipped)
+        self.bar.show()
+        self.bar_text.show()
+        if percent > 0:
+            self.bar.setRange(0, 100)
+            self.bar.setValue(percent)
+        else:
+            self.bar.setRange(0, 0)  # queued / uploading: busy animation
+        self.bar_text.setText(message)
 
     # ---- opening an egg ------------------------------------------------------------------
     def _open_selected(self, run: str | None = None) -> None:
@@ -462,7 +540,7 @@ class DryRunDialog(QDialog):
         mono = QFont("Consolas")
         mono.setStyleHint(QFont.Monospace)
         text.setFont(mono)
-        note = QLabel("Dry run: nothing was sent to the cluster. The real run comes in the next step.")
+        note = QLabel("Preview: nothing was sent to the cluster. 'Run on cluster' submits this.")
         note.setStyleSheet("color: gray;")
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
