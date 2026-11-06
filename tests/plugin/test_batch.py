@@ -51,6 +51,17 @@ def test_run_matches_profile_by_values_not_batch_size(tmp_path):
     assert not st.has_tracking
 
 
+def test_profiles_with_equal_values_each_show_their_own_run(tmp_path):
+    egg = _movie(tmp_path, "egg1.tif")
+    _run(egg, "Custom1", CELLFLOW, preset="Custom1")
+    _run(egg, "Custom2", CELLFLOW, preset="Custom2").set_active_seg_run("Custom2")
+    st = batch.egg_status(egg)
+    assert st.active_run == "Custom2"
+    assert st.run_for(CELLFLOW, "Custom1").name == "Custom1"
+    assert st.run_for(CELLFLOW, "Custom2").name == "Custom2"
+    assert st.run_for(CELLFLOW, "Custom3").name == "Custom2"  # no own run: the active one
+
+
 def test_plan_skips_done_pairs_and_reruns_get_new_names(tmp_path):
     e1, e2 = _movie(tmp_path, "egg1.tif"), _movie(tmp_path, "egg2.tif")
     _run(e1, "default", {})

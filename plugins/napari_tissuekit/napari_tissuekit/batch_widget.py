@@ -288,7 +288,7 @@ class BatchPanel(QWidget):
 
     def _fill_table(self) -> None:
         profiles = self._profile_columns()
-        headers = ["Egg", *profiles, "Track", "T1"]
+        headers = ["Egg", *profiles]
         self.table.blockSignals(True)
         try:
             self.table.clear()
@@ -303,11 +303,6 @@ class BatchPanel(QWidget):
                 self.table.setItem(row, 0, name)
                 for col, profile in enumerate(profiles, 1):
                     self.table.setItem(row, col, self._cell(egg, profile))
-                for col, flag in ((len(headers) - 2, egg.has_tracking), (len(headers) - 1, egg.has_t1)):
-                    item = QTableWidgetItem("✓" if flag else "")
-                    item.setTextAlignment(Qt.AlignCenter)
-                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                    self.table.setItem(row, col, item)
         finally:
             self.table.blockSignals(False)
         self._fit_columns()
@@ -362,7 +357,7 @@ class BatchPanel(QWidget):
 
     def _cell(self, egg: core_batch.EggStatus, profile: str) -> QTableWidgetItem:
         live = self.live.get((egg.name, profile))
-        done = egg.run_for(self._profiles[profile])
+        done = egg.run_for(self._profiles[profile], profile)
         waiting = self._remembered.get((egg.name, profile))
         if live:
             text = "running…" if live == "running" else live
@@ -373,7 +368,8 @@ class BatchPanel(QWidget):
                    "Cluster settings > Fetch cluster results picks it up.")
         elif done is not None:
             star = " ★" if done.name == egg.active_run else ""
-            text, color = f"✓ {done.name}{star}", COLORS["done"]
+            name = "" if done.name == profile else f" {done.name}"  # name only when it differs
+            text, color = f"✓{name}{star}", COLORS["done"]
             tip = (f"run '{done.name}'{' (active)' if star else ''}, made {done.time or '?'} "
                    f"from preset '{done.preset or '?'}'"
                    f"{'' if done.fill_holes is None else ', fill holes ' + ('on' if done.fill_holes else 'off')}\n"
