@@ -119,6 +119,21 @@ class RemoteJob:
     submitted: float = field(default_factory=time.time)
     partition: str = ""
     run: str = ""             # segmentation run folder (segmentation/<run>/), the same here and there
+    # Batch job: one dict per (egg, profile) item (movie_name, local_results, profile, run,
+    # status pending|done|failed|downloaded). Empty for a single-movie job.
+    items: list = field(default_factory=list)
+
+    @property
+    def is_batch(self) -> bool:
+        return bool(self.items)
+
+    @property
+    def label(self) -> str:
+        """Short name for lists and messages."""
+        if not self.items:
+            return self.movie_name
+        eggs = len({it["movie_name"] for it in self.items})
+        return f"batch ({len(self.items)} items, {eggs} egg{'s' * (eggs != 1)})"
 
     @property
     def remote_seg_dir(self) -> str:
@@ -319,13 +334,118 @@ def job_script(cfg: RemoteConfig, remote_dir: str, movie_name: str, tag: str,
         "python -c \"import torch; print('torch', torch.__version__, '| GPU usable:', "
         "torch.cuda.is_available())\" || true",
         *(_install_lines(install) if install is not None and install.needs_install else []),
-        f"tissuekit segment {q(movie_name)} --preset {q(cfg.preset)} --batch-size {int(cfg.batch_size)}"
-        + (f" --run {q(run)}" if run else "")
-        + (f" --params {q(json.dumps(params, separators=(',', ':')))}" if params else "")
-        + ("" if fill_holes else " --no-fill-holes"),
+        _segment_cmd(movie_name, cfg.preset, int(cfg.batch_size), run, params, fill_holes),
     ]
     lines.append("echo TISSUEKIT_DONE")
     return "\n".join(lines) + "\n"
+
+
+def _segment_cmd(movie_name: str, preset: str, batch_size: int, run: str = "",
+                 params: dict | None = None, fill_holes: bool = True) -> str:
+    """The ``tissuekit segment`` line of a job script."""
+    q = shlex.quote
+    return (
+        f"tissuekit segment {q(movie_name)} --preset {q(preset)} --batch-size {int(batch_size)}"
+        + (f" --run {q(run)}" if run else "")
+        + (f" --params {q(json.dumps(params, separators=(',', ':')))}" if params else "")
+        + ("" if fill_holes else " --no-fill-holes")
+    )
+
+
+# ---- batch: many (egg, profile) items one after another in one GPU job ----------------
+
+def parse_time(text: str) -> int:
+    """Seconds of a Slurm time limit: ``mm``, ``mm:ss``, ``hh:mm:ss`` or ``d-hh[:mm[:ss]]``."""
+    text = text.strip()
+    days = 0
+    if "-" in text:
+        d, text = text.split("-", 1)
+        days = int(d)
+        parts = [int(x) for x in text.split(":")] + [0, 0]
+        h, m, s = parts[:3]
+    else:
+        parts = [int(x) for x in text.split(":")]
+        if len(parts) == 1:
+            h, m, s = 0, parts[0], 0
+        elif len(parts) == 2:
+            h, (m, s) = 0, parts
+        else:
+            h, m, s = parts[-3:]
+    return ((days * 24 + h) * 60 + m) * 60 + s
+
+
+def format_time(seconds: int) -> str:
+    """Slurm time limit ``hh:mm:ss`` (hours may exceed 24)."""
+    seconds = max(int(seconds), 60)
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def batch_time(per_item: str, n_items: int) -> str:
+    """Time limit of a batch job: the per-item limit times the number of items."""
+    return format_time(parse_time(per_item) * max(int(n_items), 1))
+
+
+# Longest job a queue accepts (bwUniCluster 3.0 batch queue table): every dev_* queue 30 min,
+# gpu_h100 72 h. Other queues are not checked here (Slurm refuses a too long job itself).
+DEV_MAX = "00:30:00"
+PARTITION_MAX = {"gpu_h100": "72:00:00"}
+
+
+def partition_problem(partition: str, time_limit: str) -> str:
+    """Why ``time_limit`` does not fit ``partition`` (empty if it fits or the queue is unknown)."""
+    limit = DEV_MAX if partition.startswith("dev_") else PARTITION_MAX.get(partition)
+    if limit is None or parse_time(time_limit) <= parse_time(limit):
+        return ""
+    hint = " Use gpu_h100 (up to 72 h) in Cluster settings, or fewer items." if partition.startswith("dev_") else ""
+    return f"{time_limit} is longer than {partition} allows ({limit}).{hint}"
+
+
+def batch_job_script(cfg: RemoteConfig, remote_dir: str, items, install: "PluginState | None" = None) -> str:
+    """Slurm script that segments every item in turn (``items``: :class:`core.batch.BatchItem`).
+
+    Each item prints ``TISSUEKIT_ITEM i/N``, then ``TISSUEKIT_ITEM_DONE i`` or
+    ``TISSUEKIT_ITEM_FAILED i``. A failed item does not stop the others: a command in a
+    ``&&`` / ``||`` list does not end the script under ``set -e``.
+    """
+    q = shlex.quote
+    n = len(items)
+    conda_sh = cfg.conda_sh.replace("~", "$HOME", 1) if cfg.conda_sh.startswith("~") else q(cfg.conda_sh)
+    eggs = len({it.movie_name for it in items})
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name=tk_batch_{eggs}x{n}",
+        f"#SBATCH --partition={cfg.partition}",
+        *([f"#SBATCH --gres={cfg.gres}"] if cfg.gres else []),
+        "#SBATCH --ntasks=1",
+        f"#SBATCH --cpus-per-task={int(cfg.cpus)}",
+        f"#SBATCH --mem={cfg.mem}",
+        f"#SBATCH --time={batch_time(cfg.time, n)}",
+        f"#SBATCH --output={remote_dir}/slurm-%j.log",
+        "set -eo pipefail  # no -u: conda activate reads unset variables",
+        f"source {conda_sh}",
+        f"conda activate {q(cfg.conda_env)}",
+        f"cd {q(remote_dir)}",
+        "nvidia-smi -L || true",
+        "python -c \"import torch; print('torch', torch.__version__, '| GPU usable:', "
+        "torch.cuda.is_available())\" || true",
+        *(_install_lines(install) if install is not None and install.needs_install else []),
+    ]
+    for i, it in enumerate(items, 1):
+        cmd = _segment_cmd(it.movie_name, run_name_label(it.profile), int(it.params.get("batch_size", cfg.batch_size)),
+                           it.run, it.params, it.fill_holes)
+        lines += [
+            f"echo {q(f'TISSUEKIT_ITEM {i}/{n} {it.movie_name} {it.run}')}",
+            f"{cmd} && echo 'TISSUEKIT_ITEM_DONE {i}' || echo 'TISSUEKIT_ITEM_FAILED {i}'",
+        ]
+    lines.append("echo TISSUEKIT_DONE")
+    return "\n".join(lines) + "\n"
+
+
+def run_name_label(profile: str) -> str:
+    """Preset name as a single shell word (it is only a label when --params is given)."""
+    return re.sub(r"\s+", "_", profile.strip()) or "custom"
 
 
 def conda_root(cfg: RemoteConfig) -> str:
@@ -616,10 +736,12 @@ def submit(cfg: RemoteConfig, session: Session, movie: Path, local_results: Path
 def wait_for(session: Session, job: RemoteJob, progress: Progress, poll_seconds: float = 20,
              sleep: Callable[[float], None] = time.sleep,
              running: Callable[[str], tuple[int, str] | None] | None = None,
-             on_log: Callable[[str], None] | None = None) -> str:
+             on_log: Callable[[str], None] | None = None,
+             on_poll: Callable[[], None] | None = None) -> str:
     """Poll until the job ends. Returns the final state; raises Disconnected if SSH drops.
 
     ``on_log`` gets the newest job log lines at every check (for a live log window).
+    ``on_poll`` runs at every check once the job runs (a batch downloads finished items there).
     """
     last = ""
     phase = ("", 0.0, 0)  # (phase name, time it was first seen, percent then) for "time left"
@@ -629,6 +751,8 @@ def wait_for(session: Session, job: RemoteJob, progress: Progress, poll_seconds:
             log = _tail(session, job.log_path, 400) if state != "PENDING" else ""
             if on_log is not None and log:
                 on_log(log)
+            if on_poll is not None and state != "PENDING":
+                on_poll()
         except Exception as exc:
             if not session.alive or isinstance(exc, (OSError, EOFError)):
                 raise Disconnected(
@@ -672,20 +796,25 @@ def job_state_hint(job: RemoteJob) -> str:
 
 def download_seg(session: Session, job: RemoteJob, progress: Progress) -> list[Path]:
     """Copy the job's run folder into ``<local_results>/segmentation/<run>``."""
+    return _download_dir(session, job.remote_seg_dir, job.local_seg_dir, progress)
+
+
+def _download_dir(session: Session, remote_dir: str, dest: Path, progress: Progress,
+                  label: str = "") -> list[Path]:
+    """Copy the files (not subfolders) of ``remote_dir`` into ``dest``."""
     import stat
 
-    dest = job.local_seg_dir
-    dest.mkdir(parents=True, exist_ok=True)
     try:
-        entries = session.sftp.listdir_attr(job.remote_seg_dir)
+        entries = session.sftp.listdir_attr(remote_dir)
     except OSError:
         return []  # the caller reports what the job folder and log show instead
+    dest.mkdir(parents=True, exist_ok=True)
     files = [e for e in entries if not stat.S_ISDIR(e.st_mode or 0)]
     got = []
     for i, entry in enumerate(files):
-        progress(int(100 * i / max(len(files), 1)), f"downloading {entry.filename}")
+        progress(int(100 * i / max(len(files), 1)), f"{label}downloading {entry.filename}")
         local = dest / entry.filename
-        session.sftp.get(posixpath.join(job.remote_seg_dir, entry.filename), str(local))
+        session.sftp.get(posixpath.join(remote_dir, entry.filename), str(local))
         got.append(local)
     return got
 
@@ -734,6 +863,8 @@ def fetch_job(cfg: RemoteConfig, job: RemoteJob, progress: Progress,
 
     One login: if the job still runs, keep watching it (progress, log), then download.
     """
+    if job.is_batch:
+        return _fetch_batch(cfg, job, progress, password, otp, sleep, on_log)
     progress(0, f"connecting to {cfg.host} ...")
     with Session.connect(cfg, password, otp) as session:
         state = job_state(session, job.job_id)
@@ -756,3 +887,185 @@ def _finish(session: Session, job: RemoteJob, delete_remote: bool) -> None:
     forget_job(job.job_id)
     if delete_remote and job.remote_dir.count("/") >= 3:  # never rm a short path by accident
         session.run(f"rm -rf {shlex.quote(job.remote_dir)}", check=False)
+
+
+# ---- batch: submit, watch, download item by item --------------------------------------
+#
+# Progress messages the Batch tab reads (item numbers are 1-based):
+#   "item i/N <egg> · <profile>: <what it does>"   item i is running
+#   "downloaded item i/N <egg> · <profile>"        its run folder is on this computer
+#   "item i/N <egg> · <profile>: FAILED ..."        it ended without results
+
+_ITEM_MARK = re.compile(r"^TISSUEKIT_ITEM(?:_(DONE|FAILED))? (\d+)", re.M)
+
+
+def parse_markers(text: str) -> tuple[int, set[int], set[int]]:
+    """(last started item, finished items, failed items) from the job log's marker lines."""
+    started, done, failed = 0, set(), set()
+    for kind, i in _ITEM_MARK.findall(text):
+        i = int(i)
+        if kind == "DONE":
+            done.add(i)
+        elif kind == "FAILED":
+            failed.add(i)
+        else:
+            started = max(started, i)
+    return started, done, failed
+
+
+def item_text(it: dict) -> str:
+    return f"{movie_stem(it['movie_name'])} · {it['profile']}"
+
+
+@dataclass
+class BatchResult:
+    job: RemoteJob
+    downloaded: list = field(default_factory=list)  # item dicts now on this computer
+    failed: list = field(default_factory=list)      # item dicts without results (with "note")
+    note: str = ""                                  # why the job ended early, if it did
+
+
+def submit_batch(cfg: RemoteConfig, session: Session, items, progress: Progress,
+                 install: PluginState | None = None) -> RemoteJob:
+    """Upload every movie once, sbatch one job for all items, remember it right away."""
+    q = shlex.quote
+    tag = f"batch_{time.strftime('%Y%m%d-%H%M%S')}"
+    remote_dir = posixpath.join(session.home_path(cfg.remote_root), tag)
+    session.run(f"mkdir -p {q(remote_dir)}")
+    movies = list(dict.fromkeys(it.movie for it in items))
+    for k, movie in enumerate(movies, 1):
+        upload_movie(session, Path(movie), remote_dir,
+                     lambda p, m, k=k: progress(p, f"movie {k}/{len(movies)}: {m}"))
+    script = posixpath.join(remote_dir, "job.sh")
+    with session.sftp.open(script, "w") as fh:
+        fh.write(batch_job_script(cfg, remote_dir, items, install))
+    out = session.run(f"sbatch --parsable {q(script)}").strip()
+    job_id = out.split(";")[0].strip()
+    if not job_id.isdigit():
+        raise RemoteError(f"sbatch did not return a job id: {out!r}")
+    job = RemoteJob(
+        job_id=job_id, tag=tag, remote_dir=remote_dir, movie_name=f"batch of {len(items)}",
+        local_results=str(Path(items[0].local_results).parent), host=cfg.host, user=cfg.user,
+        partition=cfg.partition,
+        items=[{"movie_name": it.movie_name, "local_results": it.local_results, "profile": it.profile,
+                "run": it.run, "status": "pending"} for it in items],
+    )
+    remember_job(job)
+    progress(0, f"submitted batch job {job_id} on {cfg.partition} (time limit "
+                f"{batch_time(cfg.time, len(items))}): {len(items)} items, {len(movies)} movies")
+    return job
+
+
+class _BatchWatcher:
+    """At every check: read the item markers, download finished items, note failed ones."""
+
+    def __init__(self, session: Session, job: RemoteJob, progress: Progress):
+        self.session = session
+        self.job = job
+        self.progress = progress
+        self.markers = ""
+
+    def poll(self) -> None:
+        self.markers = self.session.run(
+            f"grep -a '^TISSUEKIT_ITEM' {shlex.quote(self.job.log_path)} 2>/dev/null || true", check=False)
+        _started, done, failed = parse_markers(self.markers)
+        n = len(self.job.items)
+        changed = False
+        for i, it in enumerate(self.job.items, 1):
+            if it["status"] in ("downloaded", "failed"):
+                continue
+            if i in done:
+                if self._download(it):
+                    it["status"] = "downloaded"
+                    self.progress(0, f"downloaded item {i}/{n} {item_text(it)}")
+                else:
+                    it.update(status="failed", note="finished, but no *_cp_masks.tif in its run folder")
+                    self.progress(0, f"item {i}/{n} {item_text(it)}: FAILED ({it['note']})")
+                changed = True
+            elif i in failed:
+                it.update(status="failed", note="tissuekit segment failed (see the job log)")
+                self.progress(0, f"item {i}/{n} {item_text(it)}: FAILED (see Log...)")
+                changed = True
+        if changed:
+            remember_job(self.job)  # a lost connection now only misses the rest
+
+    def _download(self, it: dict) -> bool:
+        stem = movie_stem(it["movie_name"])
+        remote_seg = posixpath.join(self.job.remote_dir, f"{stem}_results", "segmentation", it["run"])
+        dest = Path(it["local_results"]) / "segmentation" / it["run"]
+        files = _download_dir(self.session, remote_seg, dest, lambda *_: None)
+        if masks_file(files) is None:
+            return False
+        _mark_active_run(RemoteJob("", "", "", it["movie_name"], it["local_results"], run=it["run"]))
+        return True
+
+    def running(self, log: str) -> tuple[int, str] | None:
+        """Overall percent over all items, and what the current item does."""
+        n = len(self.job.items)
+        started, done, failed = parse_markers(self.markers)
+        if not started:
+            return _seg_progress(log)  # before the first item: env update, ...
+        finished = len(done | failed)
+        it = self.job.items[min(started, n) - 1]
+        frac, what = 0, "finished"
+        if started not in done | failed:
+            mark = f"TISSUEKIT_ITEM {started}/"
+            hit = _seg_progress(log.rsplit(mark, 1)[-1] if mark in log else log)
+            frac, what = hit if hit else (0, "starting")
+            if frac >= 100:
+                frac, what = 99, "writing results"
+        pct = int(100 * (finished + frac / 100) / n)
+        return max(pct, 1), f"item {started}/{n} {item_text(it)}: {what}"
+
+
+def _watch_batch(cfg: RemoteConfig, session: Session, job: RemoteJob, progress: Progress,
+                 sleep: Callable[[float], None], on_log: Callable[[str], None] | None) -> BatchResult:
+    """Watch until the job ends, downloading each item as soon as it is finished."""
+    watcher = _BatchWatcher(session, job, progress)
+    note = ""
+    try:
+        wait_for(session, job, progress, cfg.poll_seconds, sleep, running=watcher.running,
+                 on_log=on_log, on_poll=watcher.poll)
+    except Disconnected:
+        raise  # the job stays remembered with the items downloaded so far
+    except RemoteError as exc:  # time limit, out of memory ...: keep what is finished
+        note = str(exc)
+    watcher.poll()  # items that finished just before the end
+    for it in job.items:
+        if it["status"] == "pending":
+            it.update(status="failed", note="did not run to the end (the job ended first)")
+    _finish(session, job, cfg.delete_remote_after)
+    return BatchResult(
+        job=job,
+        downloaded=[it for it in job.items if it["status"] == "downloaded"],
+        failed=[it for it in job.items if it["status"] == "failed"],
+        note=note,
+    )
+
+
+def run_batch(cfg: RemoteConfig, password: str, otp: str, items, progress: Progress,
+              sleep: Callable[[float], None] = time.sleep,
+              on_log: Callable[[str], None] | None = None) -> BatchResult:
+    """The Batch tab's round trip: one login, one GPU job for every (egg, profile) item."""
+    if not items:
+        raise RemoteError("Nothing to run.")
+    problem = partition_problem(cfg.partition, batch_time(cfg.time, len(items)))
+    if problem:
+        raise RemoteError(problem)
+    progress(0, f"connecting to {cfg.host} ...")
+    with Session.connect(cfg, password, otp) as session:
+        state = sync_plugin(cfg, session, progress)
+        progress(0, "logged in; uploading the movies ...")
+        job = submit_batch(cfg, session, items, progress, state)
+        return _watch_batch(cfg, session, job, progress, sleep, on_log)
+
+
+def _fetch_batch(cfg: RemoteConfig, job: RemoteJob, progress: Progress, password: str, otp: str,
+                 sleep: Callable[[float], None], on_log: Callable[[str], None] | None) -> BatchResult:
+    """A remembered batch: keep watching it if it still runs, download what is not here yet."""
+    progress(0, f"connecting to {cfg.host} ...")
+    with Session.connect(cfg, password, otp) as session:
+        state = job_state(session, job.job_id)
+        if state and state not in DONE_STATES and state not in FAILED_STATES:
+            progress(0, f"reconnected: {job.label} is {state.lower()}; watching it again")
+        return _watch_batch(cfg, session, job, progress, sleep, on_log)

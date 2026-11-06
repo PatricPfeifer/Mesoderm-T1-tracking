@@ -274,6 +274,7 @@ class TissueKitWidget(QWidget):
         self._remote_cluster_text = ""
         self._remote_event_key = ""
         self._remote_log_dialog = None
+        self._batch_job_items: list[dict] | None = None  # items of the batch job being watched
 
         tabs = QTabWidget()
         tabs.addTab(self._scrollable(self._segmentation_tab()), "Segmentation")
@@ -282,6 +283,18 @@ class TissueKitWidget(QWidget):
         self.cell_props = CellPropertiesWidget(self.viewer)
         self.cell_props.dir_provider = self._cell_props_dir
         tabs.addTab(self._scrollable(self.cell_props), "Export Cell Props")
+        from .batch_widget import BatchPanel
+
+        self.batch = BatchPanel(
+            current_values=self.seg_params.values,
+            fill_holes=self.seg_fill_holes.isChecked,
+            open_egg=self._open_batch_egg,
+            run_items=self._run_batch,
+            preview_items=self._preview_batch,
+        )
+        batch_index = tabs.addTab(self.batch, "Batch")
+        # read the folder again when the tab is shown (presets saved, runs made meanwhile)
+        tabs.currentChanged.connect(lambda i: self.batch.refresh() if i == batch_index else None)
         version = QLabel(f"v{__version__}")
         version.setToolTip("napari-tissuekit version")
         version.setStyleSheet("color: gray; padding: 0 6px;")
@@ -309,22 +322,6 @@ class TissueKitWidget(QWidget):
         self._announce_waiting_cluster_jobs()
 
     def _announce_waiting_cluster_jobs(self) -> None:
-        """After a lost connection or a restart: say that a cluster job still waits to be fetched."""
-        try:
-            from .core.remote import load_jobs
-
-            jobs = load_jobs()
-        except Exception:
-            return
-        if jobs:
-            names = ", ".join(f"{j.movie_name} (job {j.job_id})" for j in jobs[-3:])
-            self.status.setText(
-                f"{len(jobs)} cluster job{'s' if len(jobs) > 1 else ''} waiting: {names}. "
-                "Use Cluster settings > Fetch cluster results to pick it up."
-            )
-        self._announce_waiting_cluster_jobs()
-
-    def _announce_waiting_cluster_jobs(self) -> None:
         """After a lost connection or a restart: say that a cluster job can still be fetched."""
         try:
             from .core.remote import load_jobs
@@ -333,7 +330,7 @@ class TissueKitWidget(QWidget):
         except Exception:
             return
         if jobs:
-            names = ", ".join(j.movie_name for j in jobs[:3])
+            names = ", ".join(j.label for j in jobs[:3])
             self.status.setText(
                 f"{len(jobs)} cluster job(s) waiting ({names}): use Cluster settings > Fetch cluster results. "
                 "They keep running on the cluster while napari is closed."
@@ -846,7 +843,7 @@ class TissueKitWidget(QWidget):
             job = jobs[0]
             if len(jobs) > 1:
                 names = [
-                    f"{j.job_id}  {j.movie_name}  ({time.strftime('%d.%m. %H:%M', time.localtime(j.submitted))})"
+                    f"{j.job_id}  {j.label}  ({time.strftime('%d.%m. %H:%M', time.localtime(j.submitted))})"
                     for j in jobs
                 ]
                 chosen, ok = QInputDialog.getItem(
@@ -859,13 +856,17 @@ class TissueKitWidget(QWidget):
         if cfg is None:
             return
         creds = LoginDialog(
-            cfg, f"Fetch job {job.job_id} ({job.movie_name}). If it is still running, "
+            cfg, f"Fetch job {job.job_id} ({job.label}). If it is still running, "
             "it is watched again and downloaded when it ends.", self,
         ).credentials()
         if creds is None:
             return
         password, otp = creds
         self._remote_fetch_job = job
+        if job.is_batch:
+            self._batch_job_items = list(job.items)
+            self.batch.set_live({(remote.movie_stem(it["movie_name"]), it["profile"]): "queued"
+                                 for it in job.items if it.get("status") == "pending"})
 
         def work(progress, log):
             return remote.fetch_job(cfg, job, progress, password, otp, on_log=log)
@@ -900,7 +901,7 @@ class TissueKitWidget(QWidget):
         self.status.setText(f"[cluster] Set up: {summary}. 'Run on cluster' is ready.")
 
     def _start_remote(self, work, on_done=None) -> None:
-        for button in (self.seg_remote, self.seg_remote_fetch, self.seg_remote_setup):
+        for button in (self.seg_remote, self.seg_remote_fetch, self.seg_remote_setup, self.batch.run_button):
             button.setEnabled(False)
         self._remote_event_key = ""
         self._remote_event("---- started")
@@ -947,12 +948,32 @@ class TissueKitWidget(QWidget):
             self.seg_remote_bar.setRange(0, 0)  # queued / loading: busy animation
         # log each new kind of step once (not every MB of an upload or every minute in the queue)
         key = re.sub(r"\d+", "#", message)
-        if key != self._remote_event_key:
+        if key != self._remote_event_key or "item" in message and "FAILED" in message:
             self._remote_event_key = key
             self._remote_event(message)
+        if self._batch_job_items is not None:
+            self._batch_progress(percent, message)
+
+    def _batch_progress(self, percent: int, message: str) -> None:
+        """Batch tab: the running item's cell, rows of downloaded items, the batch progress bar."""
+        import re
+
+        items = self._batch_job_items
+        key = lambda i: (movie_stem(items[i - 1]["movie_name"]), items[i - 1]["profile"])  # noqa: E731
+        m = re.match(r"(downloaded )?item (\d+)/\d+ ", message)
+        if m and 0 < int(m.group(2)) <= len(items):
+            i = int(m.group(2))
+            if m.group(1):
+                self.batch.set_live({key(i): None}, refresh_egg=key(i)[0])
+            elif "FAILED" in message:
+                self.batch.set_live({key(i): "failed"})
+            elif self.batch.live.get(key(i)) == "queued":  # stays "running" until downloaded / failed
+                self.batch.set_live({key(i): "running"})
+        self.batch.show_progress(percent, message)
 
     def _remote_finish(self) -> None:
-        for button in (self.seg_remote, self.seg_remote_fetch, self.seg_remote_setup):
+        self.batch.show_progress(None, "")
+        for button in (self.seg_remote, self.seg_remote_fetch, self.seg_remote_setup, self.batch.run_button):
             button.setEnabled(True)
         self.seg_remote_bar.hide()
         if self._remote_tmp is not None:
@@ -966,8 +987,17 @@ class TissueKitWidget(QWidget):
         text = str(exc) if isinstance(exc, RemoteError) else f"{type(exc).__name__}: {exc}"
         self._remote_event(f"FAILED: {text}")  # full report (job folder, log end) in the Log window
         self.status.setText(f"[cluster] {text.splitlines()[0]} (details: Log...)")
+        if self._batch_job_items is not None:
+            self._batch_job_items = None
+            self.batch.set_live(None)  # a lost connection: the job is remembered, fetch it later
+            self.batch.refresh()
 
     def _remote_done(self, result) -> None:
+        from .core.remote import BatchResult
+
+        if isinstance(result, BatchResult):
+            self._batch_done(result)
+            return
         self._remote_finish()
         masks_path = Path(result[1] if isinstance(result, tuple) else result)
         # .../<movie>_results/segmentation/<run>/<stem>_cp_masks.tif
@@ -1010,6 +1040,112 @@ class TissueKitWidget(QWidget):
         self._refresh_layers()
         self._pick(self.seg_masks, "Segmentation")
         self._pick(self.track_labels, "Segmentation")
+
+    # ---- Batch tab ---------------------------------------------------------------------
+    def _preview_batch(self, items, skipped) -> None:
+        """What the batch would submit: items, time limit, the Slurm script (nothing is sent)."""
+        from .batch_widget import DryRunDialog
+
+        cfg = self._remote_cfg()
+        if cfg is None:
+            return
+        try:
+            DryRunDialog(items, skipped, cfg, self).exec_()
+        except ValueError as exc:  # e.g. a time limit in the settings that is not hh:mm:ss
+            self.status.setText(f"Batch: cannot read the time limit '{cfg.time}' ({exc}); fix it in Cluster settings.")
+
+    def _run_batch(self, items, skipped) -> None:
+        """One login, one GPU job for every (egg, profile) item; results come back item by item."""
+        from .core import remote
+        from .remote_widget import LoginDialog
+
+        if self._remote.busy:
+            self.status.setText("A cluster job is already running.")
+            return
+        cfg = self._remote_cfg()
+        if cfg is None:
+            return
+        try:
+            total = remote.batch_time(cfg.time, len(items))
+        except ValueError:
+            self.status.setText(f"Batch: cannot read the time limit '{cfg.time}'; fix it in Cluster settings.")
+            return
+        problem = remote.partition_problem(cfg.partition, total)
+        if problem:
+            QMessageBox.warning(self, "Batch", f"The batch does not fit the queue:\n\n{problem}")
+            return
+        eggs = len({it.movie for it in items})
+        creds = LoginDialog(
+            cfg,
+            f"Batch: {len(items)} item(s) ({eggs} egg(s)) one after another in one job on {cfg.partition}, "
+            f"time limit {total} ({cfg.time} per item)"
+            + (f"; {len(skipped)} pair(s) skipped as already done" if skipped else "")
+            + ". Results are downloaded item by item while the job runs.",
+            self,
+        ).credentials()
+        if creds is None:
+            return
+        password, otp = creds
+        self._batch_job_items = [{"movie_name": it.movie_name, "profile": it.profile} for it in items]
+        self.batch.set_live({(it.egg, it.profile): "queued" for it in items})
+
+        def work(progress, log):
+            return remote.run_batch(cfg, password, otp, items, progress, on_log=log)
+
+        self._start_remote(work)
+
+    def _batch_done(self, result) -> None:
+        self._remote_finish()
+        self._batch_job_items = None
+        self.batch.set_live(None)
+        self.batch.refresh()
+        self._refresh_seg_runs()  # the egg shown now may have new runs
+        ok, bad = len(result.downloaded), len(result.failed)
+        for it in result.failed:
+            self._remote_event(f"not done: {it['movie_name']} · {it['profile']}: {it.get('note', '')}")
+        if result.note:
+            self._remote_event(f"batch ended early: {result.note}")
+        text = f"[cluster] Batch done: {ok} run(s) saved"
+        if bad:
+            text += f", {bad} without results (they show '–'; select them again, details: Log...)"
+        if result.note:
+            text += f". The job ended early: {result.note.splitlines()[0]}"
+        self.status.setText(text + ".")
+
+    def _open_batch_egg(self, egg, run=None) -> None:
+        """Open one egg of the Batch tab: its movie and saved results (``run`` made active first)."""
+        if len(self.viewer.layers):
+            unsaved = " The Tracked layer has unsaved edits." if self._track_dirty else ""
+            answer = QMessageBox.question(
+                self, "Open egg",
+                f"Close the current layers before opening {egg.name}?{unsaved}\n\n"
+                "Yes: close them. No: keep them and add the egg.",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Cancel:
+                return
+            if answer == QMessageBox.Yes:
+                self.viewer.layers.clear()
+                self._seg_base_masks = None
+                self._seg_base_hand = None
+                self._seg_run = None
+                self._seg_pending = None
+                self._tracking_files = None
+                self._track_dirty = False
+        self.project.set_manual(egg.results)
+        if run:
+            self.project.set_active_seg_run(run)
+        self._refresh_folder_label()
+        if self.project.found():
+            self._load_saved_results()  # also opens the movie
+        else:
+            before = {id(ly) for ly in self.viewer.layers}
+            self.viewer.open(str(egg.movie), plugin="napari")
+            self._refresh_layers()
+            new = next((ly for ly in self.viewer.layers if id(ly) not in before and isinstance(ly, Image)), None)
+            if new is not None:
+                self._pick(self.seg_image, new.name)
+            self.status.setText(f"Opened {egg.name} (no results yet). Results go to {egg.results}.")
 
     def _start_outline_editing(self) -> None:
         masks_ly = self._layer(self.seg_masks.currentText())

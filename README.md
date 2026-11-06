@@ -109,6 +109,26 @@ The folder `tests/data/` already holds finished results for the test movie.
 **Load results** works the same way for any `<movie>_results` folder, also one copied back from
 the HPC.
 
+### Many eggs at once: the Batch tab
+
+Put the egg movies (`.tif`) in one folder. In the **Batch** tab, press **Folder...** and pick it.
+Rows are eggs, columns are the checked profiles (the segmentation presets you saved in the
+Segmentation tab). A cell shows ✓ and the run name when that egg already has a run with the
+profile's Cellpose values; ★ marks the egg's active run.
+
+1. **Finding the profile:** tick one or two eggs and several profiles, **Run on cluster**, then
+   double-click a ✓ cell to open the egg with that run and switch runs under *Runs* to compare.
+2. **Production:** tick only the chosen profile, press **Missing** (ticks every egg that lacks it),
+   **Run on cluster**.
+
+All items run one after another in **one** GPU job (one login, one queue wait). Each item is
+downloaded into `<egg>_results/segmentation/<profile>/` as soon as it is finished; a failed item
+does not stop the others. **Preview...** shows the items and the Slurm script without sending
+anything. The job's time limit is *Time limit per item* (Cluster settings) times the number of
+items; the `dev_*` queues allow 30 min at most, so use `gpu_h100` for longer batches. If the
+connection drops, the job keeps running: **Cluster settings > Fetch cluster results** downloads
+the rest later.
+
 ## 4. Command line (laptop or HPC)
 
 ```bash
