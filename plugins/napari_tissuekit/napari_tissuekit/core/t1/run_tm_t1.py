@@ -1577,6 +1577,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--off-px", type=float, default=None, help="states: contact pixels below which it switches off (default: DEFINITION)")
     p.add_argument("--no-side-rule", action="store_true", help="states: switch the neighbour-relationship (side cells) rule off")
     p.add_argument("--no-vertex-clause", action="store_true", help="states: switch the return-to-vertex clause off")
+    p.add_argument("--region", type=Path, default=None,
+                   help="states: analysis_region/region.json from the plugin's Analysis cropping tab; only T1s whose four cells are inside the kept area are written")
     p.add_argument("--bond-cutoff", type=float, default=3.0)
     p.add_argument(
         "--border-rings",
@@ -1735,6 +1737,7 @@ def main(argv=None) -> None:
             config=args.states_config, t_dwell=args.t_dwell, t_stable=args.t_stable, t_end=args.t_end,
             on_px=args.on_px, off_px=args.off_px, side_rule=False if args.no_side_rule else None,
             vertex_clause=False if args.no_vertex_clause else None, n_jobs=args.n_jobs,
+            region=args.region.expanduser().resolve() if args.region is not None else None,
         )
         print("Done (states classifier).", flush=True)
         return

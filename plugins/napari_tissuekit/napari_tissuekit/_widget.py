@@ -43,8 +43,10 @@ from qtpy.QtWidgets import (
 
 from . import __version__
 from .cell_properties import CellPropertiesWidget
+from .region_widget import AnalysisRegionWidget
 from .core.cell_size import MIN_CELL_AREA
 from .core.project import WorkingFolder, find_results_root, movie_stem
+from .core.region import TRACKING_REQUIRED, burn_region
 from .track_edit import (
     CellUndo,
     ProtectedCellsError,
@@ -138,6 +140,15 @@ HELP_HTML = """
 <li><b>Correct tracks</b>: turn on <i>Edit tracks</i>, pick a mode and click cells on the Tracked layer.
  <i>Link</i> joins two tracks, <i>Break</i> starts a new track, <i>Swap</i> exchanges two IDs.
  <b>Undo</b> takes back the last edit, <b>Clear protection (lets corrected cells be changed again)</b>: corrected cells are protected so a later edit on a neighbour can't silently change them; this lifts that. <b>Save corrected tracks</b> writes the corrected tracking (the old files go to a <code>previous_...</code> folder).</li>
+</ul>
+
+<h3>Analysis cropping tab</h3>
+<p>Restrict T1 detection and cell properties to part of the embryo. <b>Needs finished tracking</b> (it warns otherwise).</p>
+<ul>
+<li><b>New line: click its cells</b>: click the cells that mark a boundary, on any frame (two or more, in a row). The line goes through them and follows the same cells in every frame. Add a second (or third) line the same way; <b>Add cells to selected line</b>, <b>Undo last cell</b> and <b>Delete line</b> correct it.</li>
+<li><b>Area to use</b>: choose <i>Keep this area</i> or <i>Disregard this area</i>, press <b>Click a cell in an area</b> and click one cell in each area. Without a 'keep' click, everything except the disregarded areas is used.</li>
+<li><b>Save region</b> writes <code>analysis_region/region.json</code>. T1 (checkbox <i>Only cells inside the analysis region</i>) and Export Cell Props then use only cells inside; exported tracked RGB / T1 tiffs show the kept area as a <b>yellow outline</b> with the rest dimmed. Segmentation and tracking are not changed.</li>
+<li>If T1 or cell props were run before the region was set or changed, the plugin says so: <b>run T1 and Export Cell Props again</b>.</li>
 </ul>
 
 <h3>T1 tab</h3>
@@ -237,6 +248,8 @@ class TissueKitWidget(QWidget):
         self._flash_timer.setSingleShot(True)
         self._flash_timer.timeout.connect(self._clear_flash)
         self._t1_result: dict | None = None
+        self._t1_region_hash = ""  # analysis region the T1 events in memory were made with
+        self._stale_shown = ""
         self.project = WorkingFolder()
         self._track_run: tuple | None = None
         # Mother + daughter track IDs from the last division-aware tracking.
@@ -249,9 +262,19 @@ class TissueKitWidget(QWidget):
         tabs = QTabWidget()
         tabs.addTab(self._scrollable(self._segmentation_tab()), "Segmentation")
         tabs.addTab(self._scrollable(self._tracking_tab()), "Tracking")
+        self.region_tab = AnalysisRegionWidget(self.viewer)
+        self.region_tab.tracked_provider = self._tracked_layer
+        self.region_tab.dir_provider = lambda: self.project.root
+        self.region_tab.project_provider = lambda: self.project if self.project.root is not None else None
+        self.region_tab.on_changed = self._region_changed
+        tabs.addTab(self._scrollable(self.region_tab), "Analysis cropping")
         tabs.addTab(self._scrollable(self._t1_tab()), "T1")
         self.cell_props = CellPropertiesWidget(self.viewer)
         self.cell_props.dir_provider = self._cell_props_dir
+        self.cell_props.region_provider = self.region_tab.inside
+        self.cell_props.on_exported = self._cell_props_exported
+        self.tabs = tabs
+        tabs.currentChanged.connect(self._tab_changed)
         tabs.addTab(self._scrollable(self.cell_props), "Export Cell Props")
         version = QLabel(f"v{__version__}")
         version.setToolTip("napari-tissuekit version")
@@ -1140,6 +1163,8 @@ class TissueKitWidget(QWidget):
         outdir = wf.step_dir(step)
         cal = self._calibration(movie, stem=stem)
         written = []
+        geom = self.region_tab.geometry()
+        burned = False
         for name, tag, dtype in self._EXPORTS[step]:
             layer = self._layer(name)
             if layer is None:
@@ -1147,11 +1172,16 @@ class TissueKitWidget(QWidget):
             data = np.asarray(layer.data)
             if dtype is not None and data.dtype != dtype:
                 data = data.astype(dtype)
+            if geom is not None and tag != "tracked_labels" and data.ndim == 4 and data.shape[-1] == 3 \
+                    and tuple(data.shape[1:3]) == tuple(geom.shape):
+                data = burn_region(data, geom)  # yellow outline = analysis region, dimmed = left out
+                burned = True
             path = outdir / f"{stem}_{tag}.tif"
             save_tiff(path, data, cal)
             written.append(path.name)
         self.status.setText(
-            f"Exported {', '.join(written)} → {outdir}" if written
+            f"Exported {', '.join(written)} → {outdir}"
+            + (" (analysis region outlined in yellow, cells outside dimmed)" if burned else "") if written
             else f"Nothing to export for {step}: run the step first."
         )
 
@@ -1556,6 +1586,7 @@ class TissueKitWidget(QWidget):
         self._track_undo.clear()
         self._protect_log.clear()
         self._track_dirty = False
+        self.region_tab.invalidate()  # track IDs may have changed: re-read cell positions for the analysis region
         msg = f"Saved {len(written)} files to {written[0].parent}."
         if backup is not None:
             msg += f" Previous versions: {backup.name}."
@@ -2076,6 +2107,14 @@ class TissueKitWidget(QWidget):
             "update them."
         )
         form.addRow("", self.t1_exclude_div)
+        self.t1_use_region = QCheckBox("Only cells inside the analysis region")
+        self.t1_use_region.setChecked(True)
+        self.t1_use_region.setToolTip(
+            "Use the area chosen in the Analysis cropping tab: T1 events are kept only when all four cells are "
+            "inside it (at the frame of the first swap). Has no effect when no region is set. Run T1 again after "
+            "changing the region."
+        )
+        form.addRow("", self.t1_use_region)
         detect_box = QGroupBox("1 · Detect T1 events")
         detect_inner = QVBoxLayout()
         detect_inner.addLayout(form)
@@ -2119,18 +2158,29 @@ class TissueKitWidget(QWidget):
             self.t1_exclude_div.isChecked() and self._division_ids and labels.name == "Tracked") else None
         pre, post = int(self.t1_pre.value()), int(self.t1_post.value())
         definition = {"expand": int(self.t1_expand.value())}
+        inside, region_hash = None, ""
+        if self.t1_use_region.isChecked():
+            used = self.region_tab.inside()
+            if used is None and self.region_tab.lines:
+                self.status.setText("The analysis region is not complete (click a cell in the area to keep, or in the "
+                                    "Analysis cropping tab clear it). T1 was not run.")
+                return
+            if used is not None:
+                inside, region_hash = used
+        self._t1_region_hash = region_hash
 
         def work(progress):
             from .core.t1.t1_states_run import run_states_stack
 
             return run_states_stack(stack, um_per_px=float(um), dt_s=float(dt), rgb=rgb, definition=definition,
-                                    pre=pre, post=post, exclude_ids=exclude, progress=progress)
+                                    pre=pre, post=post, exclude_ids=exclude, inside=inside, progress=progress)
 
         self._start(work, self._t1_done)
 
     def _t1_done(self, result: dict) -> None:
         self._t1_result = result
         self._autosave_t1(result)
+        self._region_changed()
         self._refresh_layers()
         self._apply_t1_filter()
         note = result.get("swap_note", "")
@@ -2236,6 +2286,49 @@ class TissueKitWidget(QWidget):
                     "saved there."
                 )
 
+    # --- analysis region: reminders ------------------------------------------------------------------------
+
+    def _tab_changed(self, index: int) -> None:
+        name = self.tabs.tabText(index)
+        if name == "Analysis cropping":
+            if not self.region_tab.refresh_gate():
+                self.status.setText(TRACKING_REQUIRED)
+                self._toast(TRACKING_REQUIRED)
+        elif name in ("T1", "Export Cell Props"):
+            msg = self._region_stale_message()
+            if msg:
+                self.status.setText(msg)
+
+    def _region_stale_message(self) -> str:
+        """Text telling which results were made with a different analysis region than the current one ('' if none)."""
+        cur = self.region_tab.current_hash()
+        saved = self.project.read_settings() if self.project.root is not None else {}
+        stale = []
+        for step, label, mem in (
+            ("t1", "T1 detection", self._t1_region_hash if self._t1_result is not None else None),
+            ("cell_props", "Export Cell Props", self.cell_props.region_hash_used),
+        ):
+            used = mem if mem is not None else (
+                (saved.get(step) or {}).get("params", {}).get("region_hash", "") if step in saved else None)
+            if used is not None and used != cur:
+                stale.append(label)
+        if not stale:
+            return ""
+        return ("The analysis region changed after " + " and ".join(stale) + " ran. Run "
+                + " and ".join(stale) + " again so only the cells inside the region are used.")
+
+    def _region_changed(self) -> None:
+        msg = self._region_stale_message()
+        self.region_tab.set_stale_message(msg)
+        if msg and msg != self._stale_shown:
+            self._toast(msg)
+        self._stale_shown = msg
+
+    def _cell_props_exported(self) -> None:
+        if self.project.root is not None:
+            self.project.write_settings("cell_props", {"region_hash": self.cell_props.region_hash_used or ""})
+        self._region_changed()
+
     def _cell_props_dir(self):
         return self.project.root / "cell_props" if self.project.root is not None else None
 
@@ -2268,7 +2361,8 @@ class TissueKitWidget(QWidget):
             pd.DataFrame(rows).to_csv(wf.step_dir("t1") / "t1_events.csv", index=False)
             wf.write_settings(
                 "t1",
-                {"expand": int(self.t1_expand.value()), "definition": result.get("definition")},
+                {"expand": int(self.t1_expand.value()), "definition": result.get("definition"),
+                 "region_hash": self._t1_region_hash},
             )
             self.status.setText(f"{self.status.text()} Saved {len(rows)} T1 events to {wf.step_dir('t1', create=False)}")
         except Exception as exc:  # saving must never break the analysis
@@ -2394,6 +2488,8 @@ class TissueKitWidget(QWidget):
             self._track_undo.clear()
             self._protect_log.clear()
             self._track_dirty = False
+            if getattr(self, "region_tab", None) is not None:
+                self.region_tab.invalidate()
         layer = self._layer(name)
         if isinstance(layer, Labels):
             layer.data = data

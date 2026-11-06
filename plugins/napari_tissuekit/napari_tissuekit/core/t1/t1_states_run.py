@@ -524,12 +524,15 @@ def write_length_tables(md: MovieData, ev: pd.DataFrame, out: Path, stem: str, p
 
 def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: np.ndarray | None = None, definition: dict | None = None,
                      pre: int = 3, post: int = 3, exclude_ids: set[int] | None = None, division_frames: dict[int, list[int]] | None = None,
-                     progress=None) -> dict:
+                     inside: list | None = None, progress=None) -> dict:
     """Plugin counterpart of `run_t1_stack` for the state classifier: classify a (T,Y,X) tracked label stack with the committed definition
     (DEFINITION, optionally overridden) and return the same kind of result dict (events as dicts with t_start / t_end / quartet / pair_before /
     pair_after / type, overlay, dots, ...), so the plugin's filter, overlay and autosave code works on it unchanged. `um_per_px` and `dt_s`
     are needed: the thresholds are pixel counts but the persistence times are seconds. Events have the legacy `type` (completed / flicker_resolved /
-    flicker_aborted) and the new `t1_class` (clean / flicker_resolved / flicker_aborted); pair_after is the pair the quartet ends on."""
+    flicker_aborted) and the new `t1_class` (clean / flicker_resolved / flicker_aborted); pair_after is the pair the quartet ends on.
+    `inside` (optional): per frame the set of track IDs in the analysis region (core/region.py); only events whose four cells are
+    all inside at the frame of the first swap are kept (the others are counted in `n_outside_region`)."""
+    from ..region import event_inside
     from .run_tm_t1 import grayscale_rgb, labels_gray_rgb, render_fourway_dots, render_overlay
     d = {**DEFINITION, **(definition or {})}
     n = int(stack.shape[0])
@@ -542,11 +545,14 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
     dropped = df.attrs.get("dropped", pd.DataFrame())
     exclude_ids = exclude_ids or set()
     events, four_xy = [], [dict() for _ in range(n)]
-    n_excluded = 0
+    n_excluded = n_outside = 0
     for r in df.to_dict("records"):
         quartet = frozenset(int(r[k]) for k in "ABCD")
         if quartet & exclude_ids:
             n_excluded += 1
+            continue
+        if inside is not None and not event_inside({"quartet": quartet, "t_first_swap": int(r["frame_first_swap"])}, inside):
+            n_outside += 1
             continue
         orig = frozenset(int(v) for v in str(r["pair_breaking"]).split(";"))
         new = frozenset(int(v) for v in str(r["pair_building"]).split(";"))
@@ -573,12 +579,13 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
     reasons = dropped["drop_reason"].value_counts().to_dict() if len(dropped) else {}
     note = (f"Event definition: {d['on_px']:g} px on / {d['off_px']:g} px off, new state held {d['t_stable_s']:g} s, event ends after "
             f"{d['t_end_s']:g} s of persistence; side-cell rule {'on' if d['side_rule'] else 'off'}, vertex clause {'on' if d['vertex_clause'] else 'off'}. "
-            f"Classes {classes}; not counted: {reasons}.")
+            f"Classes {classes}; not counted: {reasons}."
+            + (f" {n_outside} event(s) outside the analysis region left out." if inside is not None else ""))
     if progress is not None:
         progress(100, f"T1s={len(events)}")
     return {"classifier": "states", "definition": d, "stack": stack, "frame_indices": np.arange(n), "events": events, "events_shown": events,
             "four_xy": four_xy, "adj": [], "present": [], "overlay": overlay, "dots": dots, "overlay_base": overlay_base, "n_frames": n,
-            "n_t1_confirmed": len(events), "n_excluded_events": n_excluded, "classes": classes, "dropped": reasons, "swap_note": note,
+            "n_t1_confirmed": len(events), "n_excluded_events": n_excluded, "n_outside_region": n_outside, "classes": classes, "dropped": reasons, "swap_note": note,
             "expand": int(d["expand"]), "pre": pre, "post": post}
 
 
@@ -607,11 +614,13 @@ def load_movie(cfg: dict, stem: str, root: Path, cache_dir: Path | None = None, 
 def run_states_cli(*, labels_path: Path, rgb: Path | None, out: Path, stem: str, cal, lineage: Path | None,
                    config: Path | None = None, t_dwell: float | None = None, t_stable: float | None = None, t_end: float | None = None,
                    on_px: float | None = None, off_px: float | None = None, side_rule: bool | None = None,
-                   vertex_clause: bool | None = None, tracked_stem: str | None = None, n_jobs: int | None = None) -> Path:
+                   vertex_clause: bool | None = None, tracked_stem: str | None = None, n_jobs: int | None = None,
+                   region: Path | None = None) -> Path:
     """`run_tm_t1.py --classifier states`: classify one movie with the committed definition (DEFINITION; any argument that is not None
     overrides it) and write <stem>_t1_events.csv (legacy columns + new ones), <stem>_qc.json, the junction-length tables of the events
     (vertex-to-vertex and contact length of the active pair, as the legacy tables), the calibrated twins and the picker-ready bundle.
-    `config` (YAML) is only read for `expand` and kept for compatibility. `n_jobs`: CPU cores (default: $TISSUEKIT_N_JOBS or all cores of the allocation)."""
+    `region` (analysis_region/region.json from the plugin's Analysis cropping tab): only events whose four cells are inside the kept area at
+    the frame of their first swap are written. `config` (YAML) is only read for `expand` and kept for compatibility. `n_jobs`: CPU cores (default: $TISSUEKIT_N_JOBS or all cores of the allocation)."""
     from .calibrated_outputs import write_um_files
     from .t1_picker_ready import _write_one_picker_dir
     cfg = load_config(config) if config is not None and Path(config).is_file() else {}
@@ -627,13 +636,23 @@ def run_states_cli(*, labels_path: Path, rgb: Path | None, out: Path, stem: str,
     df = classify_with_definition(md, div, d, workers=n_jobs)
     dropped = df.attrs.get("dropped", pd.DataFrame())
     df.attrs = {}
+    n_outside = 0
+    if region is not None:
+        from ..region import Region, event_inside, geometry_for
+
+        lin_df = pd.read_csv(lineage) if lineage is not None and Path(lineage).is_file() else None
+        inside = geometry_for(Region.load(region), labels, lin_df).inside_sets()
+        keep = [event_inside({"quartet": [r.A, r.B, r.C, r.D], "t_first_swap": r.frame_first_swap}, inside) for r in df.itertuples()]
+        n_outside = int(len(df) - sum(keep))
+        df = df[keep].reset_index(drop=True)  # event_id = row index in the length tables, so renumber after filtering
     out.mkdir(parents=True, exist_ok=True)
     ev_path = out / f"{stem}_t1_events.csv"
     df.to_csv(ev_path, index=False)
     qc = dict(classifier="states", definition=d, l_on_um=p.l_on, l_off_um=p.l_off, n_dwell_frames=p.n_dwell, n_stable_frames=p.n_stable,
               n_end_frames=p.n_end, n_events=len(df), classes=df["t1_class"].value_counts().to_dict() if len(df) else {},
               dropped=dropped["drop_reason"].value_counts().to_dict() if len(dropped) else {}, labels=str(labels_path),
-              note="abortive_shrink is detected less reliably at coarse time resolution")
+              note="abortive_shrink is detected less reliably at coarse time resolution",
+              **({"analysis_region": str(region), "n_outside_region": n_outside} if region is not None else {}))
     (out / f"{stem}_qc.json").write_text(json.dumps(qc, indent=2) + "\n")
     print(f"Wrote {ev_path}: {qc['classes']}; dropped {qc['dropped']}", flush=True)
     if len(df):

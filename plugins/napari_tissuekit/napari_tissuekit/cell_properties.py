@@ -114,8 +114,12 @@ def compute_properties(
     features,
     pixel_size_um: float = 0.0,
     frame_interval_s: float = 0.0,
+    inside=None,
 ) -> pd.DataFrame:
-    """One row per selected track and frame. Lengths in um if pixel_size_um > 0."""
+    """One row per selected track and frame. Lengths in um if pixel_size_um > 0.
+
+    ``inside``: optional list (one set of track IDs per frame) of the cells in the analysis region; only those cells
+    get a row in that frame."""
     stack = as_tyx(stack)
     ids = [int(i) for i in ids]
     feats = [f for f in FEATURES if f in set(features)]
@@ -127,6 +131,9 @@ def compute_properties(
     for t in range(stack.shape[0]):
         frame = stack[t]
         present = np.intersect1d(np.unique(frame), np.asarray(ids, dtype=frame.dtype))
+        if inside is not None and len(present):
+            keep = inside[min(t, len(inside) - 1)]
+            present = np.asarray([i for i in present if int(i) in keep], dtype=frame.dtype)
         if not len(present):
             continue
         masked = np.where(np.isin(frame, present), frame, 0)
@@ -269,6 +276,9 @@ class CellPropertiesWidget(QWidget):
         self._state_path: Path | None = None
         self._cb_added = False
         self.dir_provider = None  # callable -> Path | None (the results folder)
+        self.region_provider = None  # callable -> (per-frame sets of track IDs inside, region hash) | None
+        self.on_exported = None  # called after an export (analysis-region bookkeeping)
+        self.region_hash_used: str | None = None  # region of the last export in this session
         self.color_feature: str | None = None
         self._hover_id = 0
         self._dimmed: tuple[Labels, float] | None = None
@@ -312,6 +322,13 @@ class CellPropertiesWidget(QWidget):
         select_all = QPushButton("Select all cells")
         select_all.setToolTip("Add every track in the tracked labels to the selection")
         select_all.clicked.connect(self._select_all)
+        self.use_region_cb = QCheckBox("Only cells inside the analysis region")
+        self.use_region_cb.setChecked(True)
+        self.use_region_cb.setToolTip(
+            "Use the area chosen in the Analysis cropping tab: 'Select all cells' picks only cells inside it, and "
+            "exports only list a cell in the frames where it is inside. No effect when no region is set. "
+            "Export again after changing the region."
+        )
         row = QHBoxLayout()
         row.addWidget(select_all)
         row.addWidget(remove)
@@ -424,6 +441,7 @@ class CellPropertiesWidget(QWidget):
         sel_lay = QVBoxLayout()
         sel_lay.addLayout(form)
         sel_lay.addWidget(self.select_cb)
+        sel_lay.addWidget(self.use_region_cb)
         sel_lay.addWidget(self.hover)
         sel_lay.addWidget(QLabel("Selected tracks (double-click: jump to first frame)"))
         sel_lay.addWidget(self.list)
@@ -725,6 +743,15 @@ class CellPropertiesWidget(QWidget):
         if df.empty:
             self.status.setText("Add at least one junction whose cells touch.")
             return
+        region = self._region()
+        if region is not None:
+            inside = region[0]
+            keep = [int(f) in range(len(inside)) and int(a) in inside[int(f)] and int(b) in inside[int(f)]
+                    for f, a, b in zip(df["frame"], df["cell_a"], df["cell_b"])]
+            df = df[keep]
+            if df.empty:
+                self.status.setText("No junction has both cells inside the analysis region.")
+                return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export junction lengths", str(self._default_dir() / "junction_lengths.csv"), "CSV (*.csv)"
         )
@@ -753,6 +780,7 @@ class CellPropertiesWidget(QWidget):
         except Exception as exc:  # the CSV is what matters
             tail = f" (plot not written: {exc})"
         self.status.setText(f"Wrote {len(df)} rows for {len(self._junctions)} junction(s) to {path}{tail}")
+        self._exported(region)
 
     # ---- selection --------------------------------------------------
     def _changed(self) -> None:
@@ -977,15 +1005,32 @@ class CellPropertiesWidget(QWidget):
                 self._selected.remove(i)
         self._changed()
 
+    def _region(self):
+        """(per-frame inside sets, hash) when the region is set and wanted for the export, else None."""
+        if self.region_provider is None or not self.use_region_cb.isChecked():
+            return None
+        return self.region_provider()
+
+    def _exported(self, region) -> None:
+        self.region_hash_used = region[1] if region else ""
+        if callable(self.on_exported):
+            self.on_exported()
+
     def _select_all(self) -> None:
         stack = self._stack()
         if stack is None:
             self.status.setText("Select a tracked labels layer first.")
             return
         ids = np.unique(stack)
-        self._selected = [int(i) for i in ids if i != 0]
+        ids = [int(i) for i in ids if i != 0]
+        region = self._region()
+        if region is not None:
+            ever_inside = set().union(*region[0]) if region[0] else set()
+            ids = [i for i in ids if i in ever_inside]
+        self._selected = ids
         self._changed()
-        self.status.setText(f"Selected all {len(self._selected)} tracks.")
+        where = " inside the analysis region" if region is not None else ""
+        self.status.setText(f"Selected all {len(self._selected)} tracks{where}.")
 
     def _clear(self) -> None:
         self._selected.clear()
@@ -1029,15 +1074,19 @@ class CellPropertiesWidget(QWidget):
         )
         if not path:
             return
+        region = self._region()
         df = compute_properties(
             stack,
             self._selected,
             self._features(),
             self.pixel_size.value(),
             self.interval.value(),
+            inside=region[0] if region else None,
         )
         df.to_csv(path, index=False)
-        self.status.setText(f"Wrote {len(df)} rows for {len(self._selected)} tracks to {path}")
+        where = " (only cells inside the analysis region)" if region else ""
+        self.status.setText(f"Wrote {len(df)} rows for {len(self._selected)} tracks{where} to {path}")
+        self._exported(region)
 
     # ---- state ------------------------------------------------------
     def get_state(self) -> dict:
