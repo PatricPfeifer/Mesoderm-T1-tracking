@@ -48,7 +48,7 @@ from qtpy.QtWidgets import (
 from . import __version__
 from .cell_properties import CellPropertiesWidget
 from .core.cell_size import MIN_CELL_AREA
-from .core.project import WorkingFolder, find_results_root, movie_stem
+from .core.project import PER_RUN_STEPS, WorkingFolder, find_results_root, movie_stem
 from .remote_widget import RemoteRunner
 from .track_edit import (
     CellUndo,
@@ -266,6 +266,8 @@ class TissueKitWidget(QWidget):
         # that "Save corrected tracks" compares against), and unsaved-edit flag.
         self._tracking_files: Path | None = None
         self._track_dirty = False
+        # Segmentation run the shown tracking belongs to (tracking/<run>/, t1/<run>/).
+        self._tracked_run: str | None = None
         # Cluster (bwUniCluster) segmentation runs in its own thread, so local work goes on.
         self._remote = RemoteRunner(self)
         self._remote_tmp: Path | None = None
@@ -1115,23 +1117,22 @@ class TissueKitWidget(QWidget):
     def _open_batch_egg(self, egg, run=None) -> None:
         """Open one egg of the Batch tab: its movie and saved results (``run`` made active first)."""
         if len(self.viewer.layers):
-            unsaved = " The Tracked layer has unsaved edits." if self._track_dirty else ""
-            answer = QMessageBox.question(
+            # One egg at a time (shared results folder, layer names, Runs list): replace the layers.
+            # Ask only when unsaved track edits would be lost.
+            if self._track_dirty and QMessageBox.question(
                 self, "Open egg",
-                f"Close the current layers before opening {egg.name}?{unsaved}\n\n"
-                "Yes: close them. No: keep them and add the egg.",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes,
-            )
-            if answer == QMessageBox.Cancel:
+                f"The Tracked layer has unsaved edits. Discard them and open {egg.name}?",
+                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel,
+            ) != QMessageBox.Ok:
                 return
-            if answer == QMessageBox.Yes:
-                self.viewer.layers.clear()
-                self._seg_base_masks = None
-                self._seg_base_hand = None
-                self._seg_run = None
-                self._seg_pending = None
-                self._tracking_files = None
-                self._track_dirty = False
+            self.viewer.layers.clear()
+            self._seg_base_masks = None
+            self._seg_base_hand = None
+            self._seg_run = None
+            self._seg_pending = None
+            self._tracking_files = None
+            self._tracked_run = None
+            self._track_dirty = False
         self.project.set_manual(egg.results)
         if run:
             self.project.set_active_seg_run(run)
@@ -1692,7 +1693,7 @@ class TissueKitWidget(QWidget):
             return
         paths = [p for p in self._layer_paths(movie) if p]
         stem = input_stem(paths[0]) if paths else (self._seg_stem or "movie")
-        outdir = wf.step_dir(step)
+        outdir = wf.run_step_dir(step, self._tracked_run) if step in PER_RUN_STEPS else wf.step_dir(step)
         cal = self._calibration(movie, stem=stem)
         written = []
         for name, tag, dtype in self._EXPORTS[step]:
@@ -2495,10 +2496,14 @@ class TissueKitWidget(QWidget):
         cal = self._calibration(intensity_layer, labels)
         wf = None
         out_dir = Path(out_text) if out_text else None
+        run = None
         if out_dir is None:
             wf = self._working_folder(intensity_layer, labels)
             if wf is not None:
-                out_dir = wf.step_dir("tracking")
+                # Each segmentation run keeps its own tracking: tracking/<run>/.
+                run = (self._seg_run if self.track_labels.currentText() == "Segmentation" else None)                     or wf.active_seg_run()
+                out_dir = wf.run_step_dir("tracking", run)
+                run = out_dir.name
         kwargs = dict(
             calibration=cal,
             expand=int(self.track_expand.value()),
@@ -2533,9 +2538,9 @@ class TissueKitWidget(QWidget):
         self._track_run = (
             wf,
             {**{k: v for k, v in kwargs.items() if k not in ("calibration", "n_jobs")},
-             # which segmentation run was tracked (None: a layer that is not the loaded Segmentation)
-             "segmentation_run": self._seg_run if self.track_labels.currentText() == "Segmentation" else None},
+             "labels_layer": self.track_labels.currentText()},
             movie_path,
+            run,
         )
         self._start(work, self._tracking_done)
 
@@ -2549,10 +2554,12 @@ class TissueKitWidget(QWidget):
 
     def _tracking_done(self, result: dict) -> None:
         saved = ""
+        self._tracked_run = None
         if self._track_run is not None and self._track_run[0] is not None:
-            wf, params, movie_path = self._track_run
-            wf.write_settings("tracking", params, movie=movie_path)
-            saved = f" Saved to {wf.step_dir('tracking', create=False)}"
+            wf, params, movie_path, run = self._track_run
+            wf.write_step_params("tracking", run, params, movie=movie_path)
+            self._tracked_run = run
+            saved = f" Saved to {wf.run_step_dir('tracking', run, create=False)} (run '{run}')"
         self._track_run = None
         tracked, rgb = result["tracked"], result.get("rgb")
         hidden = 0
@@ -2827,23 +2834,25 @@ class TissueKitWidget(QWidget):
                  for k, v in e.items()}
                 for e in events
             ]
-            pd.DataFrame(rows).to_csv(wf.step_dir("t1") / "t1_events.csv", index=False)
-            wf.write_settings(
-                "t1",
+            out = wf.run_step_dir("t1", self._tracked_run)  # T1 of the shown tracking's run
+            pd.DataFrame(rows).to_csv(out / "t1_events.csv", index=False)
+            wf.write_step_params(
+                "t1", out.name,
                 {"expand": int(self.t1_expand.value()), "definition": result.get("definition")},
             )
-            self.status.setText(f"{self.status.text()} Saved {len(rows)} T1 events to {wf.step_dir('t1', create=False)}")
+            self.status.setText(f"{self.status.text()} Saved {len(rows)} T1 events to {out}")
         except Exception as exc:  # saving must never break the analysis
             self.status.setText(f"{self.status.text()} (T1 events not saved: {exc})")
 
     def _load_saved_results(self, only_segmentation: bool = False) -> None:
-        """Load the movie, the active segmentation run and the tracking from the results folder.
+        """Load the movie, the active segmentation run and that run's tracking from the results folder.
 
-        ``only_segmentation``: just the active run (Runs > Show); movie and tracking stay as they are."""
+        ``only_segmentation``: just the active run and its tracking (Runs > Show); the movie stays.
+        Tracked layers of another run are removed when this run has no tracking."""
         wf = self._working_folder(self._layer(self.seg_image.currentText()), ask=False)
         found = wf.found() if wf is not None else {}
         if only_segmentation:
-            found = {k: v for k, v in found.items() if k in ("segmentation", "outlines")}
+            found = {k: v for k, v in found.items() if k in ("segmentation", "outlines", "tracking")}
         if not found:
             self.status.setText("No saved results found in the results folder.")
             return
@@ -2922,10 +2931,13 @@ class TissueKitWidget(QWidget):
                 )
                 outline_note = " Bonds are being prepared: wait for 100% before editing."
                 loaded.append(f"outlines {ofile.name} (cells derived from the outlines)")
+        if "tracking" not in found and self._tracked_run not in (None, run):
+            self._drop_tracking_layers()  # they belong to another run
         if "tracking" in found:
             labels = found["tracking"][0]
             self._replace_labels("Tracked", tifffile.imread(labels))
             self._tracking_files = Path(labels)
+            self._tracked_run = run
             self._division_ids = self._division_ids_from(labels)
             rgb = labels.with_name(labels.name.replace("_tracked_labels", "_tracked_rgb"))
             if rgb.is_file():
@@ -2937,12 +2949,27 @@ class TissueKitWidget(QWidget):
         self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}.{outline_note}{self._tracking_run_note(wf)}")
 
     def _tracking_run_note(self, wf) -> str:
-        """Warning when the saved tracking was made from another segmentation run than the active one."""
-        tracked = ((wf.read_settings().get("tracking") or {}).get("params") or {}).get("segmentation_run")
-        active = wf.active_seg_run()
-        if tracked and active and tracked != active and self._layer("Tracked") is not None:
-            return f" Note: the tracking was made from run '{tracked}', not from the active run '{active}'."
+        """Warning when the shown tracking is an older one that may not come from the active run."""
+        files = self._tracking_files
+        if files is None or self._layer("Tracked") is None or files.parent.name == self._tracked_run:
+            return ""
+        if wf.legacy_tracking_run() is None:  # older flat tracking/ folder, run not recorded
+            return (" Note: this tracking is from before tracking was kept per run; it may come from "
+                    "another segmentation run. Run tracking again to save it under this run.")
         return ""
+
+    def _drop_tracking_layers(self) -> None:
+        """Remove the Tracked and T1 layers (switching to a run without its own tracking)."""
+        for name in ("Tracked", "Tracked RGB", "T1 overlay", "T1 four-ways"):
+            if name in self.viewer.layers:
+                self.viewer.layers.remove(name)
+        self._tracking_files = None
+        self._tracked_run = None
+        self._track_dirty = False
+        self._track_undo.clear()
+        self._protect_log.clear()
+        self._division_ids = set()
+        self._t1_result = None
 
     # ---- segmentation runs -------------------------------------------------------
     def _next_run_name(self, base: str) -> str:
@@ -3007,6 +3034,11 @@ class TissueKitWidget(QWidget):
             )
             if answer != QMessageBox.Yes:
                 return
+        if run != self._tracked_run and self._track_dirty and QMessageBox.question(
+            self, "Unsaved edits",
+            f"The Tracked layer has unsaved edits. Discard them and show run '{run}' with its own tracking?",
+        ) != QMessageBox.Yes:
+            return
         self.project.set_active_seg_run(run)
         self._load_saved_results(only_segmentation=True)
 

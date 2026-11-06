@@ -146,3 +146,67 @@ def test_cli_segment_uses_preset_batch_size_and_records_run(tmp_path, monkeypatc
     cli.main(["segment", str(movie), "--preset", "hpc", "--batch-size", "16"])
     assert seen["argv"][seen["argv"].index("--batch-size") + 1] == "16"
     assert wf.seg_runs() == ["hpc", "hpc_2"]
+
+
+# ---- tracking and T1 per segmentation run ---------------------------------------------
+
+def test_each_run_keeps_its_own_tracking_and_t1(tmp_path):
+    wf = _wf(tmp_path)
+    _touch(tmp_path / "segmentation" / "Custom1" / "m_cp_masks.tif")
+    _touch(tmp_path / "segmentation" / "Custom2" / "m_cp_masks.tif")
+    t1 = _touch(wf.run_step_dir("tracking", "Custom1") / "m_tracked_labels.tif")
+    e1 = _touch(wf.run_step_dir("t1", "Custom1") / "t1_events.csv")
+    wf.write_step_params("t1", "Custom1", {"expand": 3})       # params.json is not a T1 table
+    t2 = _touch(wf.run_step_dir("tracking", "Custom2") / "m_tracked_labels.tif")
+    assert wf.found(run="Custom1")["tracking"] == [t1]
+    assert wf.found(run="Custom1")["t1"] == [e1]
+    assert wf.found(run="Custom2")["tracking"] == [t2]
+    assert "t1" not in wf.found(run="Custom2")
+    wf.set_active_seg_run("Custom2")
+    assert wf.found()["tracking"] == [t2]                        # default: the active run
+    assert wf.run_step_dir("tracking", create=False).name == "Custom2"
+
+
+def test_older_flat_tracking_belongs_to_its_recorded_run_only(tmp_path):
+    wf = _wf(tmp_path)
+    _touch(tmp_path / "segmentation" / "Custom1" / "m_cp_masks.tif")
+    _touch(tmp_path / "segmentation" / "Custom1_2" / "m_cp_masks.tif")
+    flat = _touch(tmp_path / "tracking" / "m_tracked_labels.tif")
+    assert wf.found(run="Custom1")["tracking"] == [flat]         # owner unknown: shown for any run
+    wf.write_settings("tracking", {"segmentation_run": "Custom1_2"})
+    assert wf.found(run="Custom1_2")["tracking"] == [flat]
+    assert "tracking" not in wf.found(run="Custom1")
+    own = _touch(wf.run_step_dir("tracking", "Custom1_2") / "m_tracked_labels.tif")
+    assert wf.found(run="Custom1_2")["tracking"] == [own]        # the run's own tracking wins
+
+
+def test_cli_track_and_t1_write_into_the_active_run(tmp_path, monkeypatch):
+    from napari_tissuekit import cli
+    from napari_tissuekit.core import tracking
+    from napari_tissuekit.core.t1 import run_tm_t1
+
+    seen = {}
+
+    def fake_track(argv):
+        out = Path(argv[argv.index("--output-dir") + 1])
+        seen["track"] = out
+        (out / "m_tracked_labels.tif").write_bytes(b"")
+
+    def fake_t1(argv):
+        seen["t1"] = Path(argv[argv.index("--output-dir") + 1])
+        seen["labels"] = Path(argv[argv.index("--labels") + 1])
+
+    monkeypatch.setattr(tracking, "main", fake_track)
+    monkeypatch.setattr(run_tm_t1, "main", fake_t1)
+    res = tmp_path / "m_results"
+    wf = _wf(res)
+    _touch(res / "segmentation" / "a" / "m_cp_masks.tif")
+    _touch(res / "segmentation" / "b" / "m_cp_masks.tif")
+    wf.set_active_seg_run("b")
+    cli.main(["track", str(res)])
+    cli.main(["t1", str(res)])
+    assert seen["track"] == res / "tracking" / "b"
+    assert seen["labels"] == res / "tracking" / "b" / "m_tracked_labels.tif"
+    assert seen["t1"] == res / "t1" / "b"
+    assert json.loads((res / "tracking" / "b" / "params.json").read_text())["segmentation_run"] == "b"
+    assert "tracking" not in wf.found(run="a")
