@@ -51,6 +51,7 @@ from .core.cell_size import MIN_CELL_AREA
 from .core.project import PER_RUN_STEPS, WorkingFolder, find_results_root, movie_stem
 from .core.region import TRACKING_REQUIRED, burn_region
 from .wrapped_tabs import WrappedTabs
+from .t1_preview import T1PreviewDialog, find_event_at
 from .remote_widget import RemoteRunner
 from .track_edit import (
     CellUndo,
@@ -170,6 +171,7 @@ HELP_HTML = """
 
 <h3>T1 tab</h3>
 <ul>
+<li><b>Preview events</b>: after a run, select the <i>T1 overlay</i> layer and click a cell or junction of an event (or press <b>Preview first event</b>). A window plays the event with the four cells filled; <i>Previous</i>/<i>Next event</i> step through all shown events and the napari view follows.</li>
 <li><b>Labels</b>: the Tracked layer. <b>RGB</b>: the Tracked RGB image used for the overlay.</li>
 <li><b>Run T1</b>: detect T1 transitions. Needs the pixel size and frame interval. They are read from the movie or from the results files (also ones made on a server); the line under <i>RGB</i> shows what was found. If a value is missing, type it in the boxes.</li>
 <li><b>T1 filter</b>: show all counted events, only clean ones, flicker resolved, or flicker aborted.</li>
@@ -269,6 +271,8 @@ class TissueKitWidget(QWidget):
         self._flash_timer.setSingleShot(True)
         self._flash_timer.timeout.connect(self._clear_flash)
         self._t1_result: dict | None = None
+        self._t1_shown: list = []
+        self._t1_dialog: T1PreviewDialog | None = None
         self._t1_region_hash = ""  # analysis region the T1 events in memory were made with
         self._stale_shown = ""
         self.project = WorkingFolder()
@@ -350,6 +354,7 @@ class TissueKitWidget(QWidget):
         self.viewer.layers.events.inserted.connect(self._refresh_layers)
         self.viewer.layers.events.removed.connect(self._refresh_layers)
         self.viewer.mouse_drag_callbacks.append(self._on_track_click)
+        self.viewer.mouse_drag_callbacks.append(self._on_t1_click)
         self.viewer.dims.events.current_step.connect(self._update_overlay)
         self.viewer.layers.events.inserted.connect(self._update_overlay)
         self.viewer.layers.events.removed.connect(self._update_overlay)
@@ -2713,7 +2718,23 @@ class TissueKitWidget(QWidget):
         detect_inner.addWidget(self.t1_run)
         detect_box.setLayout(detect_inner)
         layout.addWidget(detect_box)
-        export_box = QGroupBox("2 · Export")
+        preview_box = QGroupBox("2 · Preview events")
+        preview_inner = QVBoxLayout()
+        self.t1_click_preview = QCheckBox("Click an event on the T1 overlay to preview it")
+        self.t1_click_preview.setChecked(True)
+        self.t1_click_preview.setToolTip(
+            "After a T1 run: select the 'T1 overlay' (or 'T1 four-ways') layer and click a cell or junction of an event. "
+            "A window plays that event (the four cells filled, breaking and building junctions, the four-way vertex). "
+            "Dragging still pans. Not active while Edit tracks, cell selection or the cropping tool is picking."
+        )
+        self.t1_preview_btn = QPushButton("Preview first event")
+        self.t1_preview_btn.setToolTip("Open the preview on the first event shown (completed events first).")
+        self.t1_preview_btn.clicked.connect(self._preview_first_t1)
+        preview_inner.addWidget(self.t1_click_preview)
+        preview_inner.addWidget(self.t1_preview_btn)
+        preview_box.setLayout(preview_inner)
+        layout.addWidget(preview_box)
+        export_box = QGroupBox("3 · Export")
         export_inner = QVBoxLayout()
         self.t1_export = QPushButton("Export TIFF")
         self.t1_export.clicked.connect(lambda: self._export_step_tiffs("t1"))
@@ -2777,6 +2798,77 @@ class TissueKitWidget(QWidget):
         if note:
             self.status.setText(f"{self.status.text()} {note}")
 
+    # ---- T1 preview (click an event on the overlay) -------------------------------------------------------
+    def _t1_click_active(self) -> bool:
+        if not self.t1_click_preview.isChecked() or not self._t1_result or not self._t1_shown:
+            return False
+        active = self.viewer.layers.selection.active
+        if active is None or active.name not in ("T1 overlay", "T1 four-ways"):
+            return False
+        picking = (self.track_edit.isChecked() or self.region_tab.mode is not None
+                   or self.cell_props.select_cb.isChecked() or self.cell_props._picking is not None)
+        return not picking
+
+    def _on_t1_click(self, viewer, event):
+        if not self._t1_click_active() or "Shift" in getattr(event, "modifiers", ()):
+            return
+        if getattr(event, "button", 1) not in (1, "left"):
+            return
+        start = np.array(event.position, dtype=float)
+        yield
+        if getattr(event, "type", "") != "mouse_release":
+            return
+        zoom = max(float(getattr(self.viewer.camera, "zoom", 1.0) or 1.0), 1e-6)
+        if np.linalg.norm(np.array(event.position, dtype=float) - start) > 5.0 / zoom:
+            return
+        self._t1_click_at(event.position)
+
+    def _t1_click_at(self, position) -> None:
+        result = self._t1_result
+        layer = self.viewer.layers.selection.active
+        stack = result["stack"]
+        c = np.asarray(layer.world_to_data(position), dtype=float)
+        y, x = int(round(c[-2])), int(round(c[-1]))
+        frame = int(np.clip(round(float(self.viewer.dims.point[0])), 0, stack.shape[0] - 1))
+        label = int(stack[frame, y, x]) if (0 <= y < stack.shape[-2] and 0 <= x < stack.shape[-1]) else 0
+        ev = find_event_at(self._t1_shown, result.get("four_xy"), frame, y, x, label, result["pre"], result["post"])
+        if ev is None:
+            self.status.setText("No T1 event here on this frame.")
+            return
+        self._open_t1_preview(ev, start_frame=max(frame, int(ev["t_start"]) - int(result["pre"])))
+
+    def _preview_first_t1(self) -> None:
+        if not self._t1_result or not self._t1_shown:
+            self.status.setText("Run T1 first (and make sure the filter shows events).")
+            return
+        self._open_t1_preview(None)
+
+    def _open_t1_preview(self, ev, start_frame: int | None = None) -> None:
+        result = self._t1_result
+        if self._t1_dialog is None:
+            self._t1_dialog = T1PreviewDialog(self)
+            self._t1_dialog.event_changed.connect(self._t1_preview_moved)
+        d = self._t1_dialog
+        d.set_data(self._t1_shown, result["stack"], result.get("four_xy"), result["pre"], result["post"],
+                   int(result.get("expand", 3)))
+        if ev is None:
+            d.show_event(0)
+        else:
+            d.show_event_object(ev, start_frame)
+        d.show()
+        d.raise_()
+
+    def _t1_preview_moved(self, ev) -> None:
+        """Jump the napari view to the event the preview shows."""
+        try:
+            self.viewer.dims.set_point(0, int(ev["t_first_swap"]))
+            layer = self.viewer.layers["T1 overlay"] if "T1 overlay" in self.viewer.layers else None
+            if layer is not None:
+                w = layer.data_to_world([int(ev["t_first_swap"]), float(ev["y"]), float(ev["x"])])
+                self.viewer.camera.center = (0.0, float(w[-2]), float(w[-1]))
+        except Exception:
+            pass
+
     def _apply_t1_filter(self) -> None:
         result = self._t1_result
         if not result:
@@ -2785,6 +2877,7 @@ class TissueKitWidget(QWidget):
 
         mode = str(self.t1_filter.currentData() or "all")
         overlay, dots, shown = paint_t1_filter(result, mode)
+        self._t1_shown = list(shown)
         self._replace_image("T1 overlay", overlay)
         self._replace_image("T1 four-ways", dots)
         total = len(result.get("events") or [])
@@ -3103,6 +3196,7 @@ class TissueKitWidget(QWidget):
         self._protect_log.clear()
         self._division_ids = set()
         self._t1_result = None
+        self._t1_shown = []
 
     # ---- segmentation runs -------------------------------------------------------
     def _next_run_name(self, base: str) -> str:
