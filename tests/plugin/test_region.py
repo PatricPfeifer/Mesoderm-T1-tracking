@@ -186,3 +186,129 @@ def test_cell_properties_only_lists_cells_inside_per_frame():
     assert len(everyone) == 4
     only = compute_properties(stack, [1, 2], ["area"], inside=[{1, 2}, {1}])
     assert {(r.track_id, r.frame) for r in only.itertuples()} == {(1, 0), (2, 0), (1, 1)} and len(only) == 3
+
+
+# ---- straight best-fit lines ---------------------------------------------------------------------------------------
+from napari_tissuekit.core.region import STRAIGHT, fit_line  # noqa: E402
+
+
+def straight(lines, anchors, pos, shape=SHAPE):
+    return Geometry(Region(shape, lines, anchors, STRAIGHT), pos)
+
+
+def jitter_positions(seed=0, amp=3.0, n_frames=1):
+    """The grid with every cell moved by up to `amp` pixels (rows are then only roughly straight)."""
+    rng = np.random.default_rng(seed)
+    base = grid_positions(n_frames)
+    return [{k: (y + rng.uniform(-amp, amp), x + rng.uniform(-amp, amp)) for k, (y, x) in f.items()} for f in base]
+
+
+def test_fit_line_is_the_least_squares_line_and_needs_two_points():
+    c, d = fit_line(np.array([[0, 0], [10, 1], [20, -1], [30, 0.0]]))  # (x, y), nearly horizontal
+    assert abs(d[0]) > 0.99 and abs(c[1]) < 1e-9
+    assert fit_line(np.array([[5.0, 5.0]])) is None and fit_line(np.array([[5.0, 5.0], [5.0, 5.0]])) is None
+    c, d = fit_line(np.array([[3.0, 4.0], [3.0, 40.0]]))  # exactly vertical
+    assert abs(d[0]) < 1e-9 and abs(abs(d[1]) - 1) < 1e-9
+
+
+def test_straight_line_ignores_a_wobbly_row_and_is_two_points():
+    pos = jitter_positions()
+    geom = straight([[pick(i, pos) for i in row_cells(2)]], [anchor(1, pos)], pos)
+    seg = geom.line_polyline(0, 0)
+    assert seg.shape == (2, 2)  # one straight segment, border to border
+    assert abs(seg[0, 1] - 50) < 4 and abs(seg[1, 1] - 50) < 4 and {seg[0, 0], seg[1, 0]} == {0.0, 130.0}
+    ins = geom.inside_sets()[0]
+    assert all(i in ins for r in (0, 1) for i in row_cells(r)) and not any(i in ins for r in (4, 5) for i in row_cells(r))
+    # the polyline version bends through every wobbly cell, the straight one does not
+    poly = Geometry(Region(SHAPE, [[pick(i, pos) for i in row_cells(2)]], [anchor(1, pos)], "polyline"), pos)
+    assert len(poly.line_polyline(0, 0)) > 2
+
+
+def test_two_straight_lines_horizontal_and_vertical_cut_four_corners():
+    pos = jitter_positions(seed=1)
+    h = [pick(i, pos) for i in row_cells(2)]
+    v = [pick(i, pos) for i in col_cells(2)]
+    keep_tl = straight([h, v], [anchor(1, pos)], pos).inside_sets()[0]
+    want = {10 * r + c + 1 for r in (0, 1) for c in (0, 1)}
+    assert want <= keep_tl
+    assert not (keep_tl & {10 * r + c + 1 for r in (3, 4, 5) for c in range(6)})
+    assert not (keep_tl & {10 * r + c + 1 for r in range(6) for c in (3, 4, 5)})
+
+
+def test_straight_line_follows_a_moving_and_rotating_tissue_with_stable_sides():
+    n = 8
+    pos = []
+    for f in range(n):  # drift down and rotate by 3 degrees per frame around the centre
+        a = np.deg2rad(3.0 * f)
+        pos.append({k: (65 + (y - 65) * np.cos(a) + (x - 65) * np.sin(a) + 2.0 * f,
+                        65 - (y - 65) * np.sin(a) + (x - 65) * np.cos(a)) for k, (y, x) in grid_positions()[0].items()})
+    geom = straight([[pick(i, pos) for i in row_cells(2)]], [anchor(1, pos)], pos, (200, 200))
+    sets = geom.inside_sets()
+    on_line = set(row_cells(2))
+    assert all(s - on_line == sets[0] - on_line for s in sets)  # the same cells stay on the kept side
+    dirs = [np.diff(geom.line_polyline(0, f), axis=0)[0] for f in range(n)]
+    assert all(dirs[f] @ dirs[f + 1] > 0 for f in range(n - 1))  # direction never flips (side 0 stays side 0)
+
+
+def test_straight_mode_matches_the_polygon_signatures_for_a_two_cell_line():
+    pos = grid_positions()
+    line = [pick(4 + 10 * 2 + 1, pos), pick(10 * 3 + 1, pos)]  # a tilted line through two cells
+    reg = [[line, [anchor(1, pos)]]][0]
+    a = Geometry(Region(SHAPE, [line], [anchor(1, pos)], STRAIGHT), pos)
+    b = Geometry(Region(SHAPE, [line], [anchor(1, pos)], "polyline"), pos)
+    on_line = {line[0].track_id, line[1].track_id}
+    assert a.inside_sets()[0] - on_line == b.inside_sets()[0] - on_line
+    ma, mb = a.keep_mask(0), b.keep_mask(0)
+    assert (ma != mb).mean() < 0.01  # same area up to pixels on the line itself
+    assert reg
+
+
+def test_inside_ids_equals_inside_sets_and_masks_are_cached():
+    pos = grid_positions(n_frames=4, drift=(2.0, 1.0))
+    geom = straight([[pick(i, pos) for i in row_cells(2)]], [anchor(1, pos)], pos, (200, 200))
+    sets = geom.inside_sets()
+    assert all(geom.inside_ids(f) == sets[f] for f in range(4))
+    m = geom.keep_mask(2)
+    assert geom.keep_mask(2) is m  # second call comes from the cache
+    expect = np.isin(geom.signature_image(2), sorted(geom.kept))
+    assert (m == expect).all()
+
+
+def test_line_mode_roundtrip_and_old_regions_stay_polylines(tmp_path):
+    pos = grid_positions()
+    line = [pick(i, pos) for i in row_cells(2)]
+    old = Region(SHAPE, [line], [anchor(1, pos)])  # default: polyline
+    new = Region(SHAPE, [line], [anchor(1, pos)], STRAIGHT)
+    assert old.line_mode == "polyline" and Region.load(new.save(tmp_path / "r.json")).line_mode == STRAIGHT
+    legacy = old.to_json()
+    legacy.pop("line_mode")
+    assert Region.from_json(legacy).line_mode == "polyline"  # a file written before the option existed
+    assert region_hash(old) != region_hash(new) != ""
+
+
+def test_positions_from_stack_with_uint64_and_empty_frames():
+    stack = np.zeros((3, 20, 20), np.uint64)
+    stack[0, 2:6, 2:6] = 7
+    stack[2, 10:14, 4:8] = 9
+    pos = positions_from_stack(stack)
+    assert pos[0] == {7: (3.5, 3.5)} and pos[1] == {} and pos[2] == {9: (11.5, 5.5)}
+
+
+def test_clicked_boundary_cells_are_not_analysed():
+    pos = grid_positions()
+    for mode in (STRAIGHT, "polyline"):
+        geom = Geometry(Region(SHAPE, [[pick(i, pos) for i in row_cells(2)]], [anchor(1, pos)], mode), pos)
+        ins = geom.inside_sets()[0]
+        assert not (ins & set(row_cells(2)))  # the line's own cells are left out
+        assert {10 * r + c + 1 for r in (0, 1) for c in range(6)} <= ins  # the cells above stay in
+
+
+def test_daughters_of_a_boundary_cell_are_left_out_too():
+    pos = grid_positions(n_frames=3)
+    mother = row_cells(2)[2]
+    for f in (1, 2):
+        y, x = pos[f].pop(mother)
+        pos[f][901], pos[f][902] = (y, x - 3), (y, x + 3)
+    geom = Geometry(Region(SHAPE, [[pick(i, pos) for i in row_cells(2)]], [anchor(1, pos)], STRAIGHT), pos,
+                    parents={901: mother, 902: mother})
+    assert not ({901, 902} & geom.inside_ids(2)) and not ({901, 902} & geom.inside_ids(1))

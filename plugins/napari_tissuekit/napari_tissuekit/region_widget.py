@@ -1,7 +1,8 @@
 """Analysis cropping tab: choose which part of the embryo counts for T1 detection and cell properties.
 
 Needs finished tracking (picks are track IDs). The user clicks cells that form a boundary line (any frame; the line is
-redrawn through the same cells in every frame, so it moves with the tissue), adds more lines if needed, then clicks a
+redrawn through the same cells in every frame, so it moves with the tissue; by default it is the straight best-fit
+line through them), adds more lines if needed, then clicks a
 cell in each area to keep (or to disregard). The geometry lives in `core/region.py`; this file is only the napari/Qt
 side: pick handling, preview layers, saving to `<results>/analysis_region/region.json`.
 """
@@ -14,6 +15,7 @@ import numpy as np
 from napari.layers import Labels
 from qtpy.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -27,7 +29,7 @@ from qtpy.QtWidgets import (
 
 from .core.project import LEGACY_RUN
 from .core.region import (
-    REGION_FILE, TRACKING_REQUIRED, Anchor, Geometry, Pick, Region, cell_position, has_tracking, keep_stack,
+    POLYLINE, REGION_FILE, STRAIGHT, TRACKING_REQUIRED, Anchor, Geometry, Pick, Region, cell_position, has_tracking, keep_stack,
     parents_from_lineage, positions_from_stack, region_hash,
 )
 
@@ -57,6 +59,9 @@ class AnalysisRegionWidget(QWidget):
         self._pos_cache: tuple | None = None
         self._tracking_ok = False
         self._busy = False
+        self._drawn_key = None  # what the preview layers show now: (frame, geometry, anchors); skip identical redraws
+        self._area_cache: tuple | None = None  # (geometry, {frame: RGBA image}) of the area preview
+        self.line_mode = STRAIGHT  # mode of the region on screen; a loaded old region keeps "polyline"
 
         self.notice = QLabel(TRACKING_REQUIRED)
         self.notice.setWordWrap(True)
@@ -70,12 +75,21 @@ class AnalysisRegionWidget(QWidget):
         self.new_line_btn.setCheckable(True)
         self.new_line_btn.setToolTip(
             "Click the cells that mark the boundary, on any frame (two or more, in a row). The line is drawn through "
-            "them and stays on the same cells in every frame. Click a picked cell again to remove it."
+            "them (the best-fit straight line, or through every cell with 'Straight lines' off) and stays on the same "
+            "cells in every frame. The picked cells are the boundary and are not analysed. Click a picked cell again to "
+            "remove it."
         )
         self.add_cells_btn = QPushButton("Add cells to selected line")
         self.add_cells_btn.setCheckable(True)
         self.undo_btn = QPushButton("Undo last cell")
         self.delete_line_btn = QPushButton("Delete line")
+        self.straight_box = QCheckBox("Straight lines (best fit)")
+        self.straight_box.setChecked(True)
+        self.straight_box.setToolTip(
+            "On: each boundary line is the straight line that fits its cells best (refitted in every frame, so it "
+            "follows the tissue). Use one line that runs roughly horizontally and one roughly vertically to cut the "
+            "embryo into corners. Off: the line bends through every picked cell."
+        )
         self.line_list = QListWidget()
         self.line_list.setMaximumHeight(90)
         l1 = QVBoxLayout()
@@ -87,6 +101,7 @@ class AnalysisRegionWidget(QWidget):
         r.addWidget(self.undo_btn)
         r.addWidget(self.delete_line_btn)
         l1.addLayout(r)
+        l1.addWidget(self.straight_box)
         l1.addWidget(self.line_list)
         box1 = QGroupBox("1 · Boundary lines")
         box1.setLayout(l1)
@@ -163,6 +178,7 @@ class AnalysisRegionWidget(QWidget):
         self.load_btn.clicked.connect(self.load)
         self.clear_btn.clicked.connect(self.clear)
         self.line_list.currentRowChanged.connect(self._line_selected)
+        self.straight_box.toggled.connect(self._straight_toggled)
         self.viewer.mouse_drag_callbacks.append(self._on_click)
         self.viewer.dims.events.current_step.connect(self._draw)
         self.viewer.layers.events.inserted.connect(self.refresh_gate)
@@ -293,6 +309,11 @@ class AnalysisRegionWidget(QWidget):
             self._set_mode(None)
             self._changed()
 
+    def _straight_toggled(self, on: bool) -> None:
+        self.line_mode = STRAIGHT if on else POLYLINE
+        if self.lines:
+            self._changed()
+
     def _remove_anchor(self) -> None:
         row = self.anchor_list.currentRow()
         if 0 <= row < len(self.anchors):
@@ -305,7 +326,7 @@ class AnalysisRegionWidget(QWidget):
         if stack is None:
             return None
         lines = [list(line) for line in self.lines if len({p.track_id for p in line}) >= 2]
-        return Region(tuple(stack.shape[-2:]), lines, list(self.anchors))
+        return Region(tuple(stack.shape[-2:]), lines, list(self.anchors), self.line_mode)
 
     def _positions(self):
         stack = self._stack()
@@ -348,10 +369,10 @@ class AnalysisRegionWidget(QWidget):
     def _changed(self) -> None:
         self._rebuild()
         self._refresh_lists()
-        self._draw()
+        self._draw(force=True)
         n_in = None
         if self.geom is not None and self.anchors:
-            n_in = len(self.geom.inside_sets()[self._frame()])
+            n_in = len(self.geom.inside_ids(self._frame()))
         msg = f"{len(self.lines)} line(s), {len(self.anchors)} area click(s)."
         if n_in is not None:
             msg += f" Cells inside on this frame: {n_in}."
@@ -388,12 +409,18 @@ class AnalysisRegionWidget(QWidget):
         n = len(self.geom.pos) if self.geom is not None else 1
         return int(np.clip(round(float(self.viewer.dims.point[0])), 0, n - 1))
 
-    def _draw(self, *_) -> None:
+    def _draw(self, *_, force: bool = False) -> None:
         if self._busy or not self._tracking_ok:
+            return
+        # the dims event also fires for other axes / the same frame again: nothing to redraw then
+        key = (self._frame(), id(self.geom), self.active_line, len(self.anchors),
+               tuple(a.track_id for a in self.anchors), len(self.viewer.layers))
+        if not force and key == self._drawn_key:
             return
         self._busy = True
         try:
             self._draw_inner()
+            self._drawn_key = key
         finally:
             self._busy = False
 
@@ -471,11 +498,19 @@ class AnalysisRegionWidget(QWidget):
             if layer is not None:
                 layer.visible = False
             return
-        keep = self.geom.keep_mask(frame)
-        img = np.zeros((*keep.shape, 4), np.uint8)
-        img[~keep] = (0, 0, 0, 120)
-        edge = ndi.binary_dilation(find_boundaries(keep, mode="inner"), iterations=1)
-        img[edge] = (255, 255, 0, 255)
+        if self._area_cache is None or self._area_cache[0] is not self.geom:
+            self._area_cache = (self.geom, {})
+        images = self._area_cache[1]
+        img = images.get(frame)
+        if img is None:  # scrubbing back and forth reuses the images already made for this geometry
+            keep = self.geom.keep_mask(frame)
+            img = np.zeros((*keep.shape, 4), np.uint8)
+            img[~keep] = (0, 0, 0, 120)
+            edge = ndi.binary_dilation(find_boundaries(keep, mode="inner"), iterations=1)
+            img[edge] = (255, 255, 0, 255)
+            if len(images) >= 12:
+                images.pop(next(iter(images)))
+            images[frame] = img
         if layer is None:
             active = self.viewer.layers.selection.active
             layer = self.viewer.add_image(img, rgb=True, name=AREA_LAYER, scale=scale, translate=translate)
@@ -529,6 +564,7 @@ class AnalysisRegionWidget(QWidget):
         self._set_mode(None)
         self.geom = None
         self._pos_cache = None
+        self._drawn_key, self._area_cache = None, None
         for name in (LINES_LAYER, CELLS_LAYER, AREA_LAYER):
             layer = self._layer(name)
             if layer is not None:
@@ -555,7 +591,7 @@ class AnalysisRegionWidget(QWidget):
             return
         import tifffile
 
-        self.invalidate()
+        self._rebuild()  # cell positions stay cached (the cache key notices changed labels)
         geom = self.geometry()
         geom.region.save(folder / REGION_FILE)
         tifffile.imwrite(folder / "analysis_region_mask.tif", keep_stack(geom), compression="zlib")
@@ -563,7 +599,7 @@ class AnalysisRegionWidget(QWidget):
         if project is not None:
             project.write_settings("analysis_region", {"hash": region_hash(geom.region), "lines": len(geom.region.lines),
                                                        "areas": len(geom.region.anchors)})
-        n_in = len(geom.inside_sets()[0])
+        n_in = len(geom.inside_ids(0))
         self.status.setText(f"Saved the region ({n_in} of {len(geom.pos[0])} cells inside in frame 1) → {folder}")
         self._notify()
 
@@ -578,6 +614,10 @@ class AnalysisRegionWidget(QWidget):
             return
         region = Region.load(path)
         self.lines, self.anchors = [list(line) for line in region.lines], list(region.anchors)
+        self.line_mode = region.line_mode  # an old saved region keeps its polylines until the box is ticked again
+        self.straight_box.blockSignals(True)
+        self.straight_box.setChecked(region.line_mode == STRAIGHT)
+        self.straight_box.blockSignals(False)
         self.active_line = None
         self._set_mode(None)
         self._changed()

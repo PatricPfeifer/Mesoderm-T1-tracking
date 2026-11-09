@@ -1,15 +1,18 @@
 """Analysis region: keep part of the embryo for T1 detection and cell properties.
 
 The user picks cells that form a boundary *line* (on any frame). Every picked cell is a track ID, so the line can be
-redrawn in every frame through the cells' centroids of that frame: it moves with the tissue. A line is a polyline
-through the cells (ordered once along the line), extended straight to the image border at both ends. Each line splits
+redrawn in every frame through the cells' centroids of that frame: it moves with the tissue. A line is, by default
+(`line_mode == "straight"`), the straight best-fit line (least squares, refitted in every frame) through the cells,
+running to the image border at both ends; old saved regions use `line_mode == "polyline"`: a polyline through the
+cells (ordered once along the line), extended straight to the image border at both ends. Each line splits
 the frame into two sides; with several lines a cell or pixel has one *signature* (one side per line). The user then
 clicks cells in the areas to keep (or to disregard); their signatures define the kept area:
 
     kept = signatures of the "keep" clicks minus those of the "drop" clicks
            (no "keep" click at all: every signature except the "drop" ones)
 
-A cell counts as inside in a frame when its centroid in that frame has a kept signature. Nothing is cut from the
+A cell counts as inside in a frame when its centroid in that frame has a kept signature. The cells that were clicked
+to form a boundary line (and their daughters after a division) are the boundary itself and never count as inside. Nothing is cut from the
 images or labels: T1 events and cell properties just use the cells inside, and exported tiffs show the kept area as a
 yellow outline with the rest dimmed (`burn_region`).
 
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +31,8 @@ import numpy as np
 YELLOW = (255, 255, 0)
 TRACKING_REQUIRED = "Tracking is required before analysis cropping. Run the Tracking tab first."
 REGION_FILE = "region.json"
+STRAIGHT, POLYLINE = "straight", "polyline"
+MASK_CACHE_BYTES = 256_000_000  # keep-mask cache of one Geometry (frames re-used by preview, save and burn-in)
 
 Positions = list  # per frame: {track_id: (y, x)}
 
@@ -39,15 +45,22 @@ def has_tracking(stack) -> bool:
 
 def positions_from_stack(stack: np.ndarray) -> Positions:
     """Centroid (y, x) of every track ID in every frame of a tracked label stack."""
+    stack = np.asarray(stack)
+    h, w = stack.shape[-2:]
+    yy = np.repeat(np.arange(h, dtype=np.float64), w)  # flat y and x of every pixel, made once
+    xx = np.tile(np.arange(w, dtype=np.float64), h)
     out: Positions = []
-    for frame in np.asarray(stack):
-        ys, xs = np.nonzero(frame)
-        if not len(ys):
+    for frame in stack:
+        flat = frame.reshape(-1)
+        nz = flat > 0
+        if not nz.any():
             out.append({})
             continue
-        ids, inv = np.unique(frame[ys, xs], return_inverse=True)
-        n = np.bincount(inv)
-        cy, cx = np.bincount(inv, weights=ys) / n, np.bincount(inv, weights=xs) / n
+        lab = flat[nz].astype(np.intp, copy=False)
+        n = np.bincount(lab)
+        ids = np.flatnonzero(n)
+        cy = np.bincount(lab, weights=yy[nz])[ids] / n[ids]
+        cx = np.bincount(lab, weights=xx[nz])[ids] / n[ids]
         out.append({int(i): (float(y), float(x)) for i, y, x in zip(ids, cy, cx)})
     return out
 
@@ -123,6 +136,7 @@ class Region:
     shape: tuple  # (height, width) of the frames
     lines: list = field(default_factory=list)  # list of list[Pick]
     anchors: list = field(default_factory=list)  # list[Anchor]
+    line_mode: str = POLYLINE  # "straight": best-fit straight lines; "polyline": through every picked cell (old regions)
 
     @property
     def active(self) -> bool:
@@ -131,6 +145,7 @@ class Region:
     def to_json(self) -> dict:
         return {
             "version": 1,
+            "line_mode": self.line_mode,
             "shape": [int(self.shape[0]), int(self.shape[1])],
             "lines": [[vars(p) | {} for p in line] for line in self.lines],
             "anchors": [vars(a) | {} for a in self.anchors],
@@ -142,7 +157,7 @@ class Region:
                  for line in d.get("lines", [])]
         anchors = [Anchor(int(a["track_id"]), int(a["frame"]), float(a["y"]), float(a["x"]), str(a.get("mode", "keep")))
                    for a in d.get("anchors", [])]
-        return cls(tuple(d["shape"]), lines, anchors)
+        return cls(tuple(d["shape"]), lines, anchors, str(d.get("line_mode", POLYLINE)))
 
     def save(self, path) -> Path:
         path = Path(path)
@@ -161,6 +176,8 @@ def region_hash(region: Region | None) -> str:
         return ""
     key = {"lines": [sorted({p.track_id for p in line}) for line in region.lines],
            "anchors": sorted((a.track_id, a.mode) for a in region.anchors)}
+    if region.line_mode == STRAIGHT:  # only added here, so the ids of old (polyline) regions stay the same
+        key["line_mode"] = STRAIGHT
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:10]
 
 
@@ -237,6 +254,24 @@ def side_polygon(poly: np.ndarray, shape) -> np.ndarray:
     return np.vstack([poly] + [np.asarray(xy, float)[None] for _, xy in between])
 
 
+def fit_line(points_xy: np.ndarray):
+    """Straight best-fit line (total least squares) through points (x, y): (centre, unit direction), or None when
+    fewer than two different points are given. The sign of the direction is arbitrary."""
+    pts = np.asarray(points_xy, float)
+    if len(pts) < 2 or len(np.unique(pts.round(6), axis=0)) < 2:
+        return None
+    c = pts.mean(axis=0)
+    d = np.linalg.svd(pts - c, full_matrices=False)[2][0]
+    return c, d / np.hypot(*d)
+
+
+def straight_segment(centre: np.ndarray, direction: np.ndarray, shape) -> np.ndarray:
+    """The line through `centre` along `direction` cut at the image border: 2 points (x, y), start -> end."""
+    h, w = shape
+    c = np.clip(np.asarray(centre, float), [0, 0], [w, h])
+    return np.vstack([_ray_to_border(c, -direction, w, h), _ray_to_border(c, direction, w, h)])
+
+
 class Geometry:
     """Boundary lines of one region over all frames of one movie."""
 
@@ -246,13 +281,23 @@ class Geometry:
         self.children = _children(self.parents)
         self.shape = tuple(region.shape)
         self.n_frames = len(positions)
+        self.straight = region.line_mode == STRAIGHT
         self.orders = [_order_line(line, positions, self.parents, self.children) for line in region.lines]
+        self._pd: list = []  # straight mode: per line, per frame (centre, direction) of the fitted line
         self.polys = [self._line_over_time(order) for order in self.orders]
         self.n_sigs = 2 ** len(region.lines)
         self.kept = self._kept_signatures()
+        self.boundary_cells = self._boundary_cells()
+        self._lut = np.zeros(self.n_sigs, dtype=bool)
+        self._lut[sorted(self.kept)] = True
+        self._grid = None
+        self._masks: OrderedDict = OrderedDict()
+        self._mask_bytes = 0
 
     # -- lines ---------------------------------------------------------------------------------------------------
     def _line_over_time(self, order) -> list:
+        if self.straight:
+            return self._straight_over_time(order)
         raw = []
         for f in range(self.n_frames):
             pts = [cell_position(self.pos, self.parents, self.children, t, f) for t in order]
@@ -264,17 +309,47 @@ class Geometry:
             raise ValueError("a boundary line has fewer than two cells in every frame")
         return [raw[min(ok, key=lambda g: abs(g - f))] if raw[f] is None else raw[f] for f in range(self.n_frames)]
 
+    def _straight_over_time(self, order) -> list:
+        """One best-fit straight line per frame through the line's cells; it moves and tilts with the tissue."""
+        fits, prev = [], None
+        for f in range(self.n_frames):
+            pts = [cell_position(self.pos, self.parents, self.children, t, f) for t in order]
+            pts = [(x, y) for (y, x) in (p for p in pts if p is not None)]
+            fit = fit_line(np.asarray(pts, float)) if len(pts) >= 2 else None
+            if fit is not None:
+                c, d = fit
+                # keep the same direction in every frame (so side 0 stays side 0): first frame along the order of the
+                # cells (first -> last cell), later frames like the previous frame
+                ref = prev if prev is not None else np.asarray(pts[-1], float) - np.asarray(pts[0], float)
+                if d @ ref < 0:
+                    d = -d
+                prev = d
+                fit = (c, d)
+            fits.append(fit)
+        ok = [f for f, r in enumerate(fits) if r is not None]
+        if not ok:
+            raise ValueError("a boundary line has fewer than two cells in every frame")
+        fits = [fits[min(ok, key=lambda g: abs(g - f))] if fits[f] is None else fits[f] for f in range(self.n_frames)]
+        self._pd.append(fits)
+        return [straight_segment(c, d, self.shape) for c, d in fits]
+
     def line_polyline(self, line_index: int, frame: int) -> np.ndarray:
-        """Extended polyline (x, y) of one boundary line in one frame."""
+        """Polyline (x, y) of one boundary line in one frame (straight mode: its two end points at the image border)."""
         return self.polys[line_index][frame]
 
     # -- signatures ----------------------------------------------------------------------------------------------
     def signature_points(self, frame: int, pts_yx: np.ndarray) -> np.ndarray:
         """Signature (bit i = side of line i) of points (y, x) in a frame."""
-        from skimage.measure import points_in_poly
-
         pts_yx = np.atleast_2d(np.asarray(pts_yx, float))
         sig = np.zeros(len(pts_yx), dtype=np.int64)
+        if self.straight:
+            for i, fits in enumerate(self._pd):
+                (cx, cy), (dx, dy) = fits[frame]
+                cross = dx * (pts_yx[:, 0] - cy) - dy * (pts_yx[:, 1] - cx)
+                sig |= (cross > 0).astype(np.int64) << i
+            return sig
+        from skimage.measure import points_in_poly
+
         xy = pts_yx[:, ::-1]
         for i, polys in enumerate(self.polys):
             poly = side_polygon(polys[frame], self.shape)
@@ -283,9 +358,18 @@ class Geometry:
         return sig
 
     def signature_image(self, frame: int) -> np.ndarray:
+        sig = np.zeros(self.shape, dtype=np.int16)
+        if self.straight:
+            if self._grid is None:
+                self._grid = (np.arange(self.shape[0], dtype=np.float64)[:, None],
+                              np.arange(self.shape[1], dtype=np.float64)[None, :])
+            yy, xx = self._grid
+            for i, fits in enumerate(self._pd):
+                (cx, cy), (dx, dy) = fits[frame]
+                sig |= (dx * (yy - cy) - dy * (xx - cx) > 0).astype(np.int16) << i
+            return sig
         from skimage.draw import polygon2mask
 
-        sig = np.zeros(self.shape, dtype=np.int16)
         for i, polys in enumerate(self.polys):
             poly = side_polygon(polys[frame], self.shape)
             side0 = polygon2mask(self.shape, poly[:, ::-1])
@@ -302,22 +386,42 @@ class Geometry:
         base = keep if keep else set(range(self.n_sigs))
         return base - drop
 
+    def _boundary_cells(self) -> frozenset:
+        """Track IDs clicked for a boundary line, plus the daughters that continue them after a division."""
+        out, todo = set(), [p.track_id for line in self.region.lines for p in line]
+        while todo:
+            t = todo.pop()
+            if t not in out:
+                out.add(t)
+                todo.extend(self.children.get(t, ()))
+        return frozenset(out)
+
     # -- what is inside ------------------------------------------------------------------------------------------
     def keep_mask(self, frame: int) -> np.ndarray:
-        """(Y, X) bool: True where the frame belongs to the kept area."""
-        return np.isin(self.signature_image(frame), sorted(self.kept))
+        """(Y, X) bool: True where the frame belongs to the kept area. Cached per frame: do not modify the result."""
+        hit = self._masks.get(frame)
+        if hit is not None:
+            self._masks.move_to_end(frame)
+            return hit
+        mask = self._lut[self.signature_image(frame)]
+        self._masks[frame] = mask
+        self._mask_bytes += mask.nbytes
+        while self._mask_bytes > MASK_CACHE_BYTES and len(self._masks) > 1:
+            _, old = self._masks.popitem(last=False)
+            self._mask_bytes -= old.nbytes
+        return mask
+
+    def inside_ids(self, frame: int) -> set:
+        """Track IDs whose centroid is in the kept area in one frame (the boundary cells themselves are left out)."""
+        ids = list(self.pos[frame])
+        if not ids:
+            return set()
+        sig = self.signature_points(frame, np.array([self.pos[frame][i] for i in ids]))
+        return {i for i, s in zip(ids, sig) if int(s) in self.kept and i not in self.boundary_cells}
 
     def inside_sets(self) -> list:
         """Per frame: set of track IDs whose centroid is in the kept area."""
-        out = []
-        for f in range(self.n_frames):
-            ids = list(self.pos[f])
-            if not ids:
-                out.append(set())
-                continue
-            sig = self.signature_points(f, np.array([self.pos[f][i] for i in ids]))
-            out.append({i for i, s in zip(ids, sig) if int(s) in self.kept})
-        return out
+        return [self.inside_ids(f) for f in range(self.n_frames)]
 
 
 def event_inside(event: dict, inside: list) -> bool:
@@ -332,11 +436,13 @@ def event_inside(event: dict, inside: list) -> bool:
 def burn_frame(rgb: np.ndarray, keep: np.ndarray, dim: float = 0.45, width: int = 3) -> np.ndarray:
     """One RGB frame (Y,X,3 uint8) with the area outside `keep` dimmed and the kept area outlined in yellow (new array)."""
     from scipy import ndimage as ndi
-    from skimage.segmentation import find_boundaries
 
     out = np.array(rgb, copy=True)
-    out[~keep] = (out[~keep].astype(np.float32) * dim).astype(out.dtype)
-    edge = find_boundaries(keep, mode="inner")
+    if out.dtype == np.uint8:  # dim through a 256-entry table, only where the frame is left out
+        np.copyto(out, (np.arange(256) * dim).astype(np.uint8)[out], where=~keep[..., None])
+    else:
+        out[~keep] = (out[~keep].astype(np.float32) * dim).astype(out.dtype)
+    edge = keep & ~ndi.binary_erosion(keep, border_value=1)  # inner boundary (same pixels as find_boundaries "inner")
     if width > 1:
         edge = ndi.binary_dilation(edge, iterations=max(1, width // 2))
     out[edge] = YELLOW

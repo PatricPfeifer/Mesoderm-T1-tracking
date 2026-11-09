@@ -39,7 +39,6 @@ from qtpy.QtWidgets import (
     QShortcut,
     QSizePolicy,
     QSpinBox,
-    QTabWidget,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -51,6 +50,7 @@ from .region_widget import AnalysisRegionWidget
 from .core.cell_size import MIN_CELL_AREA
 from .core.project import PER_RUN_STEPS, WorkingFolder, find_results_root, movie_stem
 from .core.region import TRACKING_REQUIRED, burn_region
+from .wrapped_tabs import WrappedTabs
 from .remote_widget import RemoteRunner
 from .track_edit import (
     CellUndo,
@@ -162,7 +162,7 @@ HELP_HTML = """
 <h3>Analysis cropping tab</h3>
 <p>Restrict T1 detection and cell properties to part of the embryo. <b>Needs finished tracking</b> (it warns otherwise).</p>
 <ul>
-<li><b>New line: click its cells</b>: click the cells that mark a boundary, on any frame (two or more, in a row). The line goes through them and follows the same cells in every frame. Add a second (or third) line the same way; <b>Add cells to selected line</b>, <b>Undo last cell</b> and <b>Delete line</b> correct it.</li>
+<li><b>New line: click its cells</b>: click the cells that mark a boundary, on any frame (two or more, in a row). With <b>Straight lines (best fit)</b> ticked (default) the line is the straight line that fits the cells best, refitted in every frame so it follows the tissue (use one roughly horizontal and one roughly vertical line to cut out a corner); unticked, it bends through every cell. The cells you click for a line are the boundary itself and are <b>not analysed</b>. Add a second (or third) line the same way; <b>Add cells to selected line</b>, <b>Undo last cell</b> and <b>Delete line</b> correct it.</li>
 <li><b>Area to use</b>: choose <i>Keep this area</i> or <i>Disregard this area</i>, press <b>Click a cell in an area</b> and click one cell in each area. Without a 'keep' click, everything except the disregarded areas is used.</li>
 <li><b>Save region</b> writes <code>analysis_region/region.json</code>. T1 (checkbox <i>Only cells inside the analysis region</i>) and Export Cell Props then use only cells inside; exported tracked RGB / T1 tiffs show the kept area as a <b>yellow outline</b> with the rest dimmed. Segmentation and tracking are not changed.</li>
 <li>If T1 or cell props were run before the region was set or changed, the plugin says so: <b>run T1 and Export Cell Props again</b>.</li>
@@ -291,7 +291,7 @@ class TissueKitWidget(QWidget):
         self._remote_log_dialog = None
         self._batch_job_items: list[dict] | None = None  # items of the batch job being watched
 
-        tabs = QTabWidget()
+        tabs = WrappedTabs()  # buttons that wrap onto several rows: every tab name is always shown in full
         tabs.addTab(self._scrollable(self._segmentation_tab()), "Segmentation")
         tabs.addTab(self._scrollable(self._tracking_tab()), "Tracking")
         self.region_tab = AnalysisRegionWidget(self.viewer)
