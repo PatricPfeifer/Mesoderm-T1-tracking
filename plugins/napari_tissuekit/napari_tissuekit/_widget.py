@@ -65,7 +65,7 @@ from .track_edit import (
 
 
 class _Job(QObject):
-    progress = Signal(int, str)
+    progress = Signal(int, str, int)  # overall percent, step name, percent of the step (-1: no step bar)
     finished = Signal(object)
     failed = Signal(str)
 
@@ -75,7 +75,7 @@ class _Job(QObject):
 
     def run(self) -> None:
         try:
-            self.finished.emit(self._fn(self.progress.emit))
+            self.finished.emit(self._fn(lambda percent, message, step=-1: self.progress.emit(int(percent), str(message), int(step))))
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -326,12 +326,22 @@ class TissueKitWidget(QWidget):
         version.setToolTip("napari-tissuekit version")
         version.setStyleSheet("color: gray; padding: 0 6px;")
         tabs.setCornerWidget(version, Qt.TopRightCorner)
+        self.overall_bar = QProgressBar()  # whole job
+        self.overall_bar.setRange(0, 100)
+        self.overall_bar.setFormat("Overall  %p%")
+        self.step_bar = QProgressBar()  # the step the job is in now (T1: classifying quartets, ...)
+        self.step_bar.setRange(0, 100)
+        for bar in (self.overall_bar, self.step_bar):
+            bar.setTextVisible(True)
+            bar.setVisible(False)
         self.status = QLabel("Ready")
         self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         layout = QVBoxLayout()
         layout.addLayout(self._folder_bar())
         layout.addWidget(tabs)
+        layout.addWidget(self.overall_bar)
+        layout.addWidget(self.step_bar)
         layout.addWidget(self.status)
         self.setLayout(layout)
         self._apply_section_style()
@@ -467,8 +477,14 @@ class TissueKitWidget(QWidget):
         self._thread.finished.connect(self._clear_job)
         self._thread.start()
 
-    def _on_progress(self, percent: int, message: str) -> None:
+    def _on_progress(self, percent: int, message: str, step: int = -1) -> None:
         self.status.setText(f"{percent}% {message}")
+        self.overall_bar.setVisible(True)
+        self.overall_bar.setValue(max(0, min(100, percent)))
+        self.step_bar.setVisible(step >= 0)
+        if step >= 0:
+            self.step_bar.setValue(min(100, step))
+            self.step_bar.setFormat(f"{message}  %p%")
 
     def _on_failed(self, text: str) -> None:
         self._last_job_error = text.strip().splitlines()[-1]
@@ -481,6 +497,12 @@ class TissueKitWidget(QWidget):
         self._job = None
 
     def _set_busy(self, busy: bool) -> None:
+        if busy:
+            self.overall_bar.setValue(0)
+            self.step_bar.setVisible(False)
+        self.overall_bar.setVisible(busy)
+        if not busy:
+            self.step_bar.setVisible(False)
         for button in (self.seg_run, self.track_run, self.t1_run, self.track_save):
             button.setEnabled(not busy)
 

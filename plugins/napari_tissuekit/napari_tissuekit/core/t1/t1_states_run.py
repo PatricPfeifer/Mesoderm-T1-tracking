@@ -281,9 +281,11 @@ def _classify_worker(i: int):
 
 def classify_movie(md: MovieData, p: StateParams, division_frames: dict[int, list[int]] | None = None,
                    cand: dict | None = None, orientation: bool = True, complex_pair_min: float | None = None,
-                   apply_rules: bool = True, side_rule: bool = False, vertex_clause: bool = False, workers: int | None = None) -> pd.DataFrame:
+                   apply_rules: bool = True, side_rule: bool = False, vertex_clause: bool = False, workers: int | None = None,
+                   on_progress=None) -> pd.DataFrame:
     """One row per event of every candidate quartet. Classes: clean, flicker_resolved, flicker_aborted,
-    abortive_shrink, unresolved, complex (complex has priority, then unresolved, see t1_states.py)."""
+    abortive_shrink, unresolved, complex (complex has priority, then unresolved, see t1_states.py).
+    `on_progress(done, total)` (optional) is called while the quartets are classified."""
     cand = candidate_quartets(md, p.l_on, p.l_off) if cand is None else cand
     division_frames = division_frames or {}
     cache = {}
@@ -380,21 +382,32 @@ def classify_movie(md: MovieData, p: StateParams, division_frames: dict[int, lis
     items = sorted(cand.items(), key=lambda kv: sorted(sorted(x) for x in kv[0]))
     rows, dropped = [], []
     n_workers = default_workers(len(items), workers)
+    total, last = len(items), -1
+
+    def tick(done: int) -> None:  # report at most once per percent
+        nonlocal last
+        if on_progress is not None and (done * 100 // max(total, 1) != last or done == total):
+            last = done * 100 // max(total, 1)
+            on_progress(done, total)
+
+    tick(0)
     if n_workers > 1 and "fork" in mp.get_all_start_methods():
         # plain-Python work per quartet: separate processes (forked, so md is shared); results come back in quartet order
         _CLS["one"], _CLS["items"] = one, items
         try:
             with cf.ProcessPoolExecutor(n_workers, mp_context=mp.get_context("fork")) as pool:
-                for r, d in pool.map(_classify_worker, range(len(items)), chunksize=16):
+                for k, (r, d) in enumerate(pool.map(_classify_worker, range(len(items)), chunksize=16), 1):
                     rows += r
                     dropped += d
+                    tick(k)
         finally:
             _CLS.clear()
     else:
-        for item in items:
+        for k, item in enumerate(items, 1):
             r, d = one(item)
             rows += r
             dropped += d
+            tick(k)
     df = pd.DataFrame(rows)
     df = df.sort_values(["frame_start", "A", "B", "C", "D"]).reset_index(drop=True) if len(df) else df
     df.attrs["dropped"] = pd.DataFrame(dropped)
@@ -410,12 +423,12 @@ def definition_params(dt_s: float, um_per_px: float, definition: dict | None = N
 
 
 def classify_with_definition(md: MovieData, division_frames=None, definition: dict | None = None, orientation: bool = True,
-                             cand: dict | None = None, workers: int | None = None) -> pd.DataFrame:
+                             cand: dict | None = None, workers: int | None = None, on_progress=None) -> pd.DataFrame:
     """classify_movie with the committed definition: hysteresis thresholds in pixels, group rule, side rule, true-vertex clause."""
     d = {**DEFINITION, **(definition or {})}
     p = definition_params(md.dt_s, md.um_per_px, d)
     return classify_movie(md, p, division_frames, cand, orientation=orientation, side_rule=bool(d["side_rule"]), vertex_clause=bool(d["vertex_clause"]),
-                         workers=workers)
+                         workers=workers, on_progress=on_progress)
 
 
 _JL: dict = {}   # labels / expand handed to the forked worker processes of junction_length_traces
@@ -536,12 +549,31 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
     from .run_tm_t1 import grayscale_rgb, labels_gray_rgb, render_fourway_dots, render_overlay
     d = {**DEFINITION, **(definition or {})}
     n = int(stack.shape[0])
-    if progress is not None:
-        progress(5, "Measuring contacts")
+    # progress(overall %, step name, step %): overall 0-10 contacts, 10-80 classifying, 80-100 overlay and results
+    def report(pct, name, step=-1):
+        if progress is not None:
+            progress(int(pct), name, int(step))
+
+    report(1, "Measuring contacts", 0)
     md = build_movie_data(np.asarray(stack), float(um_per_px), float(dt_s), "plugin", int(d["expand"]))
-    if progress is not None:
-        progress(50, "Classifying events")
-    df = classify_with_definition(md, division_frames, d, workers=1)  # serial: the plugin runs this in a Qt worker thread (no forking there)
+    report(10, "Finding candidate quartets", 100)
+    cand, n_skipped = None, 0
+    if inside is not None:
+        # a counted event needs all four cells inside at one frame: a quartet with a cell that is never inside cannot
+        # be counted, so it is not classified at all (same events as filtering afterwards, much less work)
+        ever = set().union(*inside) if inside else set()
+        p = definition_params(md.dt_s, md.um_per_px, d)
+        cand_all = candidate_quartets(md, p.l_on, p.l_off)
+        cand = {k: v for k, v in cand_all.items() if set().union(*[set(x) for x in k]) <= ever}
+        n_skipped = len(cand_all) - len(cand)
+
+    def on_quartets(done, total):
+        report(10 + 70 * done / max(total, 1), f"Classifying events ({done}/{total} quartets)", 100 * done / max(total, 1))
+
+    report(10, "Classifying events", 0)
+    df = classify_with_definition(md, division_frames, d, cand=cand, workers=1,  # serial: the plugin runs this in a Qt worker thread (no forking there)
+                                  on_progress=on_quartets)
+    report(80, "Collecting events", 0)
     dropped = df.attrs.get("dropped", pd.DataFrame())
     exclude_ids = exclude_ids or set()
     events, four_xy = [], [dict() for _ in range(n)]
@@ -565,6 +597,7 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
             if ok:
                 four_xy[t][quartet] = (float(np.nanmean(md.cy[t, ok])), float(np.nanmean(md.cx[t, ok])))
         events.append(r)
+    report(85, "Drawing the overlay", 0)
     labels_list = [stack[t] for t in range(n)]
     if rgb is not None:
         overlay_base = grayscale_rgb(rgb)
@@ -574,15 +607,16 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
         for t in range(n):
             overlay_base[t] = labels_gray_rgb(stack[t], max_lab)
     overlay = render_overlay(overlay_base, labels_list, events, four_xy, pre=pre, post=post, reach=int(d["expand"]))
+    report(95, "Drawing the overlay", 70)
     dots = render_fourway_dots(stack, events, four_xy, rgb=rgb)
     classes = pd.Series([e["t1_class"] for e in events]).value_counts().to_dict()
     reasons = dropped["drop_reason"].value_counts().to_dict() if len(dropped) else {}
     note = (f"Event definition: {d['on_px']:g} px on / {d['off_px']:g} px off, new state held {d['t_stable_s']:g} s, event ends after "
             f"{d['t_end_s']:g} s of persistence; side-cell rule {'on' if d['side_rule'] else 'off'}, vertex clause {'on' if d['vertex_clause'] else 'off'}. "
             f"Classes {classes}; not counted: {reasons}."
-            + (f" {n_outside} event(s) outside the analysis region left out." if inside is not None else ""))
-    if progress is not None:
-        progress(100, f"T1s={len(events)}")
+            + (f" {n_outside} event(s) outside the analysis region left out." if inside is not None else "")
+            + (f" {n_skipped} candidate quartet(s) with a cell outside the region were skipped." if n_skipped else ""))
+    report(100, f"T1s={len(events)}", 100)
     return {"classifier": "states", "definition": d, "stack": stack, "frame_indices": np.arange(n), "events": events, "events_shown": events,
             "four_xy": four_xy, "adj": [], "present": [], "overlay": overlay, "dots": dots, "overlay_base": overlay_base, "n_frames": n,
             "n_t1_confirmed": len(events), "n_excluded_events": n_excluded, "n_outside_region": n_outside, "classes": classes, "dropped": reasons, "swap_note": note,
