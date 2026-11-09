@@ -136,7 +136,7 @@ HELP_HTML = """
 
 <h3>Segmentation tab</h3>
 <ul>
-<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). Run locally uses this computer's GPU when it has one, else the CPU; the cluster always uses its GPU. <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
+<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). Run locally uses this computer's GPU when it has one, else the CPU; the cluster always uses its GPU. <i>Thin bonds right after segmentation</i> (under Parameters, off by default): thins the borders to 1 px bonds, which takes a while and is only needed for hand-editing outlines; when off, the bonds are thinned the first time you start editing. <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
 <li><b>Masks / Outlines</b>: the cell layer and the outline layer to edit (set automatically after loading).</li>
 <li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run locally / Run on cluster or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one. With Paint, the <b>right mouse button</b> erases.</li>
@@ -245,6 +245,7 @@ class TissueKitWidget(QWidget):
         self._seg_base_masks: np.ndarray | None = None
         self._seg_base_outlines: np.ndarray | None = None
         self._autosave_outlines_ok = True  # False while editing outlines loaded from a file: never rewrite the file before the user saves
+        self._bond_pending: tuple | None = None  # (masks, saved outlines) whose bonds are not thinned yet (Thin bonds off)
         self._pending_outlines: np.ndarray | None = None  # imported outlines shown after the bonds are built; their differences apply on Enter
         self._session_cal = None  # pixel size / frame interval of the movie in use (from any file read or run)
         self._seg_cal = None  # calibration read from a loaded outlines file (pixel size / frame interval)
@@ -531,6 +532,14 @@ class TissueKitWidget(QWidget):
         self.seg_params.add_rows(form)
         # In the Parameters pane, but not saved in presets.
         self.seg_params.add_body_row("", self.seg_fill_holes)
+        self.seg_thin_bonds = QCheckBox("Thin bonds right after segmentation (for outline editing)")
+        self.seg_thin_bonds.setToolTip(
+            "Thinning the cell borders to 1 px bonds takes a while (about a minute for a long movie) and is only needed to "
+            "edit outlines by hand. Off: segmentation shows the outlines straight away; the bonds are thinned when you start "
+            "editing outlines. Tracking, T1 and cell properties do not need them."
+        )
+        self.seg_thin_bonds.setChecked(False)
+        self.seg_params.add_body_row("", self.seg_thin_bonds)
         segment_box = QGroupBox("1 · Segment")
         segment_inner = QVBoxLayout()
         segment_inner.setSpacing(6)
@@ -1260,6 +1269,7 @@ class TissueKitWidget(QWidget):
             f"Outline editing ready{' from the outlines' if from_outlines else ''} (max label {int(masks.max())}). "
             "Paint/erase bonds, Enter to Apply (TA watershed), then Save.",
             saved_outlines=outlines,
+            force_bonds=True,  # the user asked for outline editing: the bonds are needed now
         )
         self._refresh_layers()
 
@@ -1308,7 +1318,8 @@ class TissueKitWidget(QWidget):
                 f"Outlines {'shown' if ol.visible else 'hidden'} (M)."
             )
 
-    def _show_segmentation_layers(self, masks: np.ndarray, message: str, saved_outlines: np.ndarray | None = None) -> None:
+    def _show_segmentation_layers(self, masks: np.ndarray, message: str, saved_outlines: np.ndarray | None = None,
+                                  force_bonds: bool = False) -> None:
         """Show masks, then build 1 px TA bonds in the background for Outlines. ``saved_outlines`` (0/1, T,Y,X) are kept
         as the starting bonds where they are the plugin's own 1 px bonds, so loading a saved edit moves no line."""
         masks = np.asarray(masks)
@@ -1319,6 +1330,7 @@ class TissueKitWidget(QWidget):
             return
         self._seg_base_hand = None
         self._seg_base_outlines = None
+        self._bond_pending = None
 
         if self.correction is not None:
             # A "Segmentation" layer that already exists (e.g. loaded from the results folder) is the one the cell
@@ -1353,6 +1365,20 @@ class TissueKitWidget(QWidget):
         interim = (np.asarray(saved_outlines) > 0).astype(np.uint8) if saved_outlines is not None and np.shape(saved_outlines) == masks.shape else masks_to_outline_labels(masks)
         self._replace_labels("Outlines", interim)
         self._style_outlines_layer(self._layer("Outlines"))
+
+        self._bond_pending = (masks, saved_outlines)
+        if not (self.seg_thin_bonds.isChecked() or force_bonds):
+            # bonds are only needed for outline editing: thin them when editing starts (see _bonds_ready)
+            self.status.setText(f"{message} Bonds are not thinned yet (option 'Thin bonds' is off): they are prepared when you start editing outlines.")
+            return
+        self._start_bond_job()
+
+    def _start_bond_job(self) -> None:
+        """Thin the bonds of the pending masks in the background (Outlines layer; needed for outline editing)."""
+        if self._bond_pending is None or self._job_running():
+            return
+        masks, saved_outlines = self._bond_pending
+        self._bond_pending = None
 
         def work(progress):
             from .core.outline_io import hand_stack_to_outline
@@ -1472,6 +1498,10 @@ class TissueKitWidget(QWidget):
             self.status.setText(
                 "No base masks — run segmentation or Start outline editing first."
             )
+            return False
+        if self._seg_base_hand is None and self._bond_pending is not None and not self._job_running():
+            self._start_bond_job()
+            self.status.setText("Thinning the bonds now (needed for outline editing): wait for 100%, then repeat the edit.")
             return False
         if self._seg_base_hand is None or self._seg_base_outlines is None:
             if self._last_job_error and not self._job_running():
