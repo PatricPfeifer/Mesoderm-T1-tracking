@@ -58,10 +58,10 @@ from .remote_widget import RemoteRunner
 from .track_edit import (
     CellUndo,
     ProtectedCellsError,
+    ProtectLog,
     break_track,
     changed_pixels,
     link_tracks,
-    merge_protected,
     restore_cells,
     swap_tracks,
 )
@@ -285,7 +285,8 @@ class TissueKitWidget(QWidget):
         self._track_undo: deque = deque(maxlen=20)
         # Pixels set by manual edits, one record per edit (same order as the undo
         # stack). Later edits may not change them as a side effect.
-        self._protect_log: list = []
+        self._protect_log = ProtectLog()
+        self._max_track_id = None  # (weakref to the stack, largest ID in it): saves a scan of the movie per edit
         # Track IDs the user asked to keep: no edit may change them (Keep ID mode in the Tracking tab).
         self._keep_ids: list[int] = []
         self._keep_auto_hidden = False  # the "Kept cells" layer was hidden by us (nothing to show), not by the user
@@ -2178,7 +2179,9 @@ class TissueKitWidget(QWidget):
         stack = self._writable_stack(layer)
         kwargs = {}
         if fn is link_tracks and self._protect_log:
-            kwargs["protected"] = merge_protected(self._protect_log)
+            kwargs["protected"] = self._protect_log  # merged only if the link meets a conflict
+        if fn is break_track:
+            kwargs["max_id"] = self._largest_track_id(stack)
         if self._keep_ids:
             kwargs["keep_ids"] = frozenset(self._keep_ids)
         self._set_overlay_msg("Working ...")
@@ -2197,6 +2200,7 @@ class TissueKitWidget(QWidget):
         if not undos:
             self._set_overlay_msg(message)
             return
+        self._note_track_ids(stack, undos)
         self._track_undo.append(undos)
         self._track_dirty = True
         self._protect_log.append(changed_pixels(undos, stack.shape[-1]))
@@ -2415,6 +2419,24 @@ class TissueKitWidget(QWidget):
         self.status.setText("Undid the last track edit.")
         self._set_overlay_msg("Undid the last track edit.")
 
+    def _largest_track_id(self, stack: np.ndarray) -> int:
+        """Largest ID in the tracked stack: scanned once per stack, then kept up to date by ``_note_track_ids``."""
+        import weakref
+
+        cached = self._max_track_id
+        if cached is None or cached[0]() is not stack:
+            cached = (weakref.ref(stack), int(np.max(stack)))
+            self._max_track_id = cached
+        return cached[1]
+
+    def _note_track_ids(self, stack: np.ndarray, undos: list[CellUndo]) -> None:
+        """After an edit: an ID it introduced (Break) raises the remembered maximum (never lowered: an upper bound is enough)."""
+        if self._max_track_id is None or self._max_track_id[0]() is not stack:
+            return
+        top = max((int(stack[u.frame][u.ys, u.xs].max()) for u in undos if len(u.ys)), default=0)
+        if top > self._max_track_id[1]:
+            self._max_track_id = (self._max_track_id[0], top)
+
     def _writable_stack(self, layer) -> np.ndarray:
         stack = np.asarray(layer.data)
         if stack.ndim == 2:
@@ -2435,7 +2457,9 @@ class TissueKitWidget(QWidget):
         rgb = self._tracked_rgb_layer()
         if rgb is None or not undos:
             return
-        max_id = int(np.max(stack))
+        # the colour of an ID does not depend on the table size (same seed, drawn in order), so the table only has to reach
+        # the IDs just written: no scan of the whole movie for its maximum
+        max_id = max((int(stack[u.frame][u.ys, u.xs].max()) for u in undos if len(u.ys)), default=0)
         rng = np.random.default_rng(1)
         lut = rng.integers(40, 256, size=(max_id + 1, 3), dtype=np.uint8)
         lut[0] = 0
@@ -2898,6 +2922,14 @@ class TissueKitWidget(QWidget):
             "changing the region."
         )
         form.addRow("", self.t1_use_region)
+        self.t1_length_tables = QCheckBox("Also measure junction lengths (saved with the T1 results)")
+        self.t1_length_tables.setChecked(True)
+        self.t1_length_tables.setToolTip(
+            "Measures the length of the shrinking / growing junction around every event and saves the junction-length "
+            "tables (the data for length-over-time plots and kinetics) next to the events. Takes extra time after the "
+            "detection (about a second per frame near an event); untick to save only the events."
+        )
+        form.addRow("", self.t1_length_tables)
         detect_box = QGroupBox("1 · Detect T1 events")
         detect_inner = QVBoxLayout()
         detect_inner.addLayout(form)
@@ -2967,12 +2999,14 @@ class TissueKitWidget(QWidget):
             if used is not None:
                 inside, region_hash = used
         self._t1_region_hash = region_hash
+        length_tables = self.t1_length_tables.isChecked()
 
         def work(progress):
             from .core.t1.t1_states_run import run_states_stack
 
             return run_states_stack(stack, um_per_px=float(um), dt_s=float(dt), rgb=rgb, definition=definition,
-                                    pre=pre, post=post, exclude_ids=exclude, inside=inside, progress=progress)
+                                    pre=pre, post=post, exclude_ids=exclude, inside=inside, progress=progress,
+                                    length_tables=length_tables)
 
         self._start(work, self._t1_done)
 
@@ -3290,28 +3324,60 @@ class TissueKitWidget(QWidget):
         )
 
     def _autosave_t1(self, result: dict) -> None:
+        """Save everything the T1 analyses read, like the command line does: ``<stem>_t1_events.csv``, ``<stem>_qc.json`` (frame
+        count, calibration, definition, region), the junction-length tables and the ``_um`` twins, into ``t1/<run>/``."""
         wf = self.project if self.project.root is not None else self._working_folder()
         events = result.get("events") or []
         if wf is None or not events:
             return
         try:
+            import json
+
             import pandas as pd
 
+            from .core.output_names import input_stem
+            from .core.t1.calibrated_outputs import write_um_files
+            from .core.t1.t1_states_run import write_length_tables
+
+            movie = self._layer(self.seg_image.currentText())
+            paths = [p for p in self._layer_paths(movie) if p]
+            stem = input_stem(paths[0]) if paths else (self._seg_stem or "movie")
+            cal = self._calibration(movie, stem=stem)
+            out = wf.run_step_dir("t1", self._tracked_run)  # T1 of the shown tracking's run
             rows = [
                 {k: (v if isinstance(v, (int, float, str, bool)) or v is None else str(v))
                  for k, v in e.items()}
                 for e in events
             ]
-            out = wf.run_step_dir("t1", self._tracked_run)  # T1 of the shown tracking's run
-            pd.DataFrame(rows).to_csv(out / "t1_events.csv", index=False)
+            events_df = pd.DataFrame(rows)
+            events_df.to_csv(out / f"{stem}_t1_events.csv", index=False)
+            old = out / "t1_events.csv"  # name of earlier plugin versions: keep an existing copy in step
+            if old.is_file():
+                events_df.to_csv(old, index=False)
+            labels_path = wf.run_step_dir("tracking", self._tracked_run, create=False) / f"{stem}_tracked_labels.tif"
+            qc = {
+                "classifier": result.get("classifier", "states"), "definition": result.get("definition"),
+                "n_frames": int(result.get("n_frames", 0)), "n_events": len(rows), "classes": result.get("classes", {}),
+                "dropped": result.get("dropped", {}), "n_outside_region": int(result.get("n_outside_region", 0)),
+                "n_excluded_events": int(result.get("n_excluded_events", 0)),
+                "analysis_region_hash": self._t1_region_hash or "", "expand": int(result.get("expand", 3)),
+                "labels": str(labels_path) if labels_path.is_file() else "",
+            }
+            (out / f"{stem}_qc.json").write_text(json.dumps(qc, indent=2, default=str) + "\n", encoding="utf-8")
+            traces = result.get("length_traces")
+            if traces is not None:
+                write_length_tables(None, pd.DataFrame(events), out, stem, traces=traces)
+            write_um_files(out, stem, cal, log=lambda *_: None)  # adds the calibration to the qc file as well
             wf.write_step_params(
                 "t1", out.name,
                 {"expand": int(self.t1_expand.value()), "definition": result.get("definition"),
-                 "region_hash": self._t1_region_hash},
+                 "region_hash": self._t1_region_hash, "junction_lengths": traces is not None},
             )
-            self.status.setText(f"{self.status.text()} Saved {len(rows)} T1 events to {out}")
+            tables = "events, QC and junction-length tables" if traces is not None else "events and QC (no junction lengths measured)"
+            self.status.setText(f"{self.status.text()} Saved {len(rows)} T1 events ({tables}) to {out}")
         except Exception as exc:  # saving must never break the analysis
-            self.status.setText(f"{self.status.text()} (T1 events not saved: {exc})")
+            print(traceback.format_exc(), flush=True)
+            self.status.setText(f"{self.status.text()} (T1 results not saved: {exc})")
 
     def _load_saved_results(self, only_segmentation: bool = False) -> None:
         """Load the movie, the active segmentation run and that run's tracking from the results folder.

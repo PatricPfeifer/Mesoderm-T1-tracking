@@ -44,6 +44,63 @@ def changed_pixels(undos: list[CellUndo], width: int) -> dict[int, np.ndarray]:
     return {t: np.unique(np.concatenate(v)) for t, v in out.items()}
 
 
+def _union_sorted(old: np.ndarray, new: np.ndarray) -> np.ndarray:
+    """Union of two sorted unique index arrays without sorting the big one again."""
+    if len(old) == 0:
+        return new
+    pos = np.searchsorted(old, new)
+    known = (pos < len(old)) & (old[np.minimum(pos, len(old) - 1)] == new)
+    fresh = new[~known]
+    return np.insert(old, pos[~known], fresh) if len(fresh) else old
+
+
+class ProtectLog:
+    """The ``changed_pixels`` records of the edits since the last save, with their union kept for ``link_tracks``.
+
+    Behaves like the list it replaces (append / pop / clear / len) and, passed as ``protected``, like the merged
+    ``{frame: indices}`` dict. The union is only built when a link meets a conflict, then extended by the edits
+    made since; only Undo (pop) makes it rebuild from the records."""
+
+    def __init__(self) -> None:
+        self._records: list[dict[int, np.ndarray]] = []
+        self._merged: dict[int, np.ndarray] | None = {}
+        self._pending: list[dict[int, np.ndarray]] = []  # records not yet in _merged
+
+    def append(self, record: dict[int, np.ndarray]) -> None:
+        self._records.append(record)
+        self._pending.append(record)
+
+    def pop(self) -> dict[int, np.ndarray]:
+        self._merged, self._pending = None, []  # rebuilt on the next merged()
+        return self._records.pop()
+
+    def clear(self) -> None:
+        self._records.clear()
+        self._merged, self._pending = {}, []
+
+    def merged(self) -> dict[int, np.ndarray]:
+        if self._merged is None:
+            self._merged = merge_protected(self._records)
+        else:
+            for record in self._pending:
+                for t, idx in record.items():
+                    self._merged[t] = _union_sorted(self._merged.get(t, idx[:0]), idx)
+        self._pending = []
+        return self._merged
+
+    def __contains__(self, frame: int) -> bool:
+        return frame in self.merged()
+
+    def __getitem__(self, frame: int) -> np.ndarray:
+        return self.merged()[frame]
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __bool__(self) -> bool:
+        return bool(self._records)
+
+
 def merge_protected(records: list[dict[int, np.ndarray]]) -> dict[int, np.ndarray]:
     """Union of several ``changed_pixels`` records."""
     merged: dict[int, list[np.ndarray]] = {}
@@ -79,13 +136,15 @@ def _pixels_by_id(
     whole-movie edit stays fast. Frames without any of the ids map to {}.
     """
 
+    width = int(stack.shape[-1])
+
     def one(t: int):
-        plane = stack[t]
+        plane = stack[t].reshape(-1)  # flatnonzero on the flat plane is about 3x faster than nonzero on the 2D mask
         found = {}
         for i in ids:
-            ys, xs = np.nonzero(plane == i)
-            if len(ys):
-                found[i] = (ys, xs)
+            flat = np.flatnonzero(plane == i)
+            if len(flat):
+                found[i] = (flat // width, flat % width)
         return t, found
 
     with ThreadPoolExecutor(_WORKERS) as pool:
@@ -200,9 +259,12 @@ def link_tracks(
 
 
 def break_track(
-    stack: np.ndarray, src_id: int, start: int, keep_ids: frozenset[int] | set[int] | None = None
+    stack: np.ndarray, src_id: int, start: int, keep_ids: frozenset[int] | set[int] | None = None,
+    max_id: int | None = None,
 ) -> tuple[list[CellUndo] | None, str]:
-    """From ``start`` on, give ``src_id`` a new ID. Earlier frames keep the old one."""
+    """From ``start`` on, give ``src_id`` a new ID. Earlier frames keep the old one.
+
+    ``max_id``: the largest ID in ``stack`` if the caller knows it (saves a scan of the whole movie)."""
     if src_id <= 0:
         return None, "Click a cell."
     found = _pixels_by_id(stack, range(int(start), stack.shape[0]), (src_id,))
@@ -211,7 +273,7 @@ def break_track(
         return None, "That track does not continue from this frame."
     if keep_ids and src_id in keep_ids:
         raise _keep_error(stack, changed, src_id, "this would change")
-    new_id = int(np.max(stack)) + 1
+    new_id = (int(np.max(stack)) if max_id is None else int(max_id)) + 1
     _ensure_id_fits(stack, new_id)
     undos = [_relabel(stack, t, {src_id: (*found[t][src_id], new_id)}) for t in changed]
     return undos, f"Track {src_id} is {new_id} from frame {min(changed)} on."

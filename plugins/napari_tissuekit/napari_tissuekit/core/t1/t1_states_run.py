@@ -442,12 +442,13 @@ def _junction_frame(t: int):
 
 
 def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: int = 3, anchor: str = "start",
-                           workers: int | None = None) -> pd.DataFrame:
+                           workers: int | None = None, on_progress=None) -> pd.DataFrame:
     """Junction length of the active pair around every event, long table (one row per event and frame). Window = anchor - pre ..
     last swap + post (anchor 'start' = frame_start, 'first_swap' = frame_first_swap); dt = frame - anchor. In every frame the active pair is the
     original pair (sign +1) or the new pair (sign -1) when exactly one of them touches (any contact on the grown labels, as the legacy tables);
     otherwise the length is blank and `flag` says '4way' (both touch) or 'no AB/CD contact'. vertex_px = vertex-to-vertex length of the
-    junction, contact_px = 4-connected contact-pixel count (both in pixels, *_um in um); signed_* = sign * length."""
+    junction, contact_px = 4-connected contact-pixel count (both in pixels, *_um in um); signed_* = sign * length.
+    `on_progress(done, total)` is called after every measured frame of the serial path (the plugin runs it in a Qt thread)."""
     from ..celltrack.cells import build_adjacency
     from .run_tm_fourway_vertices import junctions_one_frame, vertex_bond
     from .run_tm_t1 import FLAG_NV, active_abcd_pair, length_blank_flag
@@ -472,10 +473,12 @@ def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: 
         finally:
             _JL.clear()
     else:
-        for t in frames:
+        for i, t in enumerate(frames):
             lab = md.labels[t].astype(np.int64)
             verts3[t] = junctions_one_frame(lab, md.expand, 3.0)[1]
             adj[t] = build_adjacency(lab, expand=md.expand)
+            if on_progress is not None:
+                on_progress(i + 1, len(frames))
     rows = []
     for eid, r, first, t0, t1 in wins:
         quartet = frozenset(int(r[k]) for k in "ABCD")
@@ -508,12 +511,13 @@ def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: 
     return df
 
 
-def write_length_tables(md: MovieData, ev: pd.DataFrame, out: Path, stem: str, pre: int = 3, post: int = 3, anchor: str = "start",
-                        workers: int | None = None) -> pd.DataFrame:
-    """Legacy wide tables <stem>_junction_lengths{,_signed,_contact_lengths,_contact_lengths_signed}.csv (px) for the states events."""
+def write_length_tables(md: MovieData | None, ev: pd.DataFrame, out: Path, stem: str, pre: int = 3, post: int = 3, anchor: str = "start",
+                        workers: int | None = None, traces: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Legacy wide tables <stem>_junction_lengths{,_signed,_contact_lengths,_contact_lengths_signed}.csv (px) for the states events.
+    `traces` (from `junction_length_traces` on the same `ev`) skips the measuring; `md` may then be None."""
     from ..output_names import tagged_path
     from .run_tm_t1 import FLAG_NV, TYPE_SORT_ORDER, write_junction_lengths_wide
-    tr = junction_length_traces(md, ev, pre, post, anchor, workers)
+    tr = traces if traces is not None else junction_length_traces(md, ev, pre, post, anchor, workers)
     vp, vs, cp, cs = {}, {}, {}, {}
     for r in tr.itertuples(index=False):
         k = (r.event_id, r.dt)
@@ -537,14 +541,16 @@ def write_length_tables(md: MovieData, ev: pd.DataFrame, out: Path, stem: str, p
 
 def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: np.ndarray | None = None, definition: dict | None = None,
                      pre: int = 3, post: int = 3, exclude_ids: set[int] | None = None, division_frames: dict[int, list[int]] | None = None,
-                     inside: list | None = None, progress=None) -> dict:
+                     inside: list | None = None, progress=None, length_tables: bool = False) -> dict:
     """Plugin counterpart of `run_t1_stack` for the state classifier: classify a (T,Y,X) tracked label stack with the committed definition
     (DEFINITION, optionally overridden) and return the same kind of result dict (events as dicts with t_start / t_end / quartet / pair_before /
     pair_after / type, overlay, dots, ...), so the plugin's filter, overlay and autosave code works on it unchanged. `um_per_px` and `dt_s`
     are needed: the thresholds are pixel counts but the persistence times are seconds. Events have the legacy `type` (completed / flicker_resolved /
     flicker_aborted) and the new `t1_class` (clean / flicker_resolved / flicker_aborted); pair_after is the pair the quartet ends on.
     `inside` (optional): per frame the set of track IDs in the analysis region (core/region.py); only events whose four cells are
-    all inside at the frame of the first swap are kept (the others are counted in `n_outside_region`)."""
+    all inside at the frame of the first swap are kept (the others are counted in `n_outside_region`).
+    `length_tables`: also measure the junction length of every kept event (`length_traces` in the result, for `write_length_tables`;
+    one vertex / adjacency pass per frame near an event, minutes on a long movie)."""
     from ..region import event_inside
     from .run_tm_t1 import grayscale_rgb, labels_gray_rgb, render_fourway_dots, render_overlay
     d = {**DEFINITION, **(definition or {})}
@@ -597,7 +603,14 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
             if ok:
                 four_xy[t][quartet] = (float(np.nanmean(md.cy[t, ok])), float(np.nanmean(md.cx[t, ok])))
         events.append(r)
-    report(85, "Drawing the overlay", 0)
+    length_traces = None
+    if length_tables and events:
+        report(82, "Measuring junction lengths", 0)
+        length_traces = junction_length_traces(
+            md, pd.DataFrame(events), 3, 3, "start", workers=1,  # serial: Qt worker thread, no forking
+            on_progress=lambda done, total: report(82 + 8 * done / max(total, 1), f"Measuring junction lengths ({done}/{total} frames)",
+                                                   100 * done / max(total, 1)))
+    report(90, "Drawing the overlay", 0)
     labels_list = [stack[t] for t in range(n)]
     if rgb is not None:
         overlay_base = grayscale_rgb(rgb)
@@ -620,7 +633,7 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
     return {"classifier": "states", "definition": d, "stack": stack, "frame_indices": np.arange(n), "events": events, "events_shown": events,
             "four_xy": four_xy, "adj": [], "present": [], "overlay": overlay, "dots": dots, "overlay_base": overlay_base, "n_frames": n,
             "n_t1_confirmed": len(events), "n_excluded_events": n_excluded, "n_outside_region": n_outside, "classes": classes, "dropped": reasons, "swap_note": note,
-            "expand": int(d["expand"]), "pre": pre, "post": post}
+            "expand": int(d["expand"]), "pre": pre, "post": post, "length_traces": length_traces}
 
 
 def load_config(path) -> dict:

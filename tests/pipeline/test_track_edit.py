@@ -9,6 +9,7 @@ import numpy as np
 
 from napari_tissuekit.track_edit import (
     ProtectedCellsError,
+    ProtectLog,
     break_track,
     changed_pixels,
     link_tracks,
@@ -213,3 +214,43 @@ def test_this_frame_mode_refuses_to_create_a_duplicate_id():
     undo, msg = set_id_on_frame(stack, 2, 1, 2)
     assert undo is None and "already on frame 2" in msg
     assert np.array_equal(stack, before)
+
+
+def test_protect_log_union_matches_merge_protected_through_append_pop_clear():
+    rng = np.random.default_rng(3)
+    records = [{int(t): np.unique(rng.integers(0, 500, 40)) for t in rng.integers(0, 6, 3)} for _ in range(8)]
+    log = ProtectLog()
+    for i, rec in enumerate(records):
+        log.append(rec)
+        got, want = log.merged(), merge_protected(records[: i + 1])
+        assert got.keys() == want.keys() and all((got[t] == want[t]).all() for t in want)
+    log.pop()
+    log.pop()  # Undo twice: rebuilt from the records that are left
+    got, want = log.merged(), merge_protected(records[:6])
+    assert len(log) == 6 and got.keys() == want.keys() and all((got[t] == want[t]).all() for t in want)
+    log.append(records[6])
+    got, want = log.merged(), merge_protected(records[:6] + [records[6]])
+    assert got.keys() == want.keys() and all((got[t] == want[t]).all() for t in want)
+    log.clear()
+    assert not log and len(log) == 0 and log.merged() == {}
+
+
+def test_break_track_uses_a_given_max_id_and_matches_the_scan():
+    a = stack_with([1] * 6, [2] * 6)
+    b = a.copy()
+    undos_scan, _ = break_track(a, 1, 3)
+    undos_given, _ = break_track(b, 1, 3, max_id=int(b.max()))
+    assert (a == b).all() and a[3:, :, :4].min() == 3 and len(undos_scan) == len(undos_given) == 3
+
+
+def test_protect_log_works_as_the_protected_argument_of_link_tracks():
+    stack = stack_with([1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2])
+    log = ProtectLog()
+    undos, _ = swap_tracks(stack, 1, 2, 3)
+    log.append(changed_pixels(undos, stack.shape[-1]))
+    try:
+        link_tracks(stack, 2, 1, 3, protected=log)  # would also change the cell that was just corrected
+    except ProtectedCellsError:
+        pass
+    else:
+        raise AssertionError("the protected cell was changed")
