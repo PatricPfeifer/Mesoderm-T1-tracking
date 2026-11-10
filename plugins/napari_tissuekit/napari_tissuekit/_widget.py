@@ -30,6 +30,8 @@ from qtpy.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
     QProgressBar,
@@ -155,6 +157,7 @@ HELP_HTML = """
 <li><b>Labels</b>: the segmentation to track. <b>Intensity</b>: the movie (or none).</li>
 <li><b>Run tracking</b>: track the cells. The defaults are fine to start with; hover over a setting for what it does.</li>
 <li><b>Divisions</b>: dividing cells end their track and the two daughters get new IDs.</li>
+<li><b>Keep ID</b> (in Correct tracks): click the cells around the one you are fixing to put them in the keep list. No Link, Break or Swap can change a listed cell, not even as a side effect (Link swaps IDs when another cell already has the ID); the edit is refused and the cell lights up red. Click a listed cell again, or use Remove selected / Clear list, to allow changes again. The list is cleared when new tracking is loaded or run.</li>
 <li><b>Fill enclosed empty areas as new cells</b> (on by default): empty space closed in by cells (a cell the segmentation missed or you deleted) gets an ID of its own before tracking, so no cell is left empty in the Tracked layer.</li>
 <li><b>Export TIFF</b>: write the tracked layers to the results folder.</li>
 <li><b>Correct tracks</b>: turn on <i>Edit tracks</i>, pick a mode and click cells on the Tracked layer.
@@ -283,6 +286,9 @@ class TissueKitWidget(QWidget):
         # Pixels set by manual edits, one record per edit (same order as the undo
         # stack). Later edits may not change them as a side effect.
         self._protect_log: list = []
+        # Track IDs the user asked to keep: no edit may change them (Keep ID mode in the Tracking tab).
+        self._keep_ids: list[int] = []
+        self._keep_auto_hidden = False  # the "Kept cells" layer was hidden by us (nothing to show), not by the user
         self._overlay_msg = ""  # second line of the viewer text overlay
         self._flash_timer = QTimer(self)
         self._flash_timer.setSingleShot(True)
@@ -383,6 +389,7 @@ class TissueKitWidget(QWidget):
         self.viewer.mouse_drag_callbacks.append(self._on_track_click)
         self.viewer.mouse_drag_callbacks.append(self._on_t1_click)
         self.viewer.dims.events.current_step.connect(self._update_overlay)
+        self.viewer.dims.events.current_step.connect(self._update_keep_markers)
         self.viewer.layers.events.inserted.connect(self._update_overlay)
         self.viewer.layers.events.removed.connect(self._update_overlay)
         self._update_overlay()
@@ -1991,6 +1998,7 @@ class TissueKitWidget(QWidget):
                 ("link", "Link"),
                 ("break", "Break"),
                 ("swap", "Swap"),
+                ("keep", "Keep ID"),
             )
         ):
             button = QRadioButton(label)
@@ -2012,6 +2020,22 @@ class TissueKitWidget(QWidget):
         undo = QPushButton("Undo")
         undo.clicked.connect(self._undo_track)
         inner.addWidget(undo, 0, Qt.AlignLeft)
+        inner.addWidget(QLabel("Kept cells (their IDs cannot change):"))
+        self.keep_list = QListWidget()
+        self.keep_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.keep_list.setMaximumHeight(90)
+        self.keep_list.setToolTip("Cells added with the Keep ID mode. Double-click one to jump to a frame where it is.")
+        self.keep_list.itemDoubleClicked.connect(self._keep_goto)
+        inner.addWidget(self.keep_list)
+        keep_row = QHBoxLayout()
+        keep_remove = QPushButton("Remove selected")
+        keep_remove.clicked.connect(self._keep_remove_selected)
+        keep_clear = QPushButton("Clear list")
+        keep_clear.clicked.connect(self._keep_clear)
+        keep_row.addWidget(keep_remove)
+        keep_row.addWidget(keep_clear)
+        keep_row.addStretch()
+        inner.addLayout(keep_row)
         unprotect = QPushButton("Clear protection (lets corrected cells be changed again)")
         unprotect.setToolTip(
             "Cells you corrected are protected: a later edit on a neighbouring "
@@ -2054,6 +2078,12 @@ class TissueKitWidget(QWidget):
             "swap": (
                 "Click one cell, then the other. Their IDs exchange from the "
                 "second click through the end of the movie."
+            ),
+            "keep": (
+                "Click the cells around the one you are fixing to put them in the keep list "
+                "(green dots). No edit can change a cell in the list, not even as a side "
+                "effect of Link; an edit that would is refused and the cell lights up red. "
+                "Click a listed cell again, or use the buttons, to take it out."
             ),
         }
         self.track_help.setText(help_text[self._track_mode()])
@@ -2106,6 +2136,9 @@ class TissueKitWidget(QWidget):
             self._set_overlay_msg("That is background - click a cell.")
             return
         mode = self._track_mode()
+        if mode == "keep":
+            self._keep_toggle(track_id)
+            return
         if mode == "break":
             self._commit_track(break_track, (track_id, frame))
             return
@@ -2146,6 +2179,8 @@ class TissueKitWidget(QWidget):
         kwargs = {}
         if fn is link_tracks and self._protect_log:
             kwargs["protected"] = merge_protected(self._protect_log)
+        if self._keep_ids:
+            kwargs["keep_ids"] = frozenset(self._keep_ids)
         self._set_overlay_msg("Working ...")
         try:
             undos, message = fn(stack, *args, **kwargs)
@@ -2270,6 +2305,91 @@ class TissueKitWidget(QWidget):
             self.viewer.dims.set_point(0, exc.frame)
         except Exception:
             pass
+
+    # ---- keep list: cells whose ID no edit may change -----------------------------------------------------
+    def _keep_toggle(self, track_id: int) -> None:
+        if track_id in self._keep_ids:
+            self._keep_ids.remove(track_id)
+            msg = f"Track {track_id} taken out of the keep list."
+        else:
+            self._keep_ids.append(track_id)
+            msg = f"Track {track_id} is kept: no edit can change its ID ({len(self._keep_ids)} kept)."
+        self._keep_changed()
+        self.track_msg.setText(msg)
+        self._set_overlay_msg(msg)
+
+    def _keep_changed(self) -> None:
+        self.keep_list.clear()
+        for cid in self._keep_ids:
+            item = QListWidgetItem(f"Track {cid}")
+            item.setData(Qt.UserRole, int(cid))
+            self.keep_list.addItem(item)
+        self._update_keep_markers()
+
+    def _keep_remove_selected(self) -> None:
+        gone = {int(i.data(Qt.UserRole)) for i in self.keep_list.selectedItems()}
+        if not gone:
+            self.track_msg.setText("Select the cells to remove in the list first.")
+            return
+        self._keep_ids = [c for c in self._keep_ids if c not in gone]
+        self._keep_changed()
+        self.track_msg.setText(f"Removed {len(gone)} cell(s) from the keep list.")
+
+    def _keep_clear(self) -> None:
+        n = len(self._keep_ids)
+        self._keep_ids = []
+        self._keep_changed()
+        self.track_msg.setText(f"Keep list cleared ({n} cell(s)).")
+
+    def _keep_goto(self, item) -> None:
+        """Jump to the first frame that has the cell (double-click in the list)."""
+        layer = self._tracked_layer()
+        if layer is None:
+            return
+        cid = int(item.data(Qt.UserRole))
+        stack = np.asarray(layer.data)
+        if stack.ndim < 3:
+            return
+        here = int(np.clip(round(float(self.viewer.dims.point[0])), 0, stack.shape[0] - 1))
+        for t in [here, *range(stack.shape[0])]:
+            if np.any(stack[t] == cid):
+                self.viewer.dims.set_point(0, t)
+                return
+        self.track_msg.setText(f"Track {cid} is not on any frame.")
+
+    def _update_keep_markers(self, *_args) -> None:
+        """Green dot on every kept cell that is on the frame shown. A layer the user switched off stays off."""
+        layer = self._tracked_layer()
+        points = np.zeros((0, 3))
+        if self._keep_ids and layer is not None and np.ndim(layer.data) >= 3:
+            stack = np.asarray(layer.data)
+            t = int(np.clip(round(float(self.viewer.dims.point[0])), 0, stack.shape[0] - 1))
+            plane = stack[t]
+            ys, xs = np.nonzero(np.isin(plane, np.asarray(self._keep_ids, dtype=plane.dtype)))
+            if len(ys):
+                _u, inverse = np.unique(plane[ys, xs], return_inverse=True)
+                count = np.bincount(inverse).astype(float)
+                points = np.column_stack([np.full(len(count), t), np.bincount(inverse, weights=ys) / count,
+                                          np.bincount(inverse, weights=xs) / count])
+        marker = self._layer("Kept cells")
+        if marker is None:
+            if len(points) == 0:
+                return
+            active = self.viewer.layers.selection.active
+            marker = self.viewer.add_points(points, name="Kept cells", size=self._marker_size(), face_color="#3ddc84",
+                                            border_color="black", symbol="disc")
+            marker.editable = False
+            if active is not None and active in self.viewer.layers:
+                self.viewer.layers.selection.active = active
+            return
+        marker.data = points if len(points) else np.zeros((0, int(marker.ndim)))
+        if len(points) == 0:
+            if marker.visible:
+                marker.visible = False
+                self._keep_auto_hidden = True
+        elif self._keep_auto_hidden:
+            self._keep_auto_hidden = False
+            marker.visible = True
 
     def _clear_protection(self) -> None:
         n = len(self._protect_log)
@@ -3319,6 +3439,8 @@ class TissueKitWidget(QWidget):
         self._track_dirty = False
         self._track_undo.clear()
         self._protect_log.clear()
+        self._keep_ids = []
+        self._keep_changed()
         self._division_ids = set()
         self._t1_result = None
         self._t1_shown = []
@@ -3467,6 +3589,9 @@ class TissueKitWidget(QWidget):
         if name == "Tracked":  # new tracks: old undo steps and protection are stale
             self._track_undo.clear()
             self._protect_log.clear()
+            if self._keep_ids:  # new tracks: the IDs in the list may mean other cells now
+                self._keep_ids = []
+                self._keep_changed()
             self._track_dirty = False
             if getattr(self, "region_tab", None) is not None:
                 self.region_tab.invalidate()

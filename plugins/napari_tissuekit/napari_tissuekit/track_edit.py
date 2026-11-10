@@ -53,6 +53,23 @@ def merge_protected(records: list[dict[int, np.ndarray]]) -> dict[int, np.ndarra
     return {t: np.unique(np.concatenate(v)) for t, v in merged.items()}
 
 
+def _keep_error(stack: np.ndarray, frames, cell_id: int, why: str) -> ProtectedCellsError:
+    """Refusal for an edit that would change a cell in the keep list; carries its pixels (first frame it is on) to show."""
+    for t in frames:
+        ys, xs = np.nonzero(stack[int(t)] == cell_id)
+        if len(ys):
+            break
+    else:
+        t, ys, xs = int(next(iter(frames), 0)), np.zeros(0, np.int64), np.zeros(0, np.int64)
+    return ProtectedCellsError(
+        f"Not changed: {why} track {cell_id}, which is in your keep list. "
+        "Remove it from the list (Keep ID) to change it on purpose.",
+        int(t),
+        ys,
+        xs,
+    )
+
+
 def _pixels_by_id(
     stack: np.ndarray, frames, ids: tuple[int, ...]
 ) -> dict[int, dict[int, tuple[np.ndarray, np.ndarray]]]:
@@ -114,8 +131,13 @@ def link_tracks(
     replace_id: int,
     start: int,
     protected: dict[int, np.ndarray] | None = None,
+    keep_ids: frozenset[int] | set[int] | None = None,
 ) -> tuple[list[CellUndo] | None, str]:
     """From ``start`` on, ``replace_id`` becomes ``keep_id``.
+
+    ``keep_ids`` (the user's keep list): cells whose ID must not change. The edit is refused (ProtectedCellsError)
+    if ``replace_id`` is one of them, or if ``keep_id`` is one and another cell already holds it (the exchange
+    would give that cell a different ID).
 
     If another cell already has ``keep_id`` on one of those frames, the two IDs
     are exchanged from ``start`` on, so no frame ever holds a duplicate ID.
@@ -132,6 +154,14 @@ def link_tracks(
     if not changed:
         return None, "That track does not continue from this frame."
     conflict = any(keep_id in f for f in found.values())
+    if keep_ids:
+        if replace_id in keep_ids:
+            raise _keep_error(stack, changed, replace_id, "this would change")
+        if conflict and keep_id in keep_ids:
+            raise _keep_error(
+                stack, sorted(t for t, f in found.items() if keep_id in f), keep_id,
+                f"track {replace_id} can only take the ID {keep_id} by also changing",
+            )
     if conflict and protected:
         width = int(stack.shape[-1])
         for t in sorted(found):
@@ -170,7 +200,7 @@ def link_tracks(
 
 
 def break_track(
-    stack: np.ndarray, src_id: int, start: int
+    stack: np.ndarray, src_id: int, start: int, keep_ids: frozenset[int] | set[int] | None = None
 ) -> tuple[list[CellUndo] | None, str]:
     """From ``start`` on, give ``src_id`` a new ID. Earlier frames keep the old one."""
     if src_id <= 0:
@@ -179,6 +209,8 @@ def break_track(
     changed = [t for t, f in found.items() if src_id in f]
     if not changed:
         return None, "That track does not continue from this frame."
+    if keep_ids and src_id in keep_ids:
+        raise _keep_error(stack, changed, src_id, "this would change")
     new_id = int(np.max(stack)) + 1
     _ensure_id_fits(stack, new_id)
     undos = [_relabel(stack, t, {src_id: (*found[t][src_id], new_id)}) for t in changed]
@@ -186,7 +218,7 @@ def break_track(
 
 
 def swap_tracks(
-    stack: np.ndarray, id_a: int, id_b: int, start: int
+    stack: np.ndarray, id_a: int, id_b: int, start: int, keep_ids: frozenset[int] | set[int] | None = None
 ) -> tuple[list[CellUndo] | None, str]:
     """From ``start`` on, exchange two track IDs."""
     if id_a <= 0 or id_b <= 0:
@@ -197,6 +229,9 @@ def swap_tracks(
     changed = [t for t, f in found.items() if f]
     if not changed:
         return None, "Neither track continues from this frame."
+    for cid in (id_a, id_b):
+        if keep_ids and cid in keep_ids:
+            raise _keep_error(stack, [t for t in changed if cid in found[t]], cid, "this would change")
     undos: list[CellUndo] = []
     for t in changed:
         f = found[t]
