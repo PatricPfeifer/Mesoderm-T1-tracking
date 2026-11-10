@@ -99,8 +99,10 @@ def cmd_track(args, extra) -> None:
     argv = ["--masks", str(masks), "--output-dir", str(out)]
     if movie is not None:
         argv += ["--intensity", str(movie)]
+    if args.fill_holes:
+        argv.append("--fill-holes")
     tracking.main(argv + extra)
-    wf.write_step_params("tracking", out.name, {"extra_args": extra, "masks": str(masks)},
+    wf.write_step_params("tracking", out.name, {"extra_args": extra, "masks": str(masks), "fill_holes": bool(args.fill_holes)},
                          movie=str(movie) if movie else None)
 
 
@@ -141,7 +143,9 @@ def build_parser() -> argparse.ArgumentParser:
     seg.add_argument("--force-cpu", action="store_true")
     seg.add_argument("--no-fill-holes", dest="fill_holes", action="store_false",
                      help="leave empty space enclosed by cells empty (default: it becomes a new cell)")
-    add("track", cmd_track, "track the saved segmentation")
+    trk = add("track", cmd_track, "track the saved segmentation")
+    trk.add_argument("--no-fill-holes", dest="fill_holes", action="store_false",
+                     help="leave empty areas enclosed by cells without an id (default: they become new cells before tracking)")
     add("t1", cmd_t1, "detect T1 events on the saved tracking")
     return p
 

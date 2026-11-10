@@ -131,6 +131,7 @@ HELP_HTML = """
 <ul>
 <li><b>Folder...</b>: choose the results folder. If it holds saved results they are loaded.</li>
 <li><b>Load results</b>: load the saved movie, segmentation, outlines and tracking.</li>
+<li><b>Save all</b>: save every change that is not saved yet (segmentation, track edits, analysis region, T1 events, cell selection). What is unchanged is not rewritten.</li>
 <li><b>Help</b>: this window.</li>
 </ul>
 
@@ -154,6 +155,7 @@ HELP_HTML = """
 <li><b>Labels</b>: the segmentation to track. <b>Intensity</b>: the movie (or none).</li>
 <li><b>Run tracking</b>: track the cells. The defaults are fine to start with; hover over a setting for what it does.</li>
 <li><b>Divisions</b>: dividing cells end their track and the two daughters get new IDs.</li>
+<li><b>Fill enclosed empty areas as new cells</b> (on by default): empty space closed in by cells (a cell the segmentation missed or you deleted) gets an ID of its own before tracking, so no cell is left empty in the Tracked layer.</li>
 <li><b>Export TIFF</b>: write the tracked layers to the results folder.</li>
 <li><b>Correct tracks</b>: turn on <i>Edit tracks</i>, pick a mode and click cells on the Tracked layer.
  <i>Link</i> joins two tracks, <i>Break</i> starts a new track, <i>Swap</i> exchanges two IDs.
@@ -233,6 +235,19 @@ TRACK_TIPS = {
 }
 
 
+def _stack_crc(stack) -> int:
+    """Cheap fingerprint of a label stack (CRC32 of its bytes, frame by frame): did it change since it was saved?"""
+    import zlib
+
+    arr = np.asarray(stack)
+    if arr.ndim == 2:
+        arr = arr[np.newaxis]
+    crc = 0
+    for frame in arr:
+        crc = zlib.crc32(np.ascontiguousarray(frame, dtype=np.uint32), crc)
+    return crc
+
+
 class TissueKitWidget(QWidget):
     def __init__(self, napari_viewer: napari.Viewer):
         super().__init__()
@@ -261,6 +276,7 @@ class TissueKitWidget(QWidget):
         # Segmentation run (segmentation/<run>/) the Segmentation layer belongs to; None = not saved yet.
         self._seg_run: str | None = None
         self._seg_pending: dict | None = None  # settings of a finished run, written when it is saved
+        self._seg_saved_crc: int | None = None  # fingerprint of the Segmentation layer as last saved / loaded (Save all)
         self._compare_colors = iter(())  # colours for "Add for comparison" layers
         self._track_pick: tuple[int, int, int, int] | None = None
         self._track_undo: deque = deque(maxlen=20)
@@ -342,12 +358,22 @@ class TissueKitWidget(QWidget):
         self.status = QLabel("Ready")
         self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # A long message (the T1 summary after a run) must not make the panel taller: the window would grow past the
+        # screen and the viewer's frame slider would end up off screen. The label scrolls inside a fixed-height box.
+        self.status_box = QScrollArea()
+        self.status_box.setWidget(self.status)
+        self.status_box.setWidgetResizable(True)
+        self.status_box.setFrameShape(QFrame.NoFrame)
+        self.status_box.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.status_box.setMaximumHeight(84)
+        self.status_box.setMinimumHeight(28)
         layout = QVBoxLayout()
         layout.addLayout(self._folder_bar())
         layout.addWidget(tabs)
         layout.addWidget(self.overall_bar)
         layout.addWidget(self.step_bar)
-        layout.addWidget(self.status)
+        layout.addWidget(self.status_box)
         self.setLayout(layout)
         self._apply_section_style()
         self.viewer.events.theme.connect(self._apply_section_style)
@@ -804,6 +830,7 @@ class TissueKitWidget(QWidget):
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
         self._seg_base_masks = masks.copy()
+        self._seg_saved_crc = None
         self._seg_run = None  # a new run folder is made when it is saved (below)
         self._show_segmentation_layers(
             masks,
@@ -1090,6 +1117,7 @@ class TissueKitWidget(QWidget):
         self._seg_stem = (_strip_suffix(masks_path.name, SEG_MASK_SUFFIXES) or "segmentation").replace("/", "_")
         self._replace_labels("Segmentation", masks)
         self._seg_base_masks = masks.copy()
+        self._seg_saved_crc = _stack_crc(masks)
         self._seg_run = run
         self._seg_pending = None
         self.project.set_active_seg_run(run)
@@ -1747,6 +1775,7 @@ class TissueKitWidget(QWidget):
         cell_outlines_path = outdir / f"{stem}_cell_outlines.tif"
         save_tiff(cell_outlines_path, (np.asarray(outline_only) > 0).astype(np.uint8) * 255, cal)
         self._seg_base_masks = masks.copy()
+        self._seg_saved_crc = _stack_crc(masks)
         wf.set_active_seg_run(self._seg_run)
         self._refresh_seg_runs()
         self.status.setText(
@@ -1898,6 +1927,14 @@ class TissueKitWidget(QWidget):
         )
         self.track_divisions.toggled.connect(self._track_divisions_toggled)
         form.addRow("", self.track_divisions)
+        self.track_fill_holes = QCheckBox("Fill enclosed empty areas as new cells")
+        self.track_fill_holes.setToolTip(
+            "Empty space closed in by cells (a cell the segmentation missed, or one you deleted) gets a cell id "
+            "of its own before tracking, so it is tracked and numbered like the others. The Segmentation layer "
+            "is not changed. Empty space that reaches the image edge, like the outside of the embryo, stays empty."
+        )
+        self.track_fill_holes.setChecked(True)
+        form.addRow("", self.track_fill_holes)
         self.track_show_edge = QCheckBox("Show edge cells (Not recommended)")
         self.track_show_edge.setToolTip(
             "Off (default): cells whose track touches the image edge in any frame "
@@ -2608,6 +2645,7 @@ class TissueKitWidget(QWidget):
             max_distance=float(self.track_dist.value()),
             division_mode="lineage" if self.track_divisions.isChecked() else "legacy",
             n_jobs=int(self.track_jobs.value()),
+            fill_holes=self.track_fill_holes.isChecked(),
         )
 
         def work(progress):
@@ -2928,14 +2966,70 @@ class TissueKitWidget(QWidget):
         load = QPushButton("Load results")
         load.setToolTip("Load segmentation and tracking already saved in the results folder")
         load.clicked.connect(self._load_saved_results)
+        save_all = QPushButton("Save all")
+        save_all.setToolTip(
+            "Save every change not saved yet: the segmentation (cells and outlines), the track edits, the analysis "
+            "region, the T1 events and the cell selection. Things that are unchanged are not rewritten."
+        )
+        save_all.clicked.connect(self._save_all)
+        self.save_all_button = save_all
         help_button = QPushButton("Help")
         help_button.setToolTip("How to use this panel: the workflow and what every button does")
         help_button.clicked.connect(self._show_help)
         bar.addWidget(self.folder_label, 1)
         bar.addWidget(choose)
         bar.addWidget(load)
+        bar.addWidget(save_all)
         bar.addWidget(help_button)
         return bar
+
+    def _seg_unsaved(self) -> bool:
+        """The Segmentation layer (or bond strokes not applied yet) differs from what is saved."""
+        seg = self._layer("Segmentation")
+        if not isinstance(seg, Labels):
+            return False
+        ol = self._layer("Outlines")
+        if isinstance(ol, Labels) and self._seg_base_hand is not None and self._seg_base_outlines is not None:
+            from .core.ta_bond_edit import changed_frames
+
+            edited = np.asarray(ol.data)
+            if edited.ndim == 2:
+                edited = edited[np.newaxis, ...]
+            if changed_frames(self._seg_base_outlines, edited):
+                return True  # painted bonds waiting for Enter: saving applies them
+        if self._seg_saved_crc is None:
+            return self._seg_run is None  # a new run or imported outlines were never written; a loaded run we cannot judge
+        return _stack_crc(seg.data) != self._seg_saved_crc
+
+    def _save_all(self) -> None:
+        """Write every unsaved change of every tab; what is unchanged is left alone."""
+        if self._job_running():
+            self.status.setText("A job is running: Save all after it has finished.")
+            return
+        saved, notes = [], []
+        try:
+            if self._seg_unsaved():
+                self._save_segmentation()
+                saved.append("segmentation")
+            if self.region_tab.has_unsaved():
+                self.region_tab.save()
+                saved.append("analysis region")
+            if self._t1_result and (self._t1_result.get("events") or []):
+                self._autosave_t1(self._t1_result)
+                saved.append("T1 events")
+            if self.cell_props._state_path is not None:
+                self.cell_props._autosave()
+                saved.append("cell selection")
+        except Exception as exc:  # one failing save must not hide what was written
+            print(traceback.format_exc(), flush=True)
+            notes.append(f"stopped by an error: {exc}")
+        tracking = self._track_dirty and self._tracked_layer() is not None
+        if tracking:
+            saved.append("track edits (writing in the background)")
+        text = "Saved: " + ", ".join(saved) + "." if saved else "Nothing to save: everything is already saved."
+        self.status.setText(" ".join([text, *notes]))
+        if tracking:
+            self._save_track_edits()  # runs as a job; its own message follows when it is done
 
     def _show_help(self) -> None:
         dialog = QDialog(self)
@@ -3142,6 +3236,7 @@ class TissueKitWidget(QWidget):
             masks = tifffile.imread(found["segmentation"][0])
             self._replace_labels("Segmentation", masks)
             self._seg_base_masks = np.asarray(masks).copy()
+            self._seg_saved_crc = _stack_crc(masks)
             loaded.append("segmentation")
         outline_note = ""
         self._autosave_outlines_ok = False  # loading never rewrites the saved files; only Save does

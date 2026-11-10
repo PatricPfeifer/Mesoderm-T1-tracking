@@ -122,6 +122,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         "(default: 1 = serial; -1 = all cores). Results are identical.",
     )
     p.add_argument(
+        "--fill-holes",
+        action="store_true",
+        help="Give empty areas enclosed by cells a cell id of their own before tracking.",
+    )
+    p.add_argument(
         "--quiet",
         action="store_true",
         help="Less progress output.",
@@ -184,6 +189,7 @@ def main(argv=None) -> None:
         max_distance=args.max_distance,
         run_backward=args.backward,
         n_jobs=args.n_jobs,
+        fill_holes=args.fill_holes,
         verbose=not args.quiet,
     )
     if args.exclude_border > 0:

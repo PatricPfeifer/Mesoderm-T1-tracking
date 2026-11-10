@@ -61,6 +61,7 @@ class AnalysisRegionWidget(QWidget):
         self._busy = False
         self._drawn_key = None  # what the preview layers show now: (frame, geometry, anchors); skip identical redraws
         self._area_cache: tuple | None = None  # (geometry, {frame: RGBA image}) of the area preview
+        self._auto_hidden: set[str] = set()  # preview layers this widget hid (empty); the user's own toggle is left alone
         self.line_mode = STRAIGHT  # mode of the region on screen; a loaded old region keeps "polyline"
 
         self.notice = QLabel(TRACKING_REQUIRED)
@@ -452,11 +453,24 @@ class AnalysisRegionWidget(QWidget):
     def _layer(self, name):
         return self.viewer.layers[name] if name in self.viewer.layers else None
 
+    def _hide(self, layer) -> None:
+        """Hide a preview layer that has nothing to show now (remembered, so it is shown again when it has content)."""
+        if layer.visible:
+            layer.visible = False
+            self._auto_hidden.add(layer.name)
+
+    def _show(self, layer) -> None:
+        """New content for a preview layer: only turn it back on if this widget hid it. A layer the user toggled
+        off in the layer list stays off while the frame changes."""
+        if layer.name in self._auto_hidden:
+            self._auto_hidden.discard(layer.name)
+            layer.visible = True
+
     def _set_shapes(self, paths, colors, scale, translate) -> None:
         layer = self._layer(LINES_LAYER)
         if not paths:
             if layer is not None:
-                layer.visible = False
+                self._hide(layer)
             return
         if layer is None:
             active = self.viewer.layers.selection.active
@@ -468,13 +482,13 @@ class AnalysisRegionWidget(QWidget):
         else:
             layer.data = []
             layer.add(paths, shape_type="path", edge_color=colors, edge_width=3)
-            layer.visible = True
+            self._show(layer)
 
     def _set_points(self, pts, cols, scale, translate) -> None:
         layer = self._layer(CELLS_LAYER)
         if not pts:
             if layer is not None:
-                layer.visible = False
+                self._hide(layer)
             return
         data = np.asarray(pts, float)
         if layer is None:
@@ -487,7 +501,7 @@ class AnalysisRegionWidget(QWidget):
         else:
             layer.data = data
             layer.face_color = cols
-            layer.visible = True
+            self._show(layer)
 
     def _set_area(self, frame: int, scale, translate) -> None:
         from scipy import ndimage as ndi
@@ -496,7 +510,7 @@ class AnalysisRegionWidget(QWidget):
         layer = self._layer(AREA_LAYER)
         if self.geom is None or not self.anchors:
             if layer is not None:
-                layer.visible = False
+                self._hide(layer)
             return
         if self._area_cache is None or self._area_cache[0] is not self.geom:
             self._area_cache = (self.geom, {})
@@ -518,7 +532,7 @@ class AnalysisRegionWidget(QWidget):
                 self.viewer.layers.selection.active = active
         else:
             layer.data = img
-            layer.visible = True
+            self._show(layer)
 
     # ---- results use -------------------------------------------------------------------------------------------
     def geometry(self) -> Geometry | None:
@@ -602,6 +616,19 @@ class AnalysisRegionWidget(QWidget):
         n_in = len(geom.inside_ids(0))
         self.status.setText(f"Saved the region ({n_in} of {len(geom.pos[0])} cells inside in frame 1) → {folder}")
         self._notify()
+
+    def has_unsaved(self) -> bool:
+        """The region differs from the saved file (new, changed, or emptied while a file exists)."""
+        folder = self._folder()
+        saved = folder is not None and (folder / REGION_FILE).is_file()
+        if self.geometry() is not None:
+            if not saved:
+                return folder is not None
+            try:
+                return region_hash(Region.load(folder / REGION_FILE)) != self.current_hash()
+            except Exception:
+                return True
+        return saved and not self.lines and not self.anchors
 
     def load(self) -> None:
         folder = self._folder()

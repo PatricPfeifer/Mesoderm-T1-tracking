@@ -64,6 +64,18 @@ def _stage(timings: dict[str, float], name: str):
         timings[name] = round(timings.get(name, 0.0) + timer() - t0, 3)
 
 
+def fill_movie_holes(movie: Movie, verbose: bool = True) -> Movie:
+    """Give every empty area enclosed by cells a cell id of its own (core/holes.py), so tracking sees and numbers it.
+
+    Without this, a cell the segmentation missed (or one deleted by hand) stays an empty hole with no id in the tracked stack."""
+    from ..holes import fill_enclosed_holes
+
+    movie.masks, added = fill_enclosed_holes(movie.masks)
+    if verbose:
+        print(f"Filled {added} enclosed empty area(s) as new cells before tracking", flush=True)
+    return movie
+
+
 def movie_from_arrays(
     masks: np.ndarray,
     intensity: np.ndarray | None = None,
@@ -321,9 +333,12 @@ def track_arrays(
     calibration: Calibration | None = None,
     n_jobs: int = 1,
     progress=None,
+    fill_holes: bool = False,
 ) -> dict[str, Any]:
     """Track in-memory label (and optional intensity) stacks."""
     movie = movie_from_arrays(masks, intensity, drop_blank=True)
+    if fill_holes:
+        fill_movie_holes(movie, verbose)
     return track_loaded(
         movie,
         output_dir,
@@ -374,6 +389,7 @@ def run_tracking(
     min_daughter_frames: int = 3,
     n_jobs: int = 1,
     progress=None,
+    fill_holes: bool = False,
 ) -> dict[str, Any]:
     """Track a Cellpose movie and write all outputs under ``output_dir``."""
     movie = load_movie(
@@ -382,6 +398,8 @@ def run_tracking(
         max_frames=max_frames,
         drop_blank=True,
     )
+    if fill_holes:
+        fill_movie_holes(movie, verbose)
     stem = input_stem(intensity_path or masks_path)
     return track_loaded(
         movie,
