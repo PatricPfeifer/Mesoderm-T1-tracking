@@ -182,7 +182,9 @@ class CellCorrectionWidget(QWidget):
     correction_made = Signal(np.ndarray)  # Emitted when masks are modified
     MAX_UNDO_STEPS = 20
     CLICK_THRESHOLD = 4  # px: a press that moves less than this is a click
-    OWN_LAYERS = frozenset({"Outlines", "Outlines (file)", "Tracked"})  # never adopted as the masks layer
+    # Never adopted (renamed to "Segmentation") as the masks layer. "Hovered cell" / "Selected cells" are the
+    # Cell properties overlays; renaming them broke cell selection with KeyError "'Hovered cell' is not in list".
+    OWN_LAYERS = frozenset({"Outlines", "Outlines (file)", "Tracked", "Hovered cell", "Selected cells"})
 
     def __init__(self, viewer: "napari.Viewer", data_manager: "DataManager",
                  visualization_manager: "VisualizationManager", parent: QWidget = None):
@@ -207,6 +209,8 @@ class CellCorrectionWidget(QWidget):
         self._saved_mode = None  # (Outlines layer, its tool) while Option is held
 
         self.undo_stack = deque(maxlen=self.MAX_UNDO_STEPS)
+        # Called with the frame before a cell is deleted; returns a function that puts back what it saved (undo).
+        self.snapshot_hook: Optional[Callable[[int], Callable[[], None]]] = None
         # Cmd/Ctrl+Z is handled by the plugin panel (TissueKitWidget._undo_edit), which calls undo_last_action;
         # these bindings on the napari viewer remain for use without the panel.
         self.viewer.bind_key('Control-Z', self.undo_last_action)
@@ -243,7 +247,7 @@ class CellCorrectionWidget(QWidget):
         if on == self.edit_active:
             return
         self.edit_active = on
-        # The yellow Outlines layer is in paint mode and would paint a dot under the same click: park its tool.
+        # The Outlines layer is in paint mode and would paint a dot under the same click: park its tool.
         if on:
             for layer in self.viewer.layers:
                 if layer.name == "Outlines" and isinstance(layer, Labels) and layer.mode in ("paint", "erase", "fill"):
@@ -290,8 +294,12 @@ class CellCorrectionWidget(QWidget):
             return
         frame = int(self.viewer.dims.point[0]) if len(self.masks_layer.data.shape) == 3 else 0
         before = current_mask.copy()  # this frame only: the undo step does not copy the whole movie
+        # state kept beside the masks (the plugin's outline editor: bonds / outlines of this frame), put back first
+        restore_extra = self.snapshot_hook(frame) if self.snapshot_hook is not None else None
 
         def restore() -> None:
+            if restore_extra is not None:
+                restore_extra()
             self.data_manager.segmentation_data = (before, frame)
             self.vis_manager.update_tracking_visualization((before, frame))
 

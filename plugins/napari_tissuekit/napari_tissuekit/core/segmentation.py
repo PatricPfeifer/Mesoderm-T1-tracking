@@ -4,6 +4,7 @@
 Saves progress after every frame so a short Slurm walltime can be resumed.
 
 Writes ``*_cp_masks.tif`` and ``*_cell_outlines.tif`` (1 px cell outlines, 255 on black; the plugin's outline file).
+The outlines are part of every segmentation (also in napari): there is no way to skip them.
 
 Example (``tissuekit segment`` wraps this with the results-folder layout):
   python -m napari_tissuekit.core.segmentation \
@@ -24,8 +25,7 @@ from tifffile import imread, imwrite
 
 from .cell_size import MIN_CELL_AREA, absorb_small_labels
 from .holes import fill_enclosed_holes
-from .outline_io import hand_stack_to_outline
-from .ta_bond_edit import thin_hand_stack
+from .ta_bond_edit import make_bonds
 
 from .movie_calibration import read_calibration, save_tiff  # noqa: E402
 
@@ -145,13 +145,24 @@ def segment_stack(
 
 
 def cell_outline_stack(masks: np.ndarray, progress=None) -> np.ndarray:
-    """T,Y,X uint8 stack, 255 on the 1 px cell outlines and 0 elsewhere.
+    """T,Y,X uint8 stack, 255 on the 1 px cell outlines and 0 elsewhere (``*_cell_outlines.tif``).
 
-    The same file the napari plugin saves as ``*_cell_outlines.tif``: Tissue Analyzer style
-    1 px bonds from a watershed of the masks, keeping only bond pixels that touch a cell.
+    The outline step of every segmentation (:func:`napari_tissuekit.core.ta_bond_edit.make_bonds`): Tissue Analyzer
+    style 1 px bonds from a watershed of the masks, keeping only bond pixels that touch a cell.
     """
-    hand = thin_hand_stack(masks, progress)
-    return (hand_stack_to_outline(hand) > 0).astype(np.uint8) * 255
+    return (make_bonds(masks, progress)[1] > 0).astype(np.uint8) * 255
+
+
+def outline_progress_printer(prefix: str = "  ") -> Callable[[int, str], None]:
+    """Progress callback for the outline step that prints every 10 %."""
+    last = [-10]
+
+    def _progress(pct: int, msg: str) -> None:
+        if pct >= last[0] + 10:
+            last[0] = pct
+            print(f"{prefix}{msg} ({pct}%)", flush=True)
+
+    return _progress
 
 
 CHECKPOINT_EVERY = 25  # frames between resume-file writes (env TISSUEKIT_CHECKPOINT_EVERY)
@@ -242,14 +253,7 @@ def main(argv=None) -> None:
     partial.unlink(missing_ok=True)
     prog.unlink(missing_ok=True)
     cell_path = outdir / f"{inp.stem}_cell_outlines.tif"
-    last = [-10]
-
-    def _progress(pct: int, msg: str) -> None:
-        if pct >= last[0] + 10:
-            last[0] = pct
-            print(f"  {msg} ({pct}%)", flush=True)
-
-    save_tiff(cell_path, cell_outline_stack(masks, _progress), cal)
+    save_tiff(cell_path, cell_outline_stack(masks, outline_progress_printer()), cal)
     print("wrote", cell_path, flush=True)
 
 
