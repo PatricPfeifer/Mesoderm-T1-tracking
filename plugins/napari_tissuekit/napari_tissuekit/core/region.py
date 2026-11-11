@@ -12,7 +12,9 @@ clicks cells in the areas to keep (or to disregard); their signatures define the
            (no "keep" click at all: every signature except the "drop" ones)
 
 A cell counts as inside in a frame when its centroid in that frame has a kept signature. The cells that were clicked
-to form a boundary line (and their daughters after a division) are the boundary itself and never count as inside. Nothing is cut from the
+to form a boundary line (and their daughters after a division) sit on that line: their side of their own line does not matter, they
+count as inside when the area they are in is kept as far as the OTHER lines tell (with one line: always). So a T1 that touches the
+border is analysed when its other cells are inside. Nothing is cut from the
 images or labels: T1 events and cell properties just use the cells inside, and exported tiffs show the kept area as a
 yellow outline with the rest dimmed (`burn_region`).
 
@@ -287,7 +289,8 @@ class Geometry:
         self.polys = [self._line_over_time(order) for order in self.orders]
         self.n_sigs = 2 ** len(region.lines)
         self.kept = self._kept_signatures()
-        self.boundary_cells = self._boundary_cells()
+        self.boundary_masks = self._boundary_masks()  # {track id: bit mask of the lines it was clicked for (daughters inherit)}
+        self.boundary_cells = frozenset(self.boundary_masks)
         self._lut = np.zeros(self.n_sigs, dtype=bool)
         self._lut[sorted(self.kept)] = True
         self._grid = None
@@ -386,15 +389,17 @@ class Geometry:
         base = keep if keep else set(range(self.n_sigs))
         return base - drop
 
-    def _boundary_cells(self) -> frozenset:
-        """Track IDs clicked for a boundary line, plus the daughters that continue them after a division."""
-        out, todo = set(), [p.track_id for line in self.region.lines for p in line]
-        while todo:
-            t = todo.pop()
-            if t not in out:
-                out.add(t)
-                todo.extend(self.children.get(t, ()))
-        return frozenset(out)
+    def _boundary_masks(self) -> dict:
+        """Track IDs clicked for a boundary line, plus the daughters that continue them after a division: {id: bit mask of lines}."""
+        out: dict = {}
+        for i, line in enumerate(self.region.lines):
+            todo = [p.track_id for p in line]
+            while todo:
+                t = todo.pop()
+                if not out.get(t, 0) & (1 << i):
+                    out[t] = out.get(t, 0) | (1 << i)
+                    todo.extend(self.children.get(t, ()))
+        return out
 
     # -- what is inside ------------------------------------------------------------------------------------------
     def keep_mask(self, frame: int) -> np.ndarray:
@@ -412,12 +417,16 @@ class Geometry:
         return mask
 
     def inside_ids(self, frame: int) -> set:
-        """Track IDs whose centroid is in the kept area in one frame (the boundary cells themselves are left out)."""
+        """Track IDs whose centroid is in the kept area in one frame. A boundary cell (clicked for a line, or its daughter) is
+        judged by the other lines only: its side of its own line does not count."""
         ids = list(self.pos[frame])
         if not ids:
             return set()
         sig = self.signature_points(frame, np.array([self.pos[frame][i] for i in ids]))
-        return {i for i, s in zip(ids, sig) if int(s) in self.kept and i not in self.boundary_cells}
+        full = self.n_sigs - 1
+        return {i for i, s in zip(ids, sig)
+                if int(s) in self.kept
+                or (i in self.boundary_masks and any(((k ^ int(s)) & full & ~self.boundary_masks[i]) == 0 for k in self.kept))}
 
     def inside_sets(self) -> list:
         """Per frame: set of track IDs whose centroid is in the kept area."""

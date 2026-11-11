@@ -209,3 +209,23 @@ def test_vertex_clause_needs_a_true_vertex_frame_after_the_first_flip():
     vertex[5] = True                                                                    # the vertex BEFORE the first flip is normal
     ev, _, _ = classify_quartet(lx, ly, P, side_ok_loff=vertex)
     assert ev[0].klass == "clean"
+
+
+def test_junction_centre_is_the_mean_position_of_the_contact_between_the_two_cells():
+    from types import SimpleNamespace
+
+    from napari_tissuekit.core.t1.t1_states_run import junction_centre
+
+    lab = np.zeros((2, 40, 60), np.uint32)
+    lab[:, 5:25, 10:30] = 1          # cell 1 and cell 2 share a vertical interface between x = 29 and x = 30
+    lab[:, 5:25, 30:50] = 2
+    cy = np.full((2, 3), np.nan, np.float32)
+    cx = np.full((2, 3), np.nan, np.float32)
+    cy[:, 1], cx[:, 1], cy[:, 2], cx[:, 2] = 14.5, 19.5, 14.5, 39.5
+    present = np.zeros((2, 3), bool)
+    present[:, 1:] = True
+    md = SimpleNamespace(labels=lab, T=2, expand=3, present=present, cy=cy, cx=cx)
+    x, y, n = junction_centre(md, (1, 2), 0, 2)
+    assert n == 2 and abs(x - 29.5) < 1.0 and abs(y - 14.5) < 1.0   # the grown labels meet at x = 29.5 +- the growth rounding
+    present[:, 2] = False
+    assert junction_centre(md, (1, 2), 0, 2)[2] == 0 and np.isnan(junction_centre(md, (1, 2), 0, 2)[0])
