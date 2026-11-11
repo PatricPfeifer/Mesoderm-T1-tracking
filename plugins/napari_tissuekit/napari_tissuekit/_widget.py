@@ -270,6 +270,8 @@ class TissueKitWidget(QWidget):
         self._tracked_run: str | None = None
         # Cluster (bwUniCluster) segmentation runs in its own thread, so local work goes on.
         self._remote = RemoteRunner(self)
+        # "Cancel all jobs in cluster" has its own thread: it must work while a job is watched.
+        self._remote_cancel = RemoteRunner(self)
         self._remote_tmp: Path | None = None
         self._remote_fetch_job = None
         self._remote_events: list[str] = []  # timestamped steps for the Log window
@@ -293,6 +295,7 @@ class TissueKitWidget(QWidget):
             open_egg=self._open_batch_egg,
             run_items=self._run_batch,
             preview_items=self._preview_batch,
+            cancel_all=self._cancel_all_cluster_jobs,
         )
         batch_index = tabs.addTab(self.batch, "Batch")
         # read the folder again when the tab is shown (presets saved, runs made meanwhile)
@@ -522,6 +525,13 @@ class TissueKitWidget(QWidget):
         run_row.addWidget(self.seg_remote, 1)
         run_row.addWidget(cluster_btn)
         segment_inner.addLayout(run_row)
+        self.seg_remote_cancel = QPushButton("Cancel all jobs in cluster")
+        self.seg_remote_cancel.setToolTip(
+            "Log in and cancel every waiting and running job of your cluster user (scancel -u). "
+            "Works while a job is being watched; that job then ends as CANCELLED."
+        )
+        self.seg_remote_cancel.clicked.connect(lambda: self._cancel_all_cluster_jobs())
+        segment_inner.addWidget(self.seg_remote_cancel)
         self.seg_remote_bar = QProgressBar()
         self.seg_remote_bar.setTextVisible(True)
         self.seg_remote_bar.hide()  # shown while a cluster job runs
@@ -897,6 +907,69 @@ class TissueKitWidget(QWidget):
             return remote.setup_cluster(cfg, password, otp, progress, on_log=log)
 
         self._start_remote(work, on_done=self._remote_setup_done)
+
+    def _cancel_all_cluster_jobs(self) -> None:
+        """Cancel every waiting and running Slurm job of the cluster user (own login, own thread)."""
+        from .core import remote
+        from .remote_widget import LoginDialog
+
+        if self._remote_cancel.busy:
+            self.status.setText("[cluster] Already cancelling the cluster jobs ...")
+            return
+        cfg = self._remote_cfg()
+        if cfg is None:
+            return
+        answer = QMessageBox.warning(
+            self, "Cancel all jobs in cluster",
+            f"Cancel ALL waiting and running jobs of the cluster user '{cfg.user}'?\n\n"
+            "This includes jobs not started from this plugin. Running jobs stop at once; "
+            "results they have not finished are lost. Batch items already finished can still "
+            "be downloaded with 'Fetch cluster results'.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        creds = LoginDialog(cfg, f"Cancel all waiting and running jobs of '{cfg.user}' (scancel -u).",
+                            self).credentials()
+        if creds is None:
+            return
+        password, otp = creds
+        for button in (self.seg_remote_cancel, self.batch.cancel_button):
+            button.setEnabled(False)
+        self._remote_event("---- cancel all cluster jobs")
+
+        def work(progress, _log):
+            return remote.cancel_all_jobs(cfg, password, otp, progress)
+
+        self._remote_cancel.start(work, self._cancel_all_progress, self._cancel_all_done, self._cancel_all_failed)
+
+    def _cancel_all_progress(self, _percent: int, message: str) -> None:
+        self.status.setText(f"[cluster] {message}")
+        self._remote_event(message)
+
+    def _cancel_all_reset(self) -> None:
+        for button in (self.seg_remote_cancel, self.batch.cancel_button):
+            button.setEnabled(True)
+
+    def _cancel_all_done(self, jobs) -> None:
+        self._cancel_all_reset()
+        for job_id, name, state in jobs:
+            self._remote_event(f"cancelled job {job_id} {name} (was {state.lower()})")
+        if not jobs:
+            self.status.setText("[cluster] No waiting or running jobs to cancel.")
+        else:
+            self.status.setText(f"[cluster] Cancelled {len(jobs)} job(s) "
+                                f"({', '.join(j[0] for j in jobs[:5])}{' ...' if len(jobs) > 5 else ''}).")
+        if not self._remote.busy:
+            self.batch.refresh()
+
+    def _cancel_all_failed(self, exc) -> None:
+        from .core.remote import RemoteError
+
+        self._cancel_all_reset()
+        text = str(exc) if isinstance(exc, RemoteError) else f"{type(exc).__name__}: {exc}"
+        self._remote_event(f"cancel FAILED: {text}")
+        self.status.setText(f"[cluster] Cancel failed: {text.splitlines()[0]} (details: Log...)")
 
     def _remote_setup_done(self, summary) -> None:
         self._remote_finish()

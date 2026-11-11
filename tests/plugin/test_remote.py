@@ -520,3 +520,41 @@ def test_timeout_says_how_to_fix_it(tmp_path):
     job = remote.RemoteJob("4242", "t", "/home/u/r/t", "m.tif", str(tmp_path))
     with pytest.raises(remote.RemoteError, match="Time limit"):
         remote.wait_for(session, job, lambda *_: None, 0, lambda _s: None)
+
+
+class _SlurmQueue(FakeSession):
+    """squeue -u lists the user's jobs until scancel -u empties the queue."""
+
+    def __init__(self, disk, jobs):
+        super().__init__(disk, [])
+        self.queue = list(jobs)
+
+    def run(self, command, timeout=120, check=True):
+        self.commands.append(command)
+        if command.startswith("squeue -h -u"):
+            return "".join(f"{i}|{n}|{s}\n" for i, n, s in self.queue)
+        if command.startswith("scancel -u"):
+            self.queue = []
+            return ""
+        return super().run(command, timeout, check)
+
+
+def test_cancel_all_jobs_cancels_waiting_and_running(tmp_path, monkeypatch):
+    session = _SlurmQueue(tmp_path / "cluster", [("11", "tk_seg_egg1", "RUNNING"),
+                                                 ("12", "tk_batch_2x4", "PENDING")])
+    monkeypatch.setattr(remote.Session, "connect", classmethod(lambda cls, *a, **k: session))
+    remote.remember_job(remote.RemoteJob("11", "t", "/home/u/r/t", "egg1.tif", str(tmp_path)))
+    remote.remember_job(remote.RemoteJob("12", "b", "/home/u/r/b", "batch of 4", str(tmp_path),
+                                         items=[{"movie_name": "e.tif", "status": "pending"}]))
+    cancelled = remote.cancel_all_jobs(_cfg(), "pw", "1", lambda *_: None)
+    assert [j[0] for j in cancelled] == ["11", "12"]
+    assert "scancel -u ho_test" in session.commands
+    # the single job has nothing to fetch any more; the batch may still have finished items
+    assert [j.job_id for j in remote.load_jobs()] == ["12"]
+
+
+def test_cancel_all_jobs_with_empty_queue_sends_no_scancel(tmp_path, monkeypatch):
+    session = _SlurmQueue(tmp_path / "cluster", [])
+    monkeypatch.setattr(remote.Session, "connect", classmethod(lambda cls, *a, **k: session))
+    assert remote.cancel_all_jobs(_cfg(), "pw", "1", lambda *_: None) == []
+    assert not any(c.startswith("scancel") for c in session.commands)

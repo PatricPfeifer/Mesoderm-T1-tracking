@@ -80,6 +80,7 @@ class BatchPanel(QWidget):
         open_egg: Callable[[core_batch.EggStatus, str | None], None],
         run_items: Callable[[list[core_batch.BatchItem], list], None],
         preview_items: Callable[[list[core_batch.BatchItem], list], None] | None = None,
+        cancel_all: Callable[[], None] | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -88,6 +89,7 @@ class BatchPanel(QWidget):
         self._open_egg = open_egg
         self._run_items = run_items
         self._preview_items = preview_items
+        self._cancel_all = cancel_all
         state = _load_state()
         self.folder: Path | None = Path(state["folder"]) if state.get("folder") else None
         self._checked_profiles: set[str] = set(state.get("profiles") or ["default"])
@@ -189,6 +191,14 @@ class BatchPanel(QWidget):
         buttons.addWidget(self.preview_button)
         buttons.addWidget(self.open_button)
         layout.addLayout(buttons)
+        self.cancel_button = QPushButton("Cancel all jobs in cluster")
+        self.cancel_button.setToolTip(
+            "Log in and cancel every waiting and running job of your cluster user (scancel -u). "
+            "Items a running batch already finished are kept."
+        )
+        self.cancel_button.clicked.connect(lambda: self._cancel_all() if self._cancel_all else None)
+        self.cancel_button.setEnabled(cancel_all is not None)
+        layout.addWidget(self.cancel_button)
         self.bar = QProgressBar()
         self.bar.setTextVisible(True)
         self.bar.hide()  # shown while a batch runs
