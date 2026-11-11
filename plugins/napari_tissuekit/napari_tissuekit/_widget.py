@@ -146,7 +146,7 @@ HELP_HTML = """
 <li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
 <li><b>Save segmentation (Ctrl+S)</b>: write the masks and the 1 px outlines (<code>*_cp_masks.tif</code>, <code>*_cell_outlines.tif</code>).</li>
 <li><b>Export TIFF</b>: same as Save.</li>
-<li>A cell needs at least <b>15 px</b> in every step (segmentation, outline edits, manual drawing, tracking); smaller regions are dropped or refused.</li>
+<li>A cell needs at least <b>50 px</b> in every step (segmentation, outline edits, manual drawing, tracking). Smaller regions, and empty gaps inside the tissue smaller than that, are not left empty: the neighbouring cells take them over so their membranes run across.</li>
 <li><b>Ctrl/Cmd+Z</b> takes back the last paint stroke that is not applied yet; otherwise the last applied bond edit (Enter) or cell deletion.</li>
 <li><b>M</b> hides or shows the outlines. <i>Watershed pad</i>: area around an edit that is recomputed (smaller = faster).</li>
 <li><b>Delete cell</b>: hold <b>Option</b> and left-click a cell to delete it (Cmd/Ctrl+Z undoes it).</li>

@@ -22,7 +22,7 @@ import numpy as np
 from cellpose import models
 from tifffile import imread, imwrite
 
-from .cell_size import MIN_CELL_AREA
+from .cell_size import MIN_CELL_AREA, absorb_small_labels
 from .holes import fill_enclosed_holes
 from .outline_io import hand_stack_to_outline
 from .ta_bond_edit import thin_hand_stack
@@ -137,6 +137,7 @@ def segment_stack(
             masks[t], n_new = fill_enclosed_holes(masks[t])
             if n_new:
                 print(f"  filled {n_new} enclosed holes as new cells", flush=True)
+        masks[t] = absorb_small_labels(masks[t])[0]  # under the minimal cell size: neighbours take over (no empty spots)
         if on_frame is not None:
             on_frame(t, masks)
         print(f"  labels={int(masks[t].max())}", flush=True)
