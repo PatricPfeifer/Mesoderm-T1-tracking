@@ -67,3 +67,22 @@ def test_stroke_beside_a_membrane_does_not_leave_a_double_line():
     new = apply_drawing_hand(hand, np.zeros_like(stroke), stroke, min_seed_area=14, pad=128)
     cells = label(new, connectivity=1, background=255)
     assert cells.max() == 2  # no thin cell between the two lines
+
+
+def _border_pixels(o):
+    return int(o[0].sum() + o[-1].sum() + o[:, 0].sum() + o[:, -1].sum())
+
+
+def test_tiny_gap_beside_the_tissue_edge_does_not_draw_lines_to_the_image_edge():
+    # A closed 1 px hole next to the tissue border used to un-blank the whole background outside the tissue, so the
+    # watershed split it and bonds ran from the edge cells to the image border.
+    masks = _tissue()
+    assert _border_pixels(hand_to_outline(thin_hand(masks))) == 0
+    bad = 0
+    dist = ndi.distance_transform_edt(masks > 0)
+    ys, xs = np.nonzero((dist > 1.5) & (dist < 3.5))  # 2-3 px inside the tissue border (the old code failed here)
+    for y, x in zip(ys, xs):
+        m = masks.copy()
+        m[y, x] = 0
+        bad += _border_pixels(hand_to_outline(thin_hand(m))) > 0
+    assert bad == 0

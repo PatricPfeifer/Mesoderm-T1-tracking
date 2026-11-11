@@ -12,6 +12,8 @@ Example (``tissuekit segment`` wraps this with the results-folder layout):
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -20,7 +22,7 @@ import numpy as np
 from cellpose import models
 from tifffile import imread, imwrite
 
-from .cell_size import MIN_CELL_AREA
+from .cell_size import MIN_CELL_AREA, absorb_small_labels
 from .holes import fill_enclosed_holes
 from .outline_io import hand_stack_to_outline
 from .ta_bond_edit import thin_hand_stack
@@ -135,6 +137,7 @@ def segment_stack(
             masks[t], n_new = fill_enclosed_holes(masks[t])
             if n_new:
                 print(f"  filled {n_new} enclosed holes as new cells", flush=True)
+        masks[t] = absorb_small_labels(masks[t])[0]  # under the minimal cell size: neighbours take over (no empty spots)
         if on_frame is not None:
             on_frame(t, masks)
         print(f"  labels={int(masks[t].max())}", flush=True)
@@ -149,6 +152,9 @@ def cell_outline_stack(masks: np.ndarray, progress=None) -> np.ndarray:
     """
     hand = thin_hand_stack(masks, progress)
     return (hand_stack_to_outline(hand) > 0).astype(np.uint8) * 255
+
+
+CHECKPOINT_EVERY = 25  # frames between resume-file writes (env TISSUEKIT_CHECKPOINT_EVERY)
 
 
 def main(argv=None) -> None:
@@ -186,9 +192,37 @@ def main(argv=None) -> None:
         start = 0
         print(f"starting fresh: {n_frames} frames", flush=True)
 
+    # The resume file holds the whole masks stack, so rewriting it after every frame writes
+    # N^2/2 frames in total (about 130 GB for 240 frames of 1024x2160). Write it every
+    # CHECKPOINT_EVERY frames instead, and when Slurm sends SIGTERM at the time limit.
+    done = [start]  # frames finished so far (masks[:done] are complete)
+    saved = [start]
+
+    def _write_checkpoint() -> None:
+        if done[0] <= saved[0]:
+            return
+        tmp = partial.with_name(partial.stem + ".tmp.npy")  # replace atomically: a kill never leaves half a file
+        np.save(tmp, current[0])
+        os.replace(tmp, partial)
+        prog.write_text(str(done[0]))
+        saved[0] = done[0]
+
+    current: list = [masks]
+    every = max(1, int(os.environ.get("TISSUEKIT_CHECKPOINT_EVERY", CHECKPOINT_EVERY)))
+
     def _checkpoint(t: int, frame_masks: np.ndarray) -> None:
-        np.save(partial, frame_masks)
-        prog.write_text(str(t + 1))
+        current[0] = frame_masks
+        done[0] = t + 1
+        if done[0] % every == 0:
+            _write_checkpoint()
+
+    def _on_sigterm(signum, frame) -> None:
+        print(f"signal {signum}: saving checkpoint at frame {done[0]}/{n_frames}", flush=True)
+        if current[0] is not None:
+            _write_checkpoint()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     masks = segment_stack(
         img,

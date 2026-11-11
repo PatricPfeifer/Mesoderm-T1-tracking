@@ -551,14 +551,37 @@ def paint_pair(
     pair: frozenset[int],
     color: tuple[int, int, int],
     reach: int,
+    boxes: list | None = None,
 ) -> None:
+    """Paint the facing rims of the pair. ``boxes`` (``scipy.ndimage.find_objects(labels)``, optional) lets the
+    work run on a small window around the two cells instead of the whole frame; the pixels painted are the same
+    (the window is padded by ``reach + 1``, so no cell touches its edge unless it touches the image edge)."""
     a, b = tuple(pair)
-    mask = pair_outline_mask(labels, a, b, reach)
+    if boxes is None:
+        mask = pair_outline_mask(labels, a, b, reach)
+        if mask.any():
+            dst[mask] = color
+        return
+    if not (0 < a <= len(boxes) and 0 < b <= len(boxes)) or boxes[a - 1] is None or boxes[b - 1] is None:
+        return  # a cell is absent in this frame: nothing to draw (same as an all-False mask)
+    pad = max(reach, 1) + 1
+    h, w = labels.shape
+    ys = min(boxes[a - 1][0].start, boxes[b - 1][0].start)
+    ye = max(boxes[a - 1][0].stop, boxes[b - 1][0].stop)
+    xs = min(boxes[a - 1][1].start, boxes[b - 1][1].start)
+    xe = max(boxes[a - 1][1].stop, boxes[b - 1][1].stop)
+    win = (slice(max(ys - pad, 0), min(ye + pad, h)), slice(max(xs - pad, 0), min(xe + pad, w)))
+    mask = pair_outline_mask(labels[win], a, b, reach)
     if mask.any():
-        dst[mask] = color
+        dst[win][mask] = color
 
 
 def grayscale_rgb(rgb: np.ndarray) -> np.ndarray:
+    if rgb.ndim == 4:  # one frame at a time: float32 temporaries of the whole stack would need several GB
+        out = np.empty(rgb.shape, dtype=np.uint8)
+        for t in range(rgb.shape[0]):
+            out[t] = grayscale_rgb(rgb[t])
+        return out
     luma = (
         0.299 * rgb[..., 0].astype(np.float32)
         + 0.587 * rgb[..., 1].astype(np.float32)
@@ -1088,6 +1111,13 @@ def render_overlay(
     n = out.shape[0]
     h, w = out.shape[1:3]
 
+    boxes_cache: dict[int, list] = {}
+
+    def boxes_at(t: int) -> list:  # bounding box of every cell in frame t, computed once and only for frames that are drawn
+        if t not in boxes_cache:
+            boxes_cache[t] = ndi.find_objects(labels[t].astype(np.int64, copy=False))
+        return boxes_cache[t]
+
     for ev in events:
         colors = type_colors(ev["type"])
         breaking = colors["breaking"]
@@ -1101,12 +1131,12 @@ def render_overlay(
         for t in range(win0, win1 + 1):
             dst = out[t]
             if t < t0:
-                paint_pair(dst, labels[t], ab, breaking, reach)
+                paint_pair(dst, labels[t], ab, breaking, reach, boxes_at(t))
             elif t > t1:
-                paint_pair(dst, labels[t], cd, building, reach)
+                paint_pair(dst, labels[t], cd, building, reach, boxes_at(t))
             else:
-                paint_pair(dst, labels[t], ab, breaking, reach)
-                paint_pair(dst, labels[t], cd, building, reach)
+                paint_pair(dst, labels[t], ab, breaking, reach, boxes_at(t))
+                paint_pair(dst, labels[t], cd, building, reach, boxes_at(t))
                 xy = four_xy[t].get(ev["quartet"])
                 if xy is None:
                     xy = (ev["y"], ev["x"])
@@ -1577,6 +1607,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--off-px", type=float, default=None, help="states: contact pixels below which it switches off (default: DEFINITION)")
     p.add_argument("--no-side-rule", action="store_true", help="states: switch the neighbour-relationship (side cells) rule off")
     p.add_argument("--no-vertex-clause", action="store_true", help="states: switch the return-to-vertex clause off")
+    p.add_argument("--region", type=Path, default=None,
+                   help="states: analysis_region/region.json from the plugin's Analysis cropping tab; only T1s whose four cells are inside the kept area are written")
     p.add_argument("--bond-cutoff", type=float, default=3.0)
     p.add_argument(
         "--border-rings",
@@ -1735,6 +1767,7 @@ def main(argv=None) -> None:
             config=args.states_config, t_dwell=args.t_dwell, t_stable=args.t_stable, t_end=args.t_end,
             on_px=args.on_px, off_px=args.off_px, side_rule=False if args.no_side_rule else None,
             vertex_clause=False if args.no_vertex_clause else None, n_jobs=args.n_jobs,
+            region=args.region.expanduser().resolve() if args.region is not None else None,
         )
         print("Done (states classifier).", flush=True)
         return

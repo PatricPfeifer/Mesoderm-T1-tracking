@@ -142,7 +142,13 @@ def outside_background(ext: np.ndarray, labels: np.ndarray, max_gap: float = MAX
     touched = np.zeros(int(ext_regions.max()) + 1, dtype=bool)
     touched[np.unique(ext_regions[gaps & ext])] = True  # an ext area that holds a closed gap is the gap (plus its rim)
     touched[0] = False
-    return ext & ~touched[ext_regions]
+    # An ext area that reaches the image edge is the background outside the tissue, never a gap: a single closed gap
+    # that happens to touch it (e.g. a 1 px hole beside the tissue border) must only give up its own rim, not the
+    # whole outside (which would then be flooded by the watershed and leave outline lines running to the image edge).
+    edge = np.unique(np.concatenate([ext_regions[0], ext_regions[-1], ext_regions[:, 0], ext_regions[:, -1]]))
+    touched[edge] = False
+    near_gap = ndi.binary_dilation(gaps, structure=np.ones((3, 3), bool), iterations=2)
+    return ext & ~touched[ext_regions] & ~(np.isin(ext_regions, edge) & near_gap)
 
 
 def thin_hand(labels_t: np.ndarray) -> np.ndarray:

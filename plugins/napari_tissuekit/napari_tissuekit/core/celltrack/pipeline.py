@@ -27,7 +27,7 @@ from .tracks import (
 
 from ..output_names import input_stem, tagged_path  # noqa: E402
 from ..movie_calibration import Calibration, calibration_for, save_tiff  # noqa: E402
-from ..cell_size import MIN_CELL_AREA, remove_small_labels  # noqa: E402
+from ..cell_size import MIN_CELL_AREA, absorb_small_labels  # noqa: E402
 
 
 def _stage_progress(progress, lo: int, hi: int, message: str):
@@ -62,6 +62,18 @@ def _stage(timings: dict[str, float], name: str):
         yield
     finally:
         timings[name] = round(timings.get(name, 0.0) + timer() - t0, 3)
+
+
+def fill_movie_holes(movie: Movie, verbose: bool = True) -> Movie:
+    """Give every empty area enclosed by cells a cell id of its own (core/holes.py), so tracking sees and numbers it.
+
+    Without this, a cell the segmentation missed (or one deleted by hand) stays an empty hole with no id in the tracked stack."""
+    from ..holes import fill_enclosed_holes
+
+    movie.masks, added = fill_enclosed_holes(movie.masks)
+    if verbose:
+        print(f"Filled {added} enclosed empty area(s) as new cells before tracking", flush=True)
+    return movie
 
 
 def movie_from_arrays(
@@ -144,11 +156,11 @@ def track_loaded(
     cal = calibration
     if cal is None and (intensity_path or masks_path):
         cal = calibration_for(intensity_path, masks_path, stem=stem)
-    small_masks, n_small = remove_small_labels(movie.masks)  # regions under the minimal cell size are not cells
+    small_masks, n_small = absorb_small_labels(movie.masks)  # regions under the minimal cell size are not cells: neighbours take them
     if n_small:
         movie.masks = small_masks
         if verbose:
-            print(f"Ignored {n_small} regions smaller than {MIN_CELL_AREA} px.", flush=True)
+            print(f"Gave {n_small} regions smaller than {MIN_CELL_AREA} px to their neighbouring cells.", flush=True)
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -321,9 +333,12 @@ def track_arrays(
     calibration: Calibration | None = None,
     n_jobs: int = 1,
     progress=None,
+    fill_holes: bool = False,
 ) -> dict[str, Any]:
     """Track in-memory label (and optional intensity) stacks."""
     movie = movie_from_arrays(masks, intensity, drop_blank=True)
+    if fill_holes:
+        fill_movie_holes(movie, verbose)
     return track_loaded(
         movie,
         output_dir,
@@ -374,6 +389,7 @@ def run_tracking(
     min_daughter_frames: int = 3,
     n_jobs: int = 1,
     progress=None,
+    fill_holes: bool = False,
 ) -> dict[str, Any]:
     """Track a Cellpose movie and write all outputs under ``output_dir``."""
     movie = load_movie(
@@ -382,6 +398,8 @@ def run_tracking(
         max_frames=max_frames,
         drop_blank=True,
     )
+    if fill_holes:
+        fill_movie_holes(movie, verbose)
     stem = input_stem(intensity_path or masks_path)
     return track_loaded(
         movie,

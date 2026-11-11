@@ -79,7 +79,7 @@ def test_run_params_round_trip(tmp_path):
 
 def test_full_params_and_eval_kwargs():
     p = seg_params.full_params({"flow_threshold": "0.7", "min_size": 3, "bogus": 1})
-    assert p["flow_threshold"] == 0.7 and p["min_size"] == 15 and "bogus" not in p
+    assert p["flow_threshold"] == 0.7 and p["min_size"] == 50 and "bogus" not in p
     kw = seg_params.eval_kwargs({})
     assert kw["diameter"] is None and kw["cellprob_threshold"] == 0.0
     assert "batch_size" not in kw  # passed to eval on its own
@@ -108,7 +108,7 @@ def test_segment_cli_resolves_preset_and_overrides(monkeypatch):
     monkeypatch.setattr(seg_params, "USER_PRESETS_PATH", seg_params.USER_PRESETS_PATH.parent / "_none_.json")
     kw = segmentation.resolve_params("cellflow", '{"flow_threshold": 1.0}')
     assert kw["flow_threshold"] == 1.0 and kw["cellprob_threshold"] == 0.3 and kw["diameter"] is None
-    assert segmentation.resolve_params("from_other_pc", {"min_size": 40})["min_size"] == 40
+    assert segmentation.resolve_params("from_other_pc", {"min_size": 80})["min_size"] == 80
     with pytest.raises(SystemExit):
         segmentation.resolve_params("nope")
 

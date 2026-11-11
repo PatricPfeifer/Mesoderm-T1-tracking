@@ -30,6 +30,8 @@ from qtpy.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
     QProgressBar,
@@ -39,7 +41,6 @@ from qtpy.QtWidgets import (
     QShortcut,
     QSizePolicy,
     QSpinBox,
-    QTabWidget,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -47,23 +48,27 @@ from qtpy.QtWidgets import (
 
 from . import __version__
 from .cell_properties import CellPropertiesWidget
+from .region_widget import AnalysisRegionWidget
 from .core.cell_size import MIN_CELL_AREA
 from .core.project import PER_RUN_STEPS, WorkingFolder, find_results_root, movie_stem
+from .core.region import TRACKING_REQUIRED, burn_region
+from .wrapped_tabs import WrappedTabs
+from .t1_preview import T1PreviewDialog, find_event_at
 from .remote_widget import RemoteRunner
 from .track_edit import (
     CellUndo,
     ProtectedCellsError,
+    ProtectLog,
     break_track,
     changed_pixels,
     link_tracks,
-    merge_protected,
     restore_cells,
     swap_tracks,
 )
 
 
 class _Job(QObject):
-    progress = Signal(int, str)
+    progress = Signal(int, str, int)  # overall percent, step name, percent of the step (-1: no step bar)
     finished = Signal(object)
     failed = Signal(str)
 
@@ -73,7 +78,7 @@ class _Job(QObject):
 
     def run(self) -> None:
         try:
-            self.finished.emit(self._fn(self.progress.emit))
+            self.finished.emit(self._fn(lambda percent, message, step=-1: self.progress.emit(int(percent), str(message), int(step))))
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -128,19 +133,20 @@ HELP_HTML = """
 <ul>
 <li><b>Folder...</b>: choose the results folder. If it holds saved results they are loaded.</li>
 <li><b>Load results</b>: load the saved movie, segmentation, outlines and tracking.</li>
+<li><b>Save all</b>: save every change that is not saved yet (segmentation, track edits, analysis region, T1 events, cell selection). What is unchanged is not rewritten.</li>
 <li><b>Help</b>: this window.</li>
 </ul>
 
 <h3>Segmentation tab</h3>
 <ul>
-<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). Run locally uses this computer's GPU when it has one, else the CPU; the cluster always uses its GPU. <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
+<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). Run locally uses this computer's GPU when it has one, else the CPU; the cluster always uses its GPU. <i>Thin bonds right after segmentation</i> (under Parameters, off by default): thins the borders to 1 px bonds, which takes a while and is only needed for hand-editing outlines; when off, the bonds are thinned the first time you start editing. <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
 <li><b>Masks / Outlines</b>: the cell layer and the outline layer to edit (set automatically after loading).</li>
 <li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run locally / Run on cluster or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one. With Paint, the <b>right mouse button</b> erases.</li>
 <li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
 <li><b>Save segmentation (Ctrl+S)</b>: write the masks and the 1 px outlines (<code>*_cp_masks.tif</code>, <code>*_cell_outlines.tif</code>).</li>
 <li><b>Export TIFF</b>: same as Save.</li>
-<li>A cell needs at least <b>15 px</b> in every step (segmentation, outline edits, manual drawing, tracking); smaller regions are dropped or refused.</li>
+<li>A cell needs at least <b>50 px</b> in every step (segmentation, outline edits, manual drawing, tracking). Smaller regions, and empty gaps inside the tissue smaller than that, are not left empty: the neighbouring cells take them over so their membranes run across.</li>
 <li><b>Ctrl/Cmd+Z</b> takes back the last paint stroke that is not applied yet; otherwise the last applied bond edit (Enter) or cell deletion.</li>
 <li><b>M</b> hides or shows the outlines. <i>Watershed pad</i>: area around an edit that is recomputed (smaller = faster).</li>
 <li><b>Delete cell</b>: hold <b>Option</b> and left-click a cell to delete it (Cmd/Ctrl+Z undoes it).</li>
@@ -151,14 +157,26 @@ HELP_HTML = """
 <li><b>Labels</b>: the segmentation to track. <b>Intensity</b>: the movie (or none).</li>
 <li><b>Run tracking</b>: track the cells. The defaults are fine to start with; hover over a setting for what it does.</li>
 <li><b>Divisions</b>: dividing cells end their track and the two daughters get new IDs.</li>
+<li><b>Keep ID</b> (in Correct tracks): click the cells around the one you are fixing to put them in the keep list. No Link, Break or Swap can change a listed cell, not even as a side effect (Link swaps IDs when another cell already has the ID); the edit is refused and the cell lights up red. Click a listed cell again, or use Remove selected / Clear list, to allow changes again. The list is cleared when new tracking is loaded or run.</li>
+<li><b>Fill enclosed empty areas as new cells</b> (on by default): empty space closed in by cells (a cell the segmentation missed or you deleted) gets an ID of its own before tracking, so no cell is left empty in the Tracked layer.</li>
 <li><b>Export TIFF</b>: write the tracked layers to the results folder.</li>
 <li><b>Correct tracks</b>: turn on <i>Edit tracks</i>, pick a mode and click cells on the Tracked layer.
  <i>Link</i> joins two tracks, <i>Break</i> starts a new track, <i>Swap</i> exchanges two IDs.
  <b>Undo</b> takes back the last edit, <b>Clear protection (lets corrected cells be changed again)</b>: corrected cells are protected so a later edit on a neighbour can't silently change them; this lifts that. <b>Save corrected tracks</b> writes the corrected tracking (the old files go to a <code>previous_...</code> folder).</li>
 </ul>
 
+<h3>Analysis cropping tab</h3>
+<p>Restrict T1 detection and cell properties to part of the embryo. <b>Needs finished tracking</b> (it warns otherwise).</p>
+<ul>
+<li><b>New line: click its cells</b>: click the cells that mark a boundary, on any frame (two or more, in a row). With <b>Straight lines (best fit)</b> ticked (default) the line is the straight line that fits the cells best, refitted in every frame so it follows the tissue (use one roughly horizontal and one roughly vertical line to cut out a corner); unticked, it bends through every cell. The cells you click for a line are the boundary itself and are <b>not analysed</b>. Add a second (or third) line the same way; <b>Add cells to selected line</b>, <b>Undo last cell</b> and <b>Delete line</b> correct it.</li>
+<li><b>Area to use</b>: choose <i>Keep this area</i> or <i>Disregard this area</i>, press <b>Click a cell in an area</b> and click one cell in each area. Without a 'keep' click, everything except the disregarded areas is used.</li>
+<li><b>Save region</b> writes <code>analysis_region/region.json</code>. T1 (checkbox <i>Only cells inside the analysis region</i>) and Export Cell Props then use only cells inside; exported tracked RGB / T1 tiffs show the kept area as a <b>yellow outline</b> with the rest dimmed. Segmentation and tracking are not changed.</li>
+<li>If T1 or cell props were run before the region was set or changed, the plugin says so: <b>run T1 and Export Cell Props again</b>.</li>
+</ul>
+
 <h3>T1 tab</h3>
 <ul>
+<li><b>Preview events</b>: after a run, select the <i>T1 overlay</i> layer and click a cell or junction of an event (or press <b>Preview first event</b>). A window plays the event with the four cells filled; <i>Previous</i>/<i>Next event</i> step through all shown events and the napari view follows.</li>
 <li><b>Labels</b>: the Tracked layer. <b>RGB</b>: the Tracked RGB image used for the overlay.</li>
 <li><b>Run T1</b>: detect T1 transitions. Needs the pixel size and frame interval. They are read from the movie or from the results files (also ones made on a server); the line under <i>RGB</i> shows what was found. If a value is missing, type it in the boxes.</li>
 <li><b>T1 filter</b>: show all counted events, only clean ones, flicker resolved, or flicker aborted.</li>
@@ -220,6 +238,19 @@ TRACK_TIPS = {
 }
 
 
+def _stack_crc(stack) -> int:
+    """Cheap fingerprint of a label stack (CRC32 of its bytes, frame by frame): did it change since it was saved?"""
+    import zlib
+
+    arr = np.asarray(stack)
+    if arr.ndim == 2:
+        arr = arr[np.newaxis]
+    crc = 0
+    for frame in arr:
+        crc = zlib.crc32(np.ascontiguousarray(frame, dtype=np.uint32), crc)
+    return crc
+
+
 class TissueKitWidget(QWidget):
     def __init__(self, napari_viewer: napari.Viewer):
         super().__init__()
@@ -232,6 +263,7 @@ class TissueKitWidget(QWidget):
         self._seg_base_masks: np.ndarray | None = None
         self._seg_base_outlines: np.ndarray | None = None
         self._autosave_outlines_ok = True  # False while editing outlines loaded from a file: never rewrite the file before the user saves
+        self._bond_pending: tuple | None = None  # (masks, saved outlines) whose bonds are not thinned yet (Thin bonds off)
         self._pending_outlines: np.ndarray | None = None  # imported outlines shown after the bonds are built; their differences apply on Enter
         self._session_cal = None  # pixel size / frame interval of the movie in use (from any file read or run)
         self._seg_cal = None  # calibration read from a loaded outlines file (pixel size / frame interval)
@@ -247,17 +279,26 @@ class TissueKitWidget(QWidget):
         # Segmentation run (segmentation/<run>/) the Segmentation layer belongs to; None = not saved yet.
         self._seg_run: str | None = None
         self._seg_pending: dict | None = None  # settings of a finished run, written when it is saved
+        self._seg_saved_crc: int | None = None  # fingerprint of the Segmentation layer as last saved / loaded (Save all)
         self._compare_colors = iter(())  # colours for "Add for comparison" layers
         self._track_pick: tuple[int, int, int, int] | None = None
         self._track_undo: deque = deque(maxlen=20)
         # Pixels set by manual edits, one record per edit (same order as the undo
         # stack). Later edits may not change them as a side effect.
-        self._protect_log: list = []
+        self._protect_log = ProtectLog()
+        self._max_track_id = None  # (weakref to the stack, largest ID in it): saves a scan of the movie per edit
+        # Track IDs the user asked to keep: no edit may change them (Keep ID mode in the Tracking tab).
+        self._keep_ids: list[int] = []
+        self._keep_auto_hidden = False  # the "Kept cells" layer was hidden by us (nothing to show), not by the user
         self._overlay_msg = ""  # second line of the viewer text overlay
         self._flash_timer = QTimer(self)
         self._flash_timer.setSingleShot(True)
         self._flash_timer.timeout.connect(self._clear_flash)
         self._t1_result: dict | None = None
+        self._t1_shown: list = []
+        self._t1_dialog: T1PreviewDialog | None = None
+        self._t1_region_hash = ""  # analysis region the T1 events in memory were made with
+        self._stale_shown = ""
         self.project = WorkingFolder()
         self._track_run: tuple | None = None
         # Mother + daughter track IDs from the last division-aware tracking.
@@ -280,12 +321,24 @@ class TissueKitWidget(QWidget):
         self._remote_log_dialog = None
         self._batch_job_items: list[dict] | None = None  # items of the batch job being watched
 
-        tabs = QTabWidget()
+        tabs = WrappedTabs()  # buttons that wrap onto several rows: every tab name is always shown in full
         tabs.addTab(self._scrollable(self._segmentation_tab()), "Segmentation")
         tabs.addTab(self._scrollable(self._tracking_tab()), "Tracking")
+        self.region_tab = AnalysisRegionWidget(self.viewer)
+        self.region_tab.tracked_provider = self._tracked_layer
+        self.region_tab.dir_provider = lambda: self.project.root
+        self.region_tab.project_provider = lambda: self.project if self.project.root is not None else None
+        self.region_tab.run_provider = lambda: self._tracked_run
+        self.region_tab.tracking_dir_provider = lambda: self._tracking_files.parent if self._tracking_files else None
+        self.region_tab.on_changed = self._region_changed
+        tabs.addTab(self._scrollable(self.region_tab), "Analysis cropping")
         tabs.addTab(self._scrollable(self._t1_tab()), "T1")
         self.cell_props = CellPropertiesWidget(self.viewer)
         self.cell_props.dir_provider = self._cell_props_dir
+        self.cell_props.region_provider = self.region_tab.inside
+        self.cell_props.on_exported = self._cell_props_exported
+        self.tabs = tabs
+        tabs.currentChanged.connect(self._tab_changed)
         tabs.addTab(self._scrollable(self.cell_props), "Export Cell Props")
         from .batch_widget import BatchPanel
 
@@ -304,13 +357,33 @@ class TissueKitWidget(QWidget):
         version.setToolTip("napari-tissuekit version")
         version.setStyleSheet("color: gray; padding: 0 6px;")
         tabs.setCornerWidget(version, Qt.TopRightCorner)
+        self.overall_bar = QProgressBar()  # whole job
+        self.overall_bar.setRange(0, 100)
+        self.overall_bar.setFormat("Overall  %p%")
+        self.step_bar = QProgressBar()  # the step the job is in now (T1: classifying quartets, ...)
+        self.step_bar.setRange(0, 100)
+        for bar in (self.overall_bar, self.step_bar):
+            bar.setTextVisible(True)
+            bar.setVisible(False)
         self.status = QLabel("Ready")
         self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # A long message (the T1 summary after a run) must not make the panel taller: the window would grow past the
+        # screen and the viewer's frame slider would end up off screen. The label scrolls inside a fixed-height box.
+        self.status_box = QScrollArea()
+        self.status_box.setWidget(self.status)
+        self.status_box.setWidgetResizable(True)
+        self.status_box.setFrameShape(QFrame.NoFrame)
+        self.status_box.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.status_box.setMaximumHeight(84)
+        self.status_box.setMinimumHeight(28)
         layout = QVBoxLayout()
         layout.addLayout(self._folder_bar())
         layout.addWidget(tabs)
-        layout.addWidget(self.status)
+        layout.addWidget(self.overall_bar)
+        layout.addWidget(self.step_bar)
+        layout.addWidget(self.status_box)
         self.setLayout(layout)
         self._apply_section_style()
         self.viewer.events.theme.connect(self._apply_section_style)
@@ -318,7 +391,9 @@ class TissueKitWidget(QWidget):
         self.viewer.layers.events.inserted.connect(self._refresh_layers)
         self.viewer.layers.events.removed.connect(self._refresh_layers)
         self.viewer.mouse_drag_callbacks.append(self._on_track_click)
+        self.viewer.mouse_drag_callbacks.append(self._on_t1_click)
         self.viewer.dims.events.current_step.connect(self._update_overlay)
+        self.viewer.dims.events.current_step.connect(self._update_keep_markers)
         self.viewer.layers.events.inserted.connect(self._update_overlay)
         self.viewer.layers.events.removed.connect(self._update_overlay)
         self._update_overlay()
@@ -445,8 +520,14 @@ class TissueKitWidget(QWidget):
         self._thread.finished.connect(self._clear_job)
         self._thread.start()
 
-    def _on_progress(self, percent: int, message: str) -> None:
+    def _on_progress(self, percent: int, message: str, step: int = -1) -> None:
         self.status.setText(f"{percent}% {message}")
+        self.overall_bar.setVisible(True)
+        self.overall_bar.setValue(max(0, min(100, percent)))
+        self.step_bar.setVisible(step >= 0)
+        if step >= 0:
+            self.step_bar.setValue(min(100, step))
+            self.step_bar.setFormat(f"{message}  %p%")
 
     def _on_failed(self, text: str) -> None:
         self._last_job_error = text.strip().splitlines()[-1]
@@ -459,6 +540,12 @@ class TissueKitWidget(QWidget):
         self._job = None
 
     def _set_busy(self, busy: bool) -> None:
+        if busy:
+            self.overall_bar.setValue(0)
+            self.step_bar.setVisible(False)
+        self.overall_bar.setVisible(busy)
+        if not busy:
+            self.step_bar.setVisible(False)
         for button in (self.seg_run, self.track_run, self.t1_run, self.track_save):
             button.setEnabled(not busy)
 
@@ -482,6 +569,14 @@ class TissueKitWidget(QWidget):
         self.seg_params.add_rows(form)
         # In the Parameters pane, but not saved in presets.
         self.seg_params.add_body_row("", self.seg_fill_holes)
+        self.seg_thin_bonds = QCheckBox("Thin bonds right after segmentation (for outline editing)")
+        self.seg_thin_bonds.setToolTip(
+            "Thinning the cell borders to 1 px bonds takes a while (about a minute for a long movie) and is only needed to "
+            "edit outlines by hand. Off: segmentation shows the outlines straight away; the bonds are thinned when you start "
+            "editing outlines. Tracking, T1 and cell properties do not need them."
+        )
+        self.seg_thin_bonds.setChecked(False)
+        self.seg_params.add_body_row("", self.seg_thin_bonds)
         segment_box = QGroupBox("1 · Segment")
         segment_inner = QVBoxLayout()
         segment_inner.setSpacing(6)
@@ -753,6 +848,7 @@ class TissueKitWidget(QWidget):
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
         self._seg_base_masks = masks.copy()
+        self._seg_saved_crc = None
         self._seg_run = None  # a new run folder is made when it is saved (below)
         self._show_segmentation_layers(
             masks,
@@ -1102,6 +1198,7 @@ class TissueKitWidget(QWidget):
         self._seg_stem = (_strip_suffix(masks_path.name, SEG_MASK_SUFFIXES) or "segmentation").replace("/", "_")
         self._replace_labels("Segmentation", masks)
         self._seg_base_masks = masks.copy()
+        self._seg_saved_crc = _stack_crc(masks)
         self._seg_run = run
         self._seg_pending = None
         self.project.set_active_seg_run(run)
@@ -1281,6 +1378,7 @@ class TissueKitWidget(QWidget):
             f"Outline editing ready{' from the outlines' if from_outlines else ''} (max label {int(masks.max())}). "
             "Paint/erase bonds, Enter to Apply (TA watershed), then Save.",
             saved_outlines=outlines,
+            force_bonds=True,  # the user asked for outline editing: the bonds are needed now
         )
         self._refresh_layers()
 
@@ -1329,7 +1427,8 @@ class TissueKitWidget(QWidget):
                 f"Outlines {'shown' if ol.visible else 'hidden'} (M)."
             )
 
-    def _show_segmentation_layers(self, masks: np.ndarray, message: str, saved_outlines: np.ndarray | None = None) -> None:
+    def _show_segmentation_layers(self, masks: np.ndarray, message: str, saved_outlines: np.ndarray | None = None,
+                                  force_bonds: bool = False) -> None:
         """Show masks, then build 1 px TA bonds in the background for Outlines. ``saved_outlines`` (0/1, T,Y,X) are kept
         as the starting bonds where they are the plugin's own 1 px bonds, so loading a saved edit moves no line."""
         masks = np.asarray(masks)
@@ -1340,6 +1439,7 @@ class TissueKitWidget(QWidget):
             return
         self._seg_base_hand = None
         self._seg_base_outlines = None
+        self._bond_pending = None
 
         if self.correction is not None:
             # A "Segmentation" layer that already exists (e.g. loaded from the results folder) is the one the cell
@@ -1374,6 +1474,20 @@ class TissueKitWidget(QWidget):
         interim = (np.asarray(saved_outlines) > 0).astype(np.uint8) if saved_outlines is not None and np.shape(saved_outlines) == masks.shape else masks_to_outline_labels(masks)
         self._replace_labels("Outlines", interim)
         self._style_outlines_layer(self._layer("Outlines"))
+
+        self._bond_pending = (masks, saved_outlines)
+        if not (self.seg_thin_bonds.isChecked() or force_bonds):
+            # bonds are only needed for outline editing: thin them when editing starts (see _bonds_ready)
+            self.status.setText(f"{message} Bonds are not thinned yet (option 'Thin bonds' is off): they are prepared when you start editing outlines.")
+            return
+        self._start_bond_job()
+
+    def _start_bond_job(self) -> None:
+        """Thin the bonds of the pending masks in the background (Outlines layer; needed for outline editing)."""
+        if self._bond_pending is None or self._job_running():
+            return
+        masks, saved_outlines = self._bond_pending
+        self._bond_pending = None
 
         def work(progress):
             from .core.outline_io import hand_stack_to_outline
@@ -1493,6 +1607,10 @@ class TissueKitWidget(QWidget):
             self.status.setText(
                 "No base masks — run segmentation or Start outline editing first."
             )
+            return False
+        if self._seg_base_hand is None and self._bond_pending is not None and not self._job_running():
+            self._start_bond_job()
+            self.status.setText("Thinning the bonds now (needed for outline editing): wait for 100%, then repeat the edit.")
             return False
         if self._seg_base_hand is None or self._seg_base_outlines is None:
             if self._last_job_error and not self._job_running():
@@ -1738,6 +1856,7 @@ class TissueKitWidget(QWidget):
         cell_outlines_path = outdir / f"{stem}_cell_outlines.tif"
         save_tiff(cell_outlines_path, (np.asarray(outline_only) > 0).astype(np.uint8) * 255, cal)
         self._seg_base_masks = masks.copy()
+        self._seg_saved_crc = _stack_crc(masks)
         wf.set_active_seg_run(self._seg_run)
         self._refresh_seg_runs()
         self.status.setText(
@@ -1769,6 +1888,8 @@ class TissueKitWidget(QWidget):
         outdir = wf.run_step_dir(step, self._tracked_run) if step in PER_RUN_STEPS else wf.step_dir(step)
         cal = self._calibration(movie, stem=stem)
         written = []
+        geom = self.region_tab.geometry()
+        burned = False
         for name, tag, dtype in self._EXPORTS[step]:
             layer = self._layer(name)
             if layer is None:
@@ -1776,11 +1897,16 @@ class TissueKitWidget(QWidget):
             data = np.asarray(layer.data)
             if dtype is not None and data.dtype != dtype:
                 data = data.astype(dtype)
+            if geom is not None and tag != "tracked_labels" and data.ndim == 4 and data.shape[-1] == 3 \
+                    and tuple(data.shape[1:3]) == tuple(geom.shape):
+                data = burn_region(data, geom)  # yellow outline = analysis region, dimmed = left out
+                burned = True
             path = outdir / f"{stem}_{tag}.tif"
             save_tiff(path, data, cal)
             written.append(path.name)
         self.status.setText(
-            f"Exported {', '.join(written)} → {outdir}" if written
+            f"Exported {', '.join(written)} → {outdir}"
+            + (" (analysis region outlined in yellow, cells outside dimmed)" if burned else "") if written
             else f"Nothing to export for {step}: run the step first."
         )
 
@@ -1882,6 +2008,14 @@ class TissueKitWidget(QWidget):
         )
         self.track_divisions.toggled.connect(self._track_divisions_toggled)
         form.addRow("", self.track_divisions)
+        self.track_fill_holes = QCheckBox("Fill enclosed empty areas as new cells")
+        self.track_fill_holes.setToolTip(
+            "Empty space closed in by cells (a cell the segmentation missed, or one you deleted) gets a cell id "
+            "of its own before tracking, so it is tracked and numbered like the others. The Segmentation layer "
+            "is not changed. Empty space that reaches the image edge, like the outside of the embryo, stays empty."
+        )
+        self.track_fill_holes.setChecked(True)
+        form.addRow("", self.track_fill_holes)
         self.track_show_edge = QCheckBox("Show edge cells (Not recommended)")
         self.track_show_edge.setToolTip(
             "Off (default): cells whose track touches the image edge in any frame "
@@ -1938,6 +2072,7 @@ class TissueKitWidget(QWidget):
                 ("link", "Link"),
                 ("break", "Break"),
                 ("swap", "Swap"),
+                ("keep", "Keep ID"),
             )
         ):
             button = QRadioButton(label)
@@ -1959,6 +2094,22 @@ class TissueKitWidget(QWidget):
         undo = QPushButton("Undo")
         undo.clicked.connect(self._undo_track)
         inner.addWidget(undo, 0, Qt.AlignLeft)
+        inner.addWidget(QLabel("Kept cells (their IDs cannot change):"))
+        self.keep_list = QListWidget()
+        self.keep_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.keep_list.setMaximumHeight(90)
+        self.keep_list.setToolTip("Cells added with the Keep ID mode. Double-click one to jump to a frame where it is.")
+        self.keep_list.itemDoubleClicked.connect(self._keep_goto)
+        inner.addWidget(self.keep_list)
+        keep_row = QHBoxLayout()
+        keep_remove = QPushButton("Remove selected")
+        keep_remove.clicked.connect(self._keep_remove_selected)
+        keep_clear = QPushButton("Clear list")
+        keep_clear.clicked.connect(self._keep_clear)
+        keep_row.addWidget(keep_remove)
+        keep_row.addWidget(keep_clear)
+        keep_row.addStretch()
+        inner.addLayout(keep_row)
         unprotect = QPushButton("Clear protection (lets corrected cells be changed again)")
         unprotect.setToolTip(
             "Cells you corrected are protected: a later edit on a neighbouring "
@@ -2001,6 +2152,12 @@ class TissueKitWidget(QWidget):
             "swap": (
                 "Click one cell, then the other. Their IDs exchange from the "
                 "second click through the end of the movie."
+            ),
+            "keep": (
+                "Click the cells around the one you are fixing to put them in the keep list "
+                "(green dots). No edit can change a cell in the list, not even as a side "
+                "effect of Link; an edit that would is refused and the cell lights up red. "
+                "Click a listed cell again, or use the buttons, to take it out."
             ),
         }
         self.track_help.setText(help_text[self._track_mode()])
@@ -2053,6 +2210,9 @@ class TissueKitWidget(QWidget):
             self._set_overlay_msg("That is background - click a cell.")
             return
         mode = self._track_mode()
+        if mode == "keep":
+            self._keep_toggle(track_id)
+            return
         if mode == "break":
             self._commit_track(break_track, (track_id, frame))
             return
@@ -2092,7 +2252,11 @@ class TissueKitWidget(QWidget):
         stack = self._writable_stack(layer)
         kwargs = {}
         if fn is link_tracks and self._protect_log:
-            kwargs["protected"] = merge_protected(self._protect_log)
+            kwargs["protected"] = self._protect_log  # merged only if the link meets a conflict
+        if fn is break_track:
+            kwargs["max_id"] = self._largest_track_id(stack)
+        if self._keep_ids:
+            kwargs["keep_ids"] = frozenset(self._keep_ids)
         self._set_overlay_msg("Working ...")
         try:
             undos, message = fn(stack, *args, **kwargs)
@@ -2109,6 +2273,7 @@ class TissueKitWidget(QWidget):
         if not undos:
             self._set_overlay_msg(message)
             return
+        self._note_track_ids(stack, undos)
         self._track_undo.append(undos)
         self._track_dirty = True
         self._protect_log.append(changed_pixels(undos, stack.shape[-1]))
@@ -2186,6 +2351,7 @@ class TissueKitWidget(QWidget):
         self._track_undo.clear()
         self._protect_log.clear()
         self._track_dirty = False
+        self.region_tab.invalidate()  # track IDs may have changed: re-read cell positions for the analysis region
         msg = f"Saved {len(written)} files to {written[0].parent}."
         if backup is not None:
             msg += f" Previous versions: {backup.name}."
@@ -2217,6 +2383,91 @@ class TissueKitWidget(QWidget):
         except Exception:
             pass
 
+    # ---- keep list: cells whose ID no edit may change -----------------------------------------------------
+    def _keep_toggle(self, track_id: int) -> None:
+        if track_id in self._keep_ids:
+            self._keep_ids.remove(track_id)
+            msg = f"Track {track_id} taken out of the keep list."
+        else:
+            self._keep_ids.append(track_id)
+            msg = f"Track {track_id} is kept: no edit can change its ID ({len(self._keep_ids)} kept)."
+        self._keep_changed()
+        self.track_msg.setText(msg)
+        self._set_overlay_msg(msg)
+
+    def _keep_changed(self) -> None:
+        self.keep_list.clear()
+        for cid in self._keep_ids:
+            item = QListWidgetItem(f"Track {cid}")
+            item.setData(Qt.UserRole, int(cid))
+            self.keep_list.addItem(item)
+        self._update_keep_markers()
+
+    def _keep_remove_selected(self) -> None:
+        gone = {int(i.data(Qt.UserRole)) for i in self.keep_list.selectedItems()}
+        if not gone:
+            self.track_msg.setText("Select the cells to remove in the list first.")
+            return
+        self._keep_ids = [c for c in self._keep_ids if c not in gone]
+        self._keep_changed()
+        self.track_msg.setText(f"Removed {len(gone)} cell(s) from the keep list.")
+
+    def _keep_clear(self) -> None:
+        n = len(self._keep_ids)
+        self._keep_ids = []
+        self._keep_changed()
+        self.track_msg.setText(f"Keep list cleared ({n} cell(s)).")
+
+    def _keep_goto(self, item) -> None:
+        """Jump to the first frame that has the cell (double-click in the list)."""
+        layer = self._tracked_layer()
+        if layer is None:
+            return
+        cid = int(item.data(Qt.UserRole))
+        stack = np.asarray(layer.data)
+        if stack.ndim < 3:
+            return
+        here = int(np.clip(round(float(self.viewer.dims.point[0])), 0, stack.shape[0] - 1))
+        for t in [here, *range(stack.shape[0])]:
+            if np.any(stack[t] == cid):
+                self.viewer.dims.set_point(0, t)
+                return
+        self.track_msg.setText(f"Track {cid} is not on any frame.")
+
+    def _update_keep_markers(self, *_args) -> None:
+        """Green dot on every kept cell that is on the frame shown. A layer the user switched off stays off."""
+        layer = self._tracked_layer()
+        points = np.zeros((0, 3))
+        if self._keep_ids and layer is not None and np.ndim(layer.data) >= 3:
+            stack = np.asarray(layer.data)
+            t = int(np.clip(round(float(self.viewer.dims.point[0])), 0, stack.shape[0] - 1))
+            plane = stack[t]
+            ys, xs = np.nonzero(np.isin(plane, np.asarray(self._keep_ids, dtype=plane.dtype)))
+            if len(ys):
+                _u, inverse = np.unique(plane[ys, xs], return_inverse=True)
+                count = np.bincount(inverse).astype(float)
+                points = np.column_stack([np.full(len(count), t), np.bincount(inverse, weights=ys) / count,
+                                          np.bincount(inverse, weights=xs) / count])
+        marker = self._layer("Kept cells")
+        if marker is None:
+            if len(points) == 0:
+                return
+            active = self.viewer.layers.selection.active
+            marker = self.viewer.add_points(points, name="Kept cells", size=self._marker_size(), face_color="#3ddc84",
+                                            border_color="black", symbol="disc")
+            marker.editable = False
+            if active is not None and active in self.viewer.layers:
+                self.viewer.layers.selection.active = active
+            return
+        marker.data = points if len(points) else np.zeros((0, int(marker.ndim)))
+        if len(points) == 0:
+            if marker.visible:
+                marker.visible = False
+                self._keep_auto_hidden = True
+        elif self._keep_auto_hidden:
+            self._keep_auto_hidden = False
+            marker.visible = True
+
     def _clear_protection(self) -> None:
         n = len(self._protect_log)
         self._protect_log.clear()
@@ -2241,6 +2492,24 @@ class TissueKitWidget(QWidget):
         self.status.setText("Undid the last track edit.")
         self._set_overlay_msg("Undid the last track edit.")
 
+    def _largest_track_id(self, stack: np.ndarray) -> int:
+        """Largest ID in the tracked stack: scanned once per stack, then kept up to date by ``_note_track_ids``."""
+        import weakref
+
+        cached = self._max_track_id
+        if cached is None or cached[0]() is not stack:
+            cached = (weakref.ref(stack), int(np.max(stack)))
+            self._max_track_id = cached
+        return cached[1]
+
+    def _note_track_ids(self, stack: np.ndarray, undos: list[CellUndo]) -> None:
+        """After an edit: an ID it introduced (Break) raises the remembered maximum (never lowered: an upper bound is enough)."""
+        if self._max_track_id is None or self._max_track_id[0]() is not stack:
+            return
+        top = max((int(stack[u.frame][u.ys, u.xs].max()) for u in undos if len(u.ys)), default=0)
+        if top > self._max_track_id[1]:
+            self._max_track_id = (self._max_track_id[0], top)
+
     def _writable_stack(self, layer) -> np.ndarray:
         stack = np.asarray(layer.data)
         if stack.ndim == 2:
@@ -2261,7 +2530,9 @@ class TissueKitWidget(QWidget):
         rgb = self._tracked_rgb_layer()
         if rgb is None or not undos:
             return
-        max_id = int(np.max(stack))
+        # the colour of an ID does not depend on the table size (same seed, drawn in order), so the table only has to reach
+        # the IDs just written: no scan of the whole movie for its maximum
+        max_id = max((int(stack[u.frame][u.ys, u.xs].max()) for u in undos if len(u.ys)), default=0)
         rng = np.random.default_rng(1)
         lut = rng.integers(40, 256, size=(max_id + 1, 3), dtype=np.uint8)
         lut[0] = 0
@@ -2591,6 +2862,7 @@ class TissueKitWidget(QWidget):
             max_distance=float(self.track_dist.value()),
             division_mode="lineage" if self.track_divisions.isChecked() else "legacy",
             n_jobs=int(self.track_jobs.value()),
+            fill_holes=self.track_fill_holes.isChecked(),
         )
 
         def work(progress):
@@ -2668,6 +2940,7 @@ class TissueKitWidget(QWidget):
         )
         self._refresh_layers()
         self._select_t1_layers()
+        self.region_tab.tracking_changed()
 
     def _t1_tab(self) -> QWidget:
         page = QWidget()
@@ -2714,6 +2987,22 @@ class TissueKitWidget(QWidget):
             "update them."
         )
         form.addRow("", self.t1_exclude_div)
+        self.t1_use_region = QCheckBox("Only cells inside the analysis region")
+        self.t1_use_region.setChecked(True)
+        self.t1_use_region.setToolTip(
+            "Use the area chosen in the Analysis cropping tab: T1 events are kept only when all four cells are "
+            "inside it (at the frame of the first swap). Has no effect when no region is set. Run T1 again after "
+            "changing the region."
+        )
+        form.addRow("", self.t1_use_region)
+        self.t1_length_tables = QCheckBox("Also measure junction lengths (saved with the T1 results)")
+        self.t1_length_tables.setChecked(True)
+        self.t1_length_tables.setToolTip(
+            "Measures the length of the shrinking / growing junction around every event and saves the junction-length "
+            "tables (the data for length-over-time plots and kinetics) next to the events. Takes extra time after the "
+            "detection (about a second per frame near an event); untick to save only the events."
+        )
+        form.addRow("", self.t1_length_tables)
         detect_box = QGroupBox("1 · Detect T1 events")
         detect_inner = QVBoxLayout()
         detect_inner.addLayout(form)
@@ -2722,7 +3011,23 @@ class TissueKitWidget(QWidget):
         detect_inner.addWidget(self.t1_run)
         detect_box.setLayout(detect_inner)
         layout.addWidget(detect_box)
-        export_box = QGroupBox("2 · Export")
+        preview_box = QGroupBox("2 · Preview events")
+        preview_inner = QVBoxLayout()
+        self.t1_click_preview = QCheckBox("Click an event on the T1 overlay to preview it")
+        self.t1_click_preview.setChecked(True)
+        self.t1_click_preview.setToolTip(
+            "After a T1 run: select the 'T1 overlay' (or 'T1 four-ways') layer and click a cell or junction of an event. "
+            "A window plays that event (the four cells filled, breaking and building junctions, the four-way vertex). "
+            "Dragging still pans. Not active while Edit tracks, cell selection or the cropping tool is picking."
+        )
+        self.t1_preview_btn = QPushButton("Preview first event")
+        self.t1_preview_btn.setToolTip("Open the preview on the first event shown (completed events first).")
+        self.t1_preview_btn.clicked.connect(self._preview_first_t1)
+        preview_inner.addWidget(self.t1_click_preview)
+        preview_inner.addWidget(self.t1_preview_btn)
+        preview_box.setLayout(preview_inner)
+        layout.addWidget(preview_box)
+        export_box = QGroupBox("3 · Export")
         export_inner = QVBoxLayout()
         self.t1_export = QPushButton("Export TIFF")
         self.t1_export.clicked.connect(lambda: self._export_step_tiffs("t1"))
@@ -2757,23 +3062,107 @@ class TissueKitWidget(QWidget):
             self.t1_exclude_div.isChecked() and self._division_ids and labels.name == "Tracked") else None
         pre, post = int(self.t1_pre.value()), int(self.t1_post.value())
         definition = {"expand": int(self.t1_expand.value())}
+        inside, region_hash = None, ""
+        if self.t1_use_region.isChecked():
+            used = self.region_tab.inside()
+            if used is None and self.region_tab.lines:
+                self.status.setText("The analysis region is not complete (click a cell in the area to keep, or in the "
+                                    "Analysis cropping tab clear it). T1 was not run.")
+                return
+            if used is not None:
+                inside, region_hash = used
+        self._t1_region_hash = region_hash
+        length_tables = self.t1_length_tables.isChecked()
 
         def work(progress):
             from .core.t1.t1_states_run import run_states_stack
 
             return run_states_stack(stack, um_per_px=float(um), dt_s=float(dt), rgb=rgb, definition=definition,
-                                    pre=pre, post=post, exclude_ids=exclude, progress=progress)
+                                    pre=pre, post=post, exclude_ids=exclude, inside=inside, progress=progress,
+                                    length_tables=length_tables)
 
         self._start(work, self._t1_done)
 
     def _t1_done(self, result: dict) -> None:
         self._t1_result = result
         self._autosave_t1(result)
+        self._region_changed()
         self._refresh_layers()
         self._apply_t1_filter()
         note = result.get("swap_note", "")
         if note:
             self.status.setText(f"{self.status.text()} {note}")
+
+    # ---- T1 preview (click an event on the overlay) -------------------------------------------------------
+    def _t1_click_active(self) -> bool:
+        if not self.t1_click_preview.isChecked() or not self._t1_result or not self._t1_shown:
+            return False
+        active = self.viewer.layers.selection.active
+        if active is None or active.name not in ("T1 overlay", "T1 four-ways"):
+            return False
+        picking = (self.track_edit.isChecked() or self.region_tab.mode is not None
+                   or self.cell_props.select_cb.isChecked() or self.cell_props._picking is not None)
+        return not picking
+
+    def _on_t1_click(self, viewer, event):
+        if not self._t1_click_active() or "Shift" in getattr(event, "modifiers", ()):
+            return
+        if getattr(event, "button", 1) not in (1, "left"):
+            return
+        start = np.array(event.position, dtype=float)
+        yield
+        if getattr(event, "type", "") != "mouse_release":
+            return
+        zoom = max(float(getattr(self.viewer.camera, "zoom", 1.0) or 1.0), 1e-6)
+        if np.linalg.norm(np.array(event.position, dtype=float) - start) > 5.0 / zoom:
+            return
+        self._t1_click_at(event.position)
+
+    def _t1_click_at(self, position) -> None:
+        result = self._t1_result
+        layer = self.viewer.layers.selection.active
+        stack = result["stack"]
+        c = np.asarray(layer.world_to_data(position), dtype=float)
+        y, x = int(round(c[-2])), int(round(c[-1]))
+        frame = int(np.clip(round(float(self.viewer.dims.point[0])), 0, stack.shape[0] - 1))
+        label = int(stack[frame, y, x]) if (0 <= y < stack.shape[-2] and 0 <= x < stack.shape[-1]) else 0
+        ev = find_event_at(self._t1_shown, result.get("four_xy"), frame, y, x, label, result["pre"], result["post"])
+        if ev is None:
+            self.status.setText("No T1 event here on this frame.")
+            return
+        self._open_t1_preview(ev, start_frame=max(frame, int(ev["t_start"]) - int(result["pre"])))
+
+    def _preview_first_t1(self) -> None:
+        if not self._t1_result or not self._t1_shown:
+            self.status.setText("Run T1 first (and make sure the filter shows events).")
+            return
+        self._open_t1_preview(None)
+
+    def _open_t1_preview(self, ev, start_frame: int | None = None) -> None:
+        result = self._t1_result
+        if self._t1_dialog is None:
+            self._t1_dialog = T1PreviewDialog(self)
+            self._t1_dialog.event_changed.connect(self._t1_preview_moved)
+        d = self._t1_dialog
+        d.set_data(self._t1_shown, result["stack"], result.get("four_xy"), result["pre"], result["post"],
+                   int(result.get("expand", 3)))
+        if ev is None:
+            d.show_event(0)
+        else:
+            d.show_event_object(ev, start_frame)
+        d.show()
+        d.raise_()
+
+    def _t1_preview_moved(self, ev) -> None:
+        """Jump the napari view to the event the preview shows."""
+        try:
+            self.viewer.dims.set_point(0, int(ev["t_first_swap"]))
+            layer = self.viewer.layers["T1 overlay"] if "T1 overlay" in self.viewer.layers else None
+            if layer is not None:
+                w = layer.data_to_world([int(ev["t_first_swap"]), float(ev["y"]), float(ev["x"])])
+                self.viewer.camera.center = (0.0, float(w[-2]), float(w[-1]))
+        except Exception:
+            pass
 
     def _apply_t1_filter(self) -> None:
         result = self._t1_result
@@ -2783,6 +3172,7 @@ class TissueKitWidget(QWidget):
 
         mode = str(self.t1_filter.currentData() or "all")
         overlay, dots, shown = paint_t1_filter(result, mode)
+        self._t1_shown = list(shown)
         self._replace_image("T1 overlay", overlay)
         self._replace_image("T1 four-ways", dots)
         total = len(result.get("events") or [])
@@ -2803,14 +3193,70 @@ class TissueKitWidget(QWidget):
         load = QPushButton("Load results")
         load.setToolTip("Load segmentation and tracking already saved in the results folder")
         load.clicked.connect(self._load_saved_results)
+        save_all = QPushButton("Save all")
+        save_all.setToolTip(
+            "Save every change not saved yet: the segmentation (cells and outlines), the track edits, the analysis "
+            "region, the T1 events and the cell selection. Things that are unchanged are not rewritten."
+        )
+        save_all.clicked.connect(self._save_all)
+        self.save_all_button = save_all
         help_button = QPushButton("Help")
         help_button.setToolTip("How to use this panel: the workflow and what every button does")
         help_button.clicked.connect(self._show_help)
         bar.addWidget(self.folder_label, 1)
         bar.addWidget(choose)
         bar.addWidget(load)
+        bar.addWidget(save_all)
         bar.addWidget(help_button)
         return bar
+
+    def _seg_unsaved(self) -> bool:
+        """The Segmentation layer (or bond strokes not applied yet) differs from what is saved."""
+        seg = self._layer("Segmentation")
+        if not isinstance(seg, Labels):
+            return False
+        ol = self._layer("Outlines")
+        if isinstance(ol, Labels) and self._seg_base_hand is not None and self._seg_base_outlines is not None:
+            from .core.ta_bond_edit import changed_frames
+
+            edited = np.asarray(ol.data)
+            if edited.ndim == 2:
+                edited = edited[np.newaxis, ...]
+            if changed_frames(self._seg_base_outlines, edited):
+                return True  # painted bonds waiting for Enter: saving applies them
+        if self._seg_saved_crc is None:
+            return self._seg_run is None  # a new run or imported outlines were never written; a loaded run we cannot judge
+        return _stack_crc(seg.data) != self._seg_saved_crc
+
+    def _save_all(self) -> None:
+        """Write every unsaved change of every tab; what is unchanged is left alone."""
+        if self._job_running():
+            self.status.setText("A job is running: Save all after it has finished.")
+            return
+        saved, notes = [], []
+        try:
+            if self._seg_unsaved():
+                self._save_segmentation()
+                saved.append("segmentation")
+            if self.region_tab.has_unsaved():
+                self.region_tab.save()
+                saved.append("analysis region")
+            if self._t1_result and (self._t1_result.get("events") or []):
+                self._autosave_t1(self._t1_result)
+                saved.append("T1 events")
+            if self.cell_props._state_path is not None:
+                self.cell_props._autosave()
+                saved.append("cell selection")
+        except Exception as exc:  # one failing save must not hide what was written
+            print(traceback.format_exc(), flush=True)
+            notes.append(f"stopped by an error: {exc}")
+        tracking = self._track_dirty and self._tracked_layer() is not None
+        if tracking:
+            saved.append("track edits (writing in the background)")
+        text = "Saved: " + ", ".join(saved) + "." if saved else "Nothing to save: everything is already saved."
+        self.status.setText(" ".join([text, *notes]))
+        if tracking:
+            self._save_track_edits()  # runs as a job; its own message follows when it is done
 
     def _show_help(self) -> None:
         dialog = QDialog(self)
@@ -2875,6 +3321,62 @@ class TissueKitWidget(QWidget):
                     "saved there."
                 )
 
+    # --- analysis region: reminders ------------------------------------------------------------------------
+
+    def _tab_changed(self, index: int) -> None:
+        name = self.tabs.tabText(index)
+        if name == "Analysis cropping":
+            if not self.region_tab.refresh_gate():
+                self.status.setText(TRACKING_REQUIRED)
+                self._toast(TRACKING_REQUIRED)
+        elif name in ("T1", "Export Cell Props"):
+            msg = self._region_stale_message()
+            if msg:
+                self.status.setText(msg)
+
+    def _region_stale_message(self) -> str:
+        """Text telling which results were made with a different analysis region than the current one ('' if none)."""
+        cur = self.region_tab.current_hash()
+        saved_hash = {"t1": None, "cell_props": None}  # None = not run / nothing recorded
+        if self.project.root is not None:
+            import json
+
+            from .core.project import RUN_PARAMS
+
+            t1_params = self.project.run_step_dir("t1", self._tracked_run, create=False) / RUN_PARAMS
+            if t1_params.is_file():
+                try:
+                    saved_hash["t1"] = json.loads(t1_params.read_text()).get("params", {}).get("region_hash", "")
+                except (OSError, ValueError):
+                    pass
+            cp = self.project.read_settings().get("cell_props")
+            if cp is not None:
+                saved_hash["cell_props"] = (cp.get("params") or {}).get("region_hash", "")
+        stale = []
+        for step, label, mem in (
+            ("t1", "T1 detection", self._t1_region_hash if self._t1_result is not None else None),
+            ("cell_props", "Export Cell Props", self.cell_props.region_hash_used),
+        ):
+            used = mem if mem is not None else saved_hash[step]
+            if used is not None and used != cur:
+                stale.append(label)
+        if not stale:
+            return ""
+        return ("The analysis region changed after " + " and ".join(stale) + " ran. Run "
+                + " and ".join(stale) + " again so only the cells inside the region are used.")
+
+    def _region_changed(self) -> None:
+        msg = self._region_stale_message()
+        self.region_tab.set_stale_message(msg)
+        if msg and msg != self._stale_shown:
+            self._toast(msg)
+        self._stale_shown = msg
+
+    def _cell_props_exported(self) -> None:
+        if self.project.root is not None:
+            self.project.write_settings("cell_props", {"region_hash": self.cell_props.region_hash_used or ""})
+        self._region_changed()
+
     def _cell_props_dir(self):
         return self.project.root / "cell_props" if self.project.root is not None else None
 
@@ -2895,27 +3397,60 @@ class TissueKitWidget(QWidget):
         )
 
     def _autosave_t1(self, result: dict) -> None:
+        """Save everything the T1 analyses read, like the command line does: ``<stem>_t1_events.csv``, ``<stem>_qc.json`` (frame
+        count, calibration, definition, region), the junction-length tables and the ``_um`` twins, into ``t1/<run>/``."""
         wf = self.project if self.project.root is not None else self._working_folder()
         events = result.get("events") or []
         if wf is None or not events:
             return
         try:
+            import json
+
             import pandas as pd
 
+            from .core.output_names import input_stem
+            from .core.t1.calibrated_outputs import write_um_files
+            from .core.t1.t1_states_run import write_length_tables
+
+            movie = self._layer(self.seg_image.currentText())
+            paths = [p for p in self._layer_paths(movie) if p]
+            stem = input_stem(paths[0]) if paths else (self._seg_stem or "movie")
+            cal = self._calibration(movie, stem=stem)
+            out = wf.run_step_dir("t1", self._tracked_run)  # T1 of the shown tracking's run
             rows = [
                 {k: (v if isinstance(v, (int, float, str, bool)) or v is None else str(v))
                  for k, v in e.items()}
                 for e in events
             ]
-            out = wf.run_step_dir("t1", self._tracked_run)  # T1 of the shown tracking's run
-            pd.DataFrame(rows).to_csv(out / "t1_events.csv", index=False)
+            events_df = pd.DataFrame(rows)
+            events_df.to_csv(out / f"{stem}_t1_events.csv", index=False)
+            old = out / "t1_events.csv"  # name of earlier plugin versions: keep an existing copy in step
+            if old.is_file():
+                events_df.to_csv(old, index=False)
+            labels_path = wf.run_step_dir("tracking", self._tracked_run, create=False) / f"{stem}_tracked_labels.tif"
+            qc = {
+                "classifier": result.get("classifier", "states"), "definition": result.get("definition"),
+                "n_frames": int(result.get("n_frames", 0)), "n_events": len(rows), "classes": result.get("classes", {}),
+                "dropped": result.get("dropped", {}), "n_outside_region": int(result.get("n_outside_region", 0)),
+                "n_excluded_events": int(result.get("n_excluded_events", 0)),
+                "analysis_region_hash": self._t1_region_hash or "", "expand": int(result.get("expand", 3)),
+                "labels": str(labels_path) if labels_path.is_file() else "",
+            }
+            (out / f"{stem}_qc.json").write_text(json.dumps(qc, indent=2, default=str) + "\n", encoding="utf-8")
+            traces = result.get("length_traces")
+            if traces is not None:
+                write_length_tables(None, pd.DataFrame(events), out, stem, traces=traces)
+            write_um_files(out, stem, cal, log=lambda *_: None)  # adds the calibration to the qc file as well
             wf.write_step_params(
                 "t1", out.name,
-                {"expand": int(self.t1_expand.value()), "definition": result.get("definition")},
+                {"expand": int(self.t1_expand.value()), "definition": result.get("definition"),
+                 "region_hash": self._t1_region_hash, "junction_lengths": traces is not None},
             )
-            self.status.setText(f"{self.status.text()} Saved {len(rows)} T1 events to {out}")
+            tables = "events, QC and junction-length tables" if traces is not None else "events and QC (no junction lengths measured)"
+            self.status.setText(f"{self.status.text()} Saved {len(rows)} T1 events ({tables}) to {out}")
         except Exception as exc:  # saving must never break the analysis
-            self.status.setText(f"{self.status.text()} (T1 events not saved: {exc})")
+            print(traceback.format_exc(), flush=True)
+            self.status.setText(f"{self.status.text()} (T1 results not saved: {exc})")
 
     def _load_saved_results(self, only_segmentation: bool = False) -> None:
         """Load the movie, the active segmentation run and that run's tracking from the results folder.
@@ -2960,6 +3495,7 @@ class TissueKitWidget(QWidget):
             masks = tifffile.imread(found["segmentation"][0])
             self._replace_labels("Segmentation", masks)
             self._seg_base_masks = np.asarray(masks).copy()
+            self._seg_saved_crc = _stack_crc(masks)
             loaded.append("segmentation")
         outline_note = ""
         self._autosave_outlines_ok = False  # loading never rewrites the saved files; only Save does
@@ -3019,6 +3555,7 @@ class TissueKitWidget(QWidget):
         self._refresh_layers()
         self._refresh_seg_runs()
         self._select_loaded_layers(movie_layer)
+        self.region_tab.tracking_changed()
         self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}.{outline_note}{self._tracking_run_note(wf)}")
 
     def _tracking_run_note(self, wf) -> str:
@@ -3041,8 +3578,11 @@ class TissueKitWidget(QWidget):
         self._track_dirty = False
         self._track_undo.clear()
         self._protect_log.clear()
+        self._keep_ids = []
+        self._keep_changed()
         self._division_ids = set()
         self._t1_result = None
+        self._t1_shown = []
 
     # ---- segmentation runs -------------------------------------------------------
     def _next_run_name(self, base: str) -> str:
@@ -3188,7 +3728,12 @@ class TissueKitWidget(QWidget):
         if name == "Tracked":  # new tracks: old undo steps and protection are stale
             self._track_undo.clear()
             self._protect_log.clear()
+            if self._keep_ids:  # new tracks: the IDs in the list may mean other cells now
+                self._keep_ids = []
+                self._keep_changed()
             self._track_dirty = False
+            if getattr(self, "region_tab", None) is not None:
+                self.region_tab.invalidate()
         layer = self._layer(name)
         if isinstance(layer, Labels):
             layer.data = data

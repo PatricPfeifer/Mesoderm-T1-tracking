@@ -4,7 +4,7 @@
 run on a headless HPC node. The widget is only imported when it is asked for.
 """
 
-__version__ = "0.3.15"
+__version__ = "0.4.5"
 __all__ = ["TissueKitWidget"]
 
 

@@ -281,9 +281,11 @@ def _classify_worker(i: int):
 
 def classify_movie(md: MovieData, p: StateParams, division_frames: dict[int, list[int]] | None = None,
                    cand: dict | None = None, orientation: bool = True, complex_pair_min: float | None = None,
-                   apply_rules: bool = True, side_rule: bool = False, vertex_clause: bool = False, workers: int | None = None) -> pd.DataFrame:
+                   apply_rules: bool = True, side_rule: bool = False, vertex_clause: bool = False, workers: int | None = None,
+                   on_progress=None) -> pd.DataFrame:
     """One row per event of every candidate quartet. Classes: clean, flicker_resolved, flicker_aborted,
-    abortive_shrink, unresolved, complex (complex has priority, then unresolved, see t1_states.py)."""
+    abortive_shrink, unresolved, complex (complex has priority, then unresolved, see t1_states.py).
+    `on_progress(done, total)` (optional) is called while the quartets are classified."""
     cand = candidate_quartets(md, p.l_on, p.l_off) if cand is None else cand
     division_frames = division_frames or {}
     cache = {}
@@ -380,21 +382,32 @@ def classify_movie(md: MovieData, p: StateParams, division_frames: dict[int, lis
     items = sorted(cand.items(), key=lambda kv: sorted(sorted(x) for x in kv[0]))
     rows, dropped = [], []
     n_workers = default_workers(len(items), workers)
+    total, last = len(items), -1
+
+    def tick(done: int) -> None:  # report at most once per percent
+        nonlocal last
+        if on_progress is not None and (done * 100 // max(total, 1) != last or done == total):
+            last = done * 100 // max(total, 1)
+            on_progress(done, total)
+
+    tick(0)
     if n_workers > 1 and "fork" in mp.get_all_start_methods():
         # plain-Python work per quartet: separate processes (forked, so md is shared); results come back in quartet order
         _CLS["one"], _CLS["items"] = one, items
         try:
             with cf.ProcessPoolExecutor(n_workers, mp_context=mp.get_context("fork")) as pool:
-                for r, d in pool.map(_classify_worker, range(len(items)), chunksize=16):
+                for k, (r, d) in enumerate(pool.map(_classify_worker, range(len(items)), chunksize=16), 1):
                     rows += r
                     dropped += d
+                    tick(k)
         finally:
             _CLS.clear()
     else:
-        for item in items:
+        for k, item in enumerate(items, 1):
             r, d = one(item)
             rows += r
             dropped += d
+            tick(k)
     df = pd.DataFrame(rows)
     df = df.sort_values(["frame_start", "A", "B", "C", "D"]).reset_index(drop=True) if len(df) else df
     df.attrs["dropped"] = pd.DataFrame(dropped)
@@ -410,12 +423,12 @@ def definition_params(dt_s: float, um_per_px: float, definition: dict | None = N
 
 
 def classify_with_definition(md: MovieData, division_frames=None, definition: dict | None = None, orientation: bool = True,
-                             cand: dict | None = None, workers: int | None = None) -> pd.DataFrame:
+                             cand: dict | None = None, workers: int | None = None, on_progress=None) -> pd.DataFrame:
     """classify_movie with the committed definition: hysteresis thresholds in pixels, group rule, side rule, true-vertex clause."""
     d = {**DEFINITION, **(definition or {})}
     p = definition_params(md.dt_s, md.um_per_px, d)
     return classify_movie(md, p, division_frames, cand, orientation=orientation, side_rule=bool(d["side_rule"]), vertex_clause=bool(d["vertex_clause"]),
-                         workers=workers)
+                         workers=workers, on_progress=on_progress)
 
 
 _JL: dict = {}   # labels / expand handed to the forked worker processes of junction_length_traces
@@ -429,12 +442,13 @@ def _junction_frame(t: int):
 
 
 def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: int = 3, anchor: str = "start",
-                           workers: int | None = None) -> pd.DataFrame:
+                           workers: int | None = None, on_progress=None) -> pd.DataFrame:
     """Junction length of the active pair around every event, long table (one row per event and frame). Window = anchor - pre ..
     last swap + post (anchor 'start' = frame_start, 'first_swap' = frame_first_swap); dt = frame - anchor. In every frame the active pair is the
     original pair (sign +1) or the new pair (sign -1) when exactly one of them touches (any contact on the grown labels, as the legacy tables);
     otherwise the length is blank and `flag` says '4way' (both touch) or 'no AB/CD contact'. vertex_px = vertex-to-vertex length of the
-    junction, contact_px = 4-connected contact-pixel count (both in pixels, *_um in um); signed_* = sign * length."""
+    junction, contact_px = 4-connected contact-pixel count (both in pixels, *_um in um); signed_* = sign * length.
+    `on_progress(done, total)` is called after every measured frame of the serial path (the plugin runs it in a Qt thread)."""
     from ..celltrack.cells import build_adjacency
     from .run_tm_fourway_vertices import junctions_one_frame, vertex_bond
     from .run_tm_t1 import FLAG_NV, active_abcd_pair, length_blank_flag
@@ -459,10 +473,12 @@ def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: 
         finally:
             _JL.clear()
     else:
-        for t in frames:
+        for i, t in enumerate(frames):
             lab = md.labels[t].astype(np.int64)
             verts3[t] = junctions_one_frame(lab, md.expand, 3.0)[1]
             adj[t] = build_adjacency(lab, expand=md.expand)
+            if on_progress is not None:
+                on_progress(i + 1, len(frames))
     rows = []
     for eid, r, first, t0, t1 in wins:
         quartet = frozenset(int(r[k]) for k in "ABCD")
@@ -495,12 +511,13 @@ def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: 
     return df
 
 
-def write_length_tables(md: MovieData, ev: pd.DataFrame, out: Path, stem: str, pre: int = 3, post: int = 3, anchor: str = "start",
-                        workers: int | None = None) -> pd.DataFrame:
-    """Legacy wide tables <stem>_junction_lengths{,_signed,_contact_lengths,_contact_lengths_signed}.csv (px) for the states events."""
+def write_length_tables(md: MovieData | None, ev: pd.DataFrame, out: Path, stem: str, pre: int = 3, post: int = 3, anchor: str = "start",
+                        workers: int | None = None, traces: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Legacy wide tables <stem>_junction_lengths{,_signed,_contact_lengths,_contact_lengths_signed}.csv (px) for the states events.
+    `traces` (from `junction_length_traces` on the same `ev`) skips the measuring; `md` may then be None."""
     from ..output_names import tagged_path
     from .run_tm_t1 import FLAG_NV, TYPE_SORT_ORDER, write_junction_lengths_wide
-    tr = junction_length_traces(md, ev, pre, post, anchor, workers)
+    tr = traces if traces is not None else junction_length_traces(md, ev, pre, post, anchor, workers)
     vp, vs, cp, cs = {}, {}, {}, {}
     for r in tr.itertuples(index=False):
         k = (r.event_id, r.dt)
@@ -524,29 +541,56 @@ def write_length_tables(md: MovieData, ev: pd.DataFrame, out: Path, stem: str, p
 
 def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: np.ndarray | None = None, definition: dict | None = None,
                      pre: int = 3, post: int = 3, exclude_ids: set[int] | None = None, division_frames: dict[int, list[int]] | None = None,
-                     progress=None) -> dict:
+                     inside: list | None = None, progress=None, length_tables: bool = False) -> dict:
     """Plugin counterpart of `run_t1_stack` for the state classifier: classify a (T,Y,X) tracked label stack with the committed definition
     (DEFINITION, optionally overridden) and return the same kind of result dict (events as dicts with t_start / t_end / quartet / pair_before /
     pair_after / type, overlay, dots, ...), so the plugin's filter, overlay and autosave code works on it unchanged. `um_per_px` and `dt_s`
     are needed: the thresholds are pixel counts but the persistence times are seconds. Events have the legacy `type` (completed / flicker_resolved /
-    flicker_aborted) and the new `t1_class` (clean / flicker_resolved / flicker_aborted); pair_after is the pair the quartet ends on."""
+    flicker_aborted) and the new `t1_class` (clean / flicker_resolved / flicker_aborted); pair_after is the pair the quartet ends on.
+    `inside` (optional): per frame the set of track IDs in the analysis region (core/region.py); only events whose four cells are
+    all inside at the frame of the first swap are kept (the others are counted in `n_outside_region`).
+    `length_tables`: also measure the junction length of every kept event (`length_traces` in the result, for `write_length_tables`;
+    one vertex / adjacency pass per frame near an event, minutes on a long movie)."""
+    from ..region import event_inside
     from .run_tm_t1 import grayscale_rgb, labels_gray_rgb, render_fourway_dots, render_overlay
     d = {**DEFINITION, **(definition or {})}
     n = int(stack.shape[0])
-    if progress is not None:
-        progress(5, "Measuring contacts")
+    # progress(overall %, step name, step %): overall 0-10 contacts, 10-80 classifying, 80-100 overlay and results
+    def report(pct, name, step=-1):
+        if progress is not None:
+            progress(int(pct), name, int(step))
+
+    report(1, "Measuring contacts", 0)
     md = build_movie_data(np.asarray(stack), float(um_per_px), float(dt_s), "plugin", int(d["expand"]))
-    if progress is not None:
-        progress(50, "Classifying events")
-    df = classify_with_definition(md, division_frames, d, workers=1)  # serial: the plugin runs this in a Qt worker thread (no forking there)
+    report(10, "Finding candidate quartets", 100)
+    cand, n_skipped = None, 0
+    if inside is not None:
+        # a counted event needs all four cells inside at one frame: a quartet with a cell that is never inside cannot
+        # be counted, so it is not classified at all (same events as filtering afterwards, much less work)
+        ever = set().union(*inside) if inside else set()
+        p = definition_params(md.dt_s, md.um_per_px, d)
+        cand_all = candidate_quartets(md, p.l_on, p.l_off)
+        cand = {k: v for k, v in cand_all.items() if set().union(*[set(x) for x in k]) <= ever}
+        n_skipped = len(cand_all) - len(cand)
+
+    def on_quartets(done, total):
+        report(10 + 70 * done / max(total, 1), f"Classifying events ({done}/{total} quartets)", 100 * done / max(total, 1))
+
+    report(10, "Classifying events", 0)
+    df = classify_with_definition(md, division_frames, d, cand=cand, workers=1,  # serial: the plugin runs this in a Qt worker thread (no forking there)
+                                  on_progress=on_quartets)
+    report(80, "Collecting events", 0)
     dropped = df.attrs.get("dropped", pd.DataFrame())
     exclude_ids = exclude_ids or set()
     events, four_xy = [], [dict() for _ in range(n)]
-    n_excluded = 0
+    n_excluded = n_outside = 0
     for r in df.to_dict("records"):
         quartet = frozenset(int(r[k]) for k in "ABCD")
         if quartet & exclude_ids:
             n_excluded += 1
+            continue
+        if inside is not None and not event_inside({"quartet": quartet, "t_first_swap": int(r["frame_first_swap"])}, inside):
+            n_outside += 1
             continue
         orig = frozenset(int(v) for v in str(r["pair_breaking"]).split(";"))
         new = frozenset(int(v) for v in str(r["pair_building"]).split(";"))
@@ -559,6 +603,14 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
             if ok:
                 four_xy[t][quartet] = (float(np.nanmean(md.cy[t, ok])), float(np.nanmean(md.cx[t, ok])))
         events.append(r)
+    length_traces = None
+    if length_tables and events:
+        report(82, "Measuring junction lengths", 0)
+        length_traces = junction_length_traces(
+            md, pd.DataFrame(events), 3, 3, "start", workers=1,  # serial: Qt worker thread, no forking
+            on_progress=lambda done, total: report(82 + 8 * done / max(total, 1), f"Measuring junction lengths ({done}/{total} frames)",
+                                                   100 * done / max(total, 1)))
+    report(90, "Drawing the overlay", 0)
     labels_list = [stack[t] for t in range(n)]
     if rgb is not None:
         overlay_base = grayscale_rgb(rgb)
@@ -568,18 +620,20 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
         for t in range(n):
             overlay_base[t] = labels_gray_rgb(stack[t], max_lab)
     overlay = render_overlay(overlay_base, labels_list, events, four_xy, pre=pre, post=post, reach=int(d["expand"]))
+    report(95, "Drawing the overlay", 70)
     dots = render_fourway_dots(stack, events, four_xy, rgb=rgb)
     classes = pd.Series([e["t1_class"] for e in events]).value_counts().to_dict()
     reasons = dropped["drop_reason"].value_counts().to_dict() if len(dropped) else {}
     note = (f"Event definition: {d['on_px']:g} px on / {d['off_px']:g} px off, new state held {d['t_stable_s']:g} s, event ends after "
             f"{d['t_end_s']:g} s of persistence; side-cell rule {'on' if d['side_rule'] else 'off'}, vertex clause {'on' if d['vertex_clause'] else 'off'}. "
-            f"Classes {classes}; not counted: {reasons}.")
-    if progress is not None:
-        progress(100, f"T1s={len(events)}")
+            f"Classes {classes}; not counted: {reasons}."
+            + (f" {n_outside} event(s) outside the analysis region left out." if inside is not None else "")
+            + (f" {n_skipped} candidate quartet(s) with a cell outside the region were skipped." if n_skipped else ""))
+    report(100, f"T1s={len(events)}", 100)
     return {"classifier": "states", "definition": d, "stack": stack, "frame_indices": np.arange(n), "events": events, "events_shown": events,
             "four_xy": four_xy, "adj": [], "present": [], "overlay": overlay, "dots": dots, "overlay_base": overlay_base, "n_frames": n,
-            "n_t1_confirmed": len(events), "n_excluded_events": n_excluded, "classes": classes, "dropped": reasons, "swap_note": note,
-            "expand": int(d["expand"]), "pre": pre, "post": post}
+            "n_t1_confirmed": len(events), "n_excluded_events": n_excluded, "n_outside_region": n_outside, "classes": classes, "dropped": reasons, "swap_note": note,
+            "expand": int(d["expand"]), "pre": pre, "post": post, "length_traces": length_traces}
 
 
 def load_config(path) -> dict:
@@ -607,11 +661,13 @@ def load_movie(cfg: dict, stem: str, root: Path, cache_dir: Path | None = None, 
 def run_states_cli(*, labels_path: Path, rgb: Path | None, out: Path, stem: str, cal, lineage: Path | None,
                    config: Path | None = None, t_dwell: float | None = None, t_stable: float | None = None, t_end: float | None = None,
                    on_px: float | None = None, off_px: float | None = None, side_rule: bool | None = None,
-                   vertex_clause: bool | None = None, tracked_stem: str | None = None, n_jobs: int | None = None) -> Path:
+                   vertex_clause: bool | None = None, tracked_stem: str | None = None, n_jobs: int | None = None,
+                   region: Path | None = None) -> Path:
     """`run_tm_t1.py --classifier states`: classify one movie with the committed definition (DEFINITION; any argument that is not None
     overrides it) and write <stem>_t1_events.csv (legacy columns + new ones), <stem>_qc.json, the junction-length tables of the events
     (vertex-to-vertex and contact length of the active pair, as the legacy tables), the calibrated twins and the picker-ready bundle.
-    `config` (YAML) is only read for `expand` and kept for compatibility. `n_jobs`: CPU cores (default: $TISSUEKIT_N_JOBS or all cores of the allocation)."""
+    `region` (analysis_region/region.json from the plugin's Analysis cropping tab): only events whose four cells are inside the kept area at
+    the frame of their first swap are written. `config` (YAML) is only read for `expand` and kept for compatibility. `n_jobs`: CPU cores (default: $TISSUEKIT_N_JOBS or all cores of the allocation)."""
     from .calibrated_outputs import write_um_files
     from .t1_picker_ready import _write_one_picker_dir
     cfg = load_config(config) if config is not None and Path(config).is_file() else {}
@@ -627,13 +683,23 @@ def run_states_cli(*, labels_path: Path, rgb: Path | None, out: Path, stem: str,
     df = classify_with_definition(md, div, d, workers=n_jobs)
     dropped = df.attrs.get("dropped", pd.DataFrame())
     df.attrs = {}
+    n_outside = 0
+    if region is not None:
+        from ..region import Region, event_inside, geometry_for
+
+        lin_df = pd.read_csv(lineage) if lineage is not None and Path(lineage).is_file() else None
+        inside = geometry_for(Region.load(region), labels, lin_df).inside_sets()
+        keep = [event_inside({"quartet": [r.A, r.B, r.C, r.D], "t_first_swap": r.frame_first_swap}, inside) for r in df.itertuples()]
+        n_outside = int(len(df) - sum(keep))
+        df = df[keep].reset_index(drop=True)  # event_id = row index in the length tables, so renumber after filtering
     out.mkdir(parents=True, exist_ok=True)
     ev_path = out / f"{stem}_t1_events.csv"
     df.to_csv(ev_path, index=False)
     qc = dict(classifier="states", definition=d, l_on_um=p.l_on, l_off_um=p.l_off, n_dwell_frames=p.n_dwell, n_stable_frames=p.n_stable,
               n_end_frames=p.n_end, n_events=len(df), classes=df["t1_class"].value_counts().to_dict() if len(df) else {},
               dropped=dropped["drop_reason"].value_counts().to_dict() if len(dropped) else {}, labels=str(labels_path),
-              note="abortive_shrink is detected less reliably at coarse time resolution")
+              note="abortive_shrink is detected less reliably at coarse time resolution",
+              **({"analysis_region": str(region), "n_outside_region": n_outside} if region is not None else {}))
     (out / f"{stem}_qc.json").write_text(json.dumps(qc, indent=2) + "\n")
     print(f"Wrote {ev_path}: {qc['classes']}; dropped {qc['dropped']}", flush=True)
     if len(df):

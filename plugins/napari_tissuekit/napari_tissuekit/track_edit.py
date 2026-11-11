@@ -44,6 +44,63 @@ def changed_pixels(undos: list[CellUndo], width: int) -> dict[int, np.ndarray]:
     return {t: np.unique(np.concatenate(v)) for t, v in out.items()}
 
 
+def _union_sorted(old: np.ndarray, new: np.ndarray) -> np.ndarray:
+    """Union of two sorted unique index arrays without sorting the big one again."""
+    if len(old) == 0:
+        return new
+    pos = np.searchsorted(old, new)
+    known = (pos < len(old)) & (old[np.minimum(pos, len(old) - 1)] == new)
+    fresh = new[~known]
+    return np.insert(old, pos[~known], fresh) if len(fresh) else old
+
+
+class ProtectLog:
+    """The ``changed_pixels`` records of the edits since the last save, with their union kept for ``link_tracks``.
+
+    Behaves like the list it replaces (append / pop / clear / len) and, passed as ``protected``, like the merged
+    ``{frame: indices}`` dict. The union is only built when a link meets a conflict, then extended by the edits
+    made since; only Undo (pop) makes it rebuild from the records."""
+
+    def __init__(self) -> None:
+        self._records: list[dict[int, np.ndarray]] = []
+        self._merged: dict[int, np.ndarray] | None = {}
+        self._pending: list[dict[int, np.ndarray]] = []  # records not yet in _merged
+
+    def append(self, record: dict[int, np.ndarray]) -> None:
+        self._records.append(record)
+        self._pending.append(record)
+
+    def pop(self) -> dict[int, np.ndarray]:
+        self._merged, self._pending = None, []  # rebuilt on the next merged()
+        return self._records.pop()
+
+    def clear(self) -> None:
+        self._records.clear()
+        self._merged, self._pending = {}, []
+
+    def merged(self) -> dict[int, np.ndarray]:
+        if self._merged is None:
+            self._merged = merge_protected(self._records)
+        else:
+            for record in self._pending:
+                for t, idx in record.items():
+                    self._merged[t] = _union_sorted(self._merged.get(t, idx[:0]), idx)
+        self._pending = []
+        return self._merged
+
+    def __contains__(self, frame: int) -> bool:
+        return frame in self.merged()
+
+    def __getitem__(self, frame: int) -> np.ndarray:
+        return self.merged()[frame]
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __bool__(self) -> bool:
+        return bool(self._records)
+
+
 def merge_protected(records: list[dict[int, np.ndarray]]) -> dict[int, np.ndarray]:
     """Union of several ``changed_pixels`` records."""
     merged: dict[int, list[np.ndarray]] = {}
@@ -51,6 +108,23 @@ def merge_protected(records: list[dict[int, np.ndarray]]) -> dict[int, np.ndarra
         for t, idx in rec.items():
             merged.setdefault(t, []).append(idx)
     return {t: np.unique(np.concatenate(v)) for t, v in merged.items()}
+
+
+def _keep_error(stack: np.ndarray, frames, cell_id: int, why: str) -> ProtectedCellsError:
+    """Refusal for an edit that would change a cell in the keep list; carries its pixels (first frame it is on) to show."""
+    for t in frames:
+        ys, xs = np.nonzero(stack[int(t)] == cell_id)
+        if len(ys):
+            break
+    else:
+        t, ys, xs = int(next(iter(frames), 0)), np.zeros(0, np.int64), np.zeros(0, np.int64)
+    return ProtectedCellsError(
+        f"Not changed: {why} track {cell_id}, which is in your keep list. "
+        "Remove it from the list (Keep ID) to change it on purpose.",
+        int(t),
+        ys,
+        xs,
+    )
 
 
 def _pixels_by_id(
@@ -62,13 +136,15 @@ def _pixels_by_id(
     whole-movie edit stays fast. Frames without any of the ids map to {}.
     """
 
+    width = int(stack.shape[-1])
+
     def one(t: int):
-        plane = stack[t]
+        plane = stack[t].reshape(-1)  # flatnonzero on the flat plane is about 3x faster than nonzero on the 2D mask
         found = {}
         for i in ids:
-            ys, xs = np.nonzero(plane == i)
-            if len(ys):
-                found[i] = (ys, xs)
+            flat = np.flatnonzero(plane == i)
+            if len(flat):
+                found[i] = (flat // width, flat % width)
         return t, found
 
     with ThreadPoolExecutor(_WORKERS) as pool:
@@ -114,8 +190,13 @@ def link_tracks(
     replace_id: int,
     start: int,
     protected: dict[int, np.ndarray] | None = None,
+    keep_ids: frozenset[int] | set[int] | None = None,
 ) -> tuple[list[CellUndo] | None, str]:
     """From ``start`` on, ``replace_id`` becomes ``keep_id``.
+
+    ``keep_ids`` (the user's keep list): cells whose ID must not change. The edit is refused (ProtectedCellsError)
+    if ``replace_id`` is one of them, or if ``keep_id`` is one and another cell already holds it (the exchange
+    would give that cell a different ID).
 
     If another cell already has ``keep_id`` on one of those frames, the two IDs
     are exchanged from ``start`` on, so no frame ever holds a duplicate ID.
@@ -132,6 +213,14 @@ def link_tracks(
     if not changed:
         return None, "That track does not continue from this frame."
     conflict = any(keep_id in f for f in found.values())
+    if keep_ids:
+        if replace_id in keep_ids:
+            raise _keep_error(stack, changed, replace_id, "this would change")
+        if conflict and keep_id in keep_ids:
+            raise _keep_error(
+                stack, sorted(t for t, f in found.items() if keep_id in f), keep_id,
+                f"track {replace_id} can only take the ID {keep_id} by also changing",
+            )
     if conflict and protected:
         width = int(stack.shape[-1])
         for t in sorted(found):
@@ -170,23 +259,28 @@ def link_tracks(
 
 
 def break_track(
-    stack: np.ndarray, src_id: int, start: int
+    stack: np.ndarray, src_id: int, start: int, keep_ids: frozenset[int] | set[int] | None = None,
+    max_id: int | None = None,
 ) -> tuple[list[CellUndo] | None, str]:
-    """From ``start`` on, give ``src_id`` a new ID. Earlier frames keep the old one."""
+    """From ``start`` on, give ``src_id`` a new ID. Earlier frames keep the old one.
+
+    ``max_id``: the largest ID in ``stack`` if the caller knows it (saves a scan of the whole movie)."""
     if src_id <= 0:
         return None, "Click a cell."
     found = _pixels_by_id(stack, range(int(start), stack.shape[0]), (src_id,))
     changed = [t for t, f in found.items() if src_id in f]
     if not changed:
         return None, "That track does not continue from this frame."
-    new_id = int(np.max(stack)) + 1
+    if keep_ids and src_id in keep_ids:
+        raise _keep_error(stack, changed, src_id, "this would change")
+    new_id = (int(np.max(stack)) if max_id is None else int(max_id)) + 1
     _ensure_id_fits(stack, new_id)
     undos = [_relabel(stack, t, {src_id: (*found[t][src_id], new_id)}) for t in changed]
     return undos, f"Track {src_id} is {new_id} from frame {min(changed)} on."
 
 
 def swap_tracks(
-    stack: np.ndarray, id_a: int, id_b: int, start: int
+    stack: np.ndarray, id_a: int, id_b: int, start: int, keep_ids: frozenset[int] | set[int] | None = None
 ) -> tuple[list[CellUndo] | None, str]:
     """From ``start`` on, exchange two track IDs."""
     if id_a <= 0 or id_b <= 0:
@@ -197,6 +291,9 @@ def swap_tracks(
     changed = [t for t, f in found.items() if f]
     if not changed:
         return None, "Neither track continues from this frame."
+    for cid in (id_a, id_b):
+        if keep_ids and cid in keep_ids:
+            raise _keep_error(stack, [t for t in changed if cid in found[t]], cid, "this would change")
     undos: list[CellUndo] = []
     for t in changed:
         f = found[t]
