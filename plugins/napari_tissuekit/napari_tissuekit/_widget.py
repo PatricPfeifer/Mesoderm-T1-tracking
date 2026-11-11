@@ -3205,11 +3205,15 @@ class TissueKitWidget(QWidget):
         help_button = QPushButton("Help")
         help_button.setToolTip("How to use this panel: the workflow and what every button does")
         help_button.clicked.connect(self._show_help)
+        # the buttons sit under each other on the left, the name of the results folder on their right
+        buttons = QVBoxLayout()
+        buttons.setSpacing(2)
+        for b in (choose, load, save_all, help_button):
+            buttons.addWidget(b)
+        buttons.addStretch(1)
+        self.folder_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        bar.addLayout(buttons)
         bar.addWidget(self.folder_label, 1)
-        bar.addWidget(choose)
-        bar.addWidget(load)
-        bar.addWidget(save_all)
-        bar.addWidget(help_button)
         return bar
 
     def _seg_unsaved(self) -> bool:
