@@ -173,7 +173,7 @@ def test_positions_from_stack_and_geometry_for():
     assert pos[0][1] == (7.0, 7.0) and pos[1][4] == (32.0, 32.0)
     region = Region((40, 40), [[Pick(3, 0, 32, 7), Pick(4, 0, 32, 32)]], [Anchor(1, 0, 7, 7, "keep")])
     ins = geometry_for(region, stack).inside_sets()
-    assert ins[0] == {1, 2}
+    assert ins[0] == {1, 2, 3, 4}  # 3 and 4 are the line's own cells: they sit on the line and count as inside
 
 
 def test_cell_properties_only_lists_cells_inside_per_frame():
@@ -294,16 +294,16 @@ def test_positions_from_stack_with_uint64_and_empty_frames():
     assert pos[0] == {7: (3.5, 3.5)} and pos[1] == {} and pos[2] == {9: (11.5, 5.5)}
 
 
-def test_clicked_boundary_cells_are_not_analysed():
+def test_clicked_boundary_cells_count_as_inside():
     pos = grid_positions()
     for mode in (STRAIGHT, "polyline"):
         geom = Geometry(Region(SHAPE, [[pick(i, pos) for i in row_cells(2)]], [anchor(1, pos)], mode), pos)
         ins = geom.inside_sets()[0]
-        assert not (ins & set(row_cells(2)))  # the line's own cells are left out
+        assert set(row_cells(2)) <= ins  # the line's own cells sit on the border of the kept area and count as inside
         assert {10 * r + c + 1 for r in (0, 1) for c in range(6)} <= ins  # the cells above stay in
 
 
-def test_daughters_of_a_boundary_cell_are_left_out_too():
+def test_daughters_of_a_boundary_cell_count_as_inside_too():
     pos = grid_positions(n_frames=3)
     mother = row_cells(2)[2]
     for f in (1, 2):
@@ -311,4 +311,4 @@ def test_daughters_of_a_boundary_cell_are_left_out_too():
         pos[f][901], pos[f][902] = (y, x - 3), (y, x + 3)
     geom = Geometry(Region(SHAPE, [[pick(i, pos) for i in row_cells(2)]], [anchor(1, pos)], STRAIGHT), pos,
                     parents={901: mother, 902: mother})
-    assert not ({901, 902} & geom.inside_ids(2)) and not ({901, 902} & geom.inside_ids(1))
+    assert {901, 902} <= geom.inside_ids(2) and {901, 902} <= geom.inside_ids(1)

@@ -111,8 +111,15 @@ def _component_records(
     if n == 0:
         return []
     rows = []
+    all_y, all_x = np.nonzero(labeled)          # all blob pixels once, grouped by component (not one full-image scan per blob)
+    comp = labeled[all_y, all_x]
+    order = np.argsort(comp, kind="stable")
+    all_y, all_x, comp = all_y[order], all_x[order], comp[order]
+    cuts = np.searchsorted(comp, np.arange(1, n + 2))
+    h, w = expanded.shape
+    pad = np.pad(expanded, 1, mode="constant")  # zeros outside the image: they are skipped like the clipped patches were
     for cid in range(1, n + 1):
-        ys, xs = np.where(labeled == cid)
+        ys, xs = all_y[cuts[cid - 1]:cuts[cid]], all_x[cuts[cid - 1]:cuts[cid]]
         if ys.size == 0:
             continue
         y = float(ys.mean())
@@ -121,13 +128,8 @@ def _component_records(
         yi = min(max(yi, 0), expanded.shape[0] - 1)
         xi = min(max(xi, 0), expanded.shape[1] - 1)
         # Labels that actually meet in this blob (3x3 around component pixels).
-        ids: set[int] = set()
-        h, w = expanded.shape
-        for yy, xx in zip(ys, xs):
-            y0, y1 = max(yy - 1, 0), min(yy + 2, h)
-            x0, x1 = max(xx - 1, 0), min(xx + 2, w)
-            patch = expanded[y0:y1, x0:x1]
-            ids.update(int(v) for v in np.unique(patch) if v != 0)
+        vals = np.unique(np.concatenate([pad[ys + dy, xs + dx] for dy in range(3) for dx in range(3)]))
+        ids: set[int] = {int(v) for v in vals if v != 0}
         multiplicity = max(int(count[ys, xs].max()), len(ids))
         rows.append(
             {

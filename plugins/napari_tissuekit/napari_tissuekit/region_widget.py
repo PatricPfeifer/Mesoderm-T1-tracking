@@ -77,7 +77,7 @@ class AnalysisRegionWidget(QWidget):
         self.new_line_btn.setToolTip(
             "Click the cells that mark the boundary, on any frame (two or more, in a row). The line is drawn through "
             "them (the best-fit straight line, or through every cell with 'Straight lines' off) and stays on the same "
-            "cells in every frame. The picked cells are the boundary and are not analysed. Click a picked cell again to "
+            "cells in every frame. The picked cells sit on the line: their side of it does not matter, they count as inside when the area they are in is kept (by the other lines). Click a picked cell again to "
             "remove it."
         )
         self.add_cells_btn = QPushButton("Add cells to selected line")
@@ -491,6 +491,11 @@ class AnalysisRegionWidget(QWidget):
                 self._hide(layer)
             return
         data = np.asarray(pts, float)
+        if layer is not None and len(layer.data) != len(data):
+            # napari redraws a Points layer with the old slice indices while the data shrinks ("index 2 is out of bounds
+            # for axis 0 with size 2"): a changed number of points gets a fresh layer instead
+            self.viewer.layers.remove(layer)
+            layer = None
         if layer is None:
             active = self.viewer.layers.selection.active
             layer = self.viewer.add_points(data, face_color=cols, size=14, name=CELLS_LAYER, scale=scale,

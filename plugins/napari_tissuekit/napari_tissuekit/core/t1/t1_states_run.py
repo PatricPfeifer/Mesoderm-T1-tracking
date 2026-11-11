@@ -240,12 +240,49 @@ def _angle(md: MovieData, expanded_cache: dict, t: int, a: int, b: int):
     from .run_tm_t1_picker import angle_from_mask  # lazy: heavy import
     if t < 0 or t >= md.T or not (md.present[t, a] and md.present[t, b]):
         return float("nan")
-    if t not in expanded_cache:
-        lab = md.labels[t].astype(np.int64)
+    key = (t, a, b)
+    if key not in expanded_cache:
+        # grown labels on a crop around the two cells only (a whole frame is ~10x slower; the angle only reads pixels near A and B)
+        lab = md.labels[t]
+        ys, xs = np.nonzero((lab == a) | (lab == b))
+        m = 2 * int(md.expand) + 6
+        y0, y1 = max(int(ys.min()) - m, 0), min(int(ys.max()) + m + 1, lab.shape[0])
+        x0, x1 = max(int(xs.min()) - m, 0), min(int(xs.max()) + m + 1, lab.shape[1])
+        sub = lab[y0:y1, x0:x1].astype(np.int64)
         expanded_cache.clear()
-        expanded_cache[t] = expand_labels(lab, distance=md.expand) if md.expand > 0 else lab
-    ang = angle_from_mask(pair_outline_mask(expanded_cache[t], a, b, md.expand + 1))
+        expanded_cache[key] = expand_labels(sub, distance=md.expand) if md.expand > 0 else sub
+    ang = angle_from_mask(pair_outline_mask(expanded_cache[key], a, b, md.expand + 1))
     return float("nan") if ang is None else float(ang)
+
+
+def junction_centre(md: MovieData, pair: tuple, f0: int, f1: int) -> tuple[float, float, int]:
+    """(x, y, n_frames): where the junction of `pair` is, averaged over the frames f0 .. f1 - 1 in which the two cells touch.
+
+    The junction is the set of contact pixel pairs of the two cells in the labels grown by `md.expand` px (the contact the detector
+    measures); per frame the mean x and y of those pixels (a horizontal pair sits between x and x + 1, a vertical one between y and y + 1),
+    then the mean over the frames. n_frames = 0 (and NaN) when the cells never touch in that range."""
+    a, b = int(pair[0]), int(pair[1])
+    xs_f, ys_f = [], []
+    for t in range(max(f0, 0), min(f1, md.T)):
+        if not (md.present[t, a] and md.present[t, b]):
+            continue
+        cy, cx = (float(np.nanmean(md.cy[t, [a, b]])), float(np.nanmean(md.cx[t, [a, b]])))
+        half = int(max(40.0, math.hypot(float(md.cy[t, a] - md.cy[t, b]), float(md.cx[t, a] - md.cx[t, b])) / 2 + 20 + md.expand))
+        y0, y1 = max(0, int(cy) - half), min(md.labels.shape[1], int(cy) + half + 1)
+        x0, x1 = max(0, int(cx) - half), min(md.labels.shape[2], int(cx) + half + 1)
+        crop = md.labels[t, y0:y1, x0:x1].astype(np.int64)
+        g = expand_labels(crop, distance=md.expand) if md.expand > 0 else crop
+        ma, mb = g == a, g == b
+        h = (ma[:, :-1] & mb[:, 1:]) | (mb[:, :-1] & ma[:, 1:])
+        v = (ma[:-1] & mb[1:]) | (mb[:-1] & ma[1:])
+        (hy, hx), (vy, vx) = np.nonzero(h), np.nonzero(v)
+        if not len(hy) and not len(vy):
+            continue
+        xs_f.append(float(np.r_[hx + 0.5, vx].mean()) + x0)
+        ys_f.append(float(np.r_[hy, vy + 0.5].mean()) + y0)
+    if not xs_f:
+        return float("nan"), float("nan"), 0
+    return float(np.mean(xs_f)), float(np.mean(ys_f)), len(xs_f)
 
 
 def group_ok_series(md: MovieData, cells: list[int], l_off: float) -> np.ndarray:
@@ -356,13 +393,18 @@ def classify_movie(md: MovieData, p: StateParams, division_frames: dict[int, lis
             o_end = (_angle(md, cache, ev.end, *fin) if (orientation and ev.end is not None and fin) else float("nan"))
             dt = md.dt_s
             first_swap = ev.flip_frames[0] if ev.flip_frames else ev.start
+            # event position = the shrinking junction (the breaking pair) before the first swap; the four-cell centre where it never touches
+            jx, jy, n_junction = junction_centre(md, orig, f_a, first_swap)
+            cx_cells, cy_cells = cx, cy
+            if n_junction:
+                cx, cy = jx, jy
             last_swap = ev.flip_frames[-1] if ev.flip_frames else ev.start
             rows.append(dict(
                 # legacy columns (as *_t1_events.csv of the current detector)
                 frame_start=ev.start, frame_end=f_b, frame_first_swap=first_swap, frame_last_swap=last_swap,
                 frame_before=f_a, frame_after=f_b, A=cells[0], B=cells[1], C=cells[2], D=cells[3],
                 pair_breaking=";".join(map(str, orig)), pair_building=";".join(map(str, other)),
-                y=cy, x=cx, source="states", kind=kind, type=typ, persist_pre=ev.pre_frames,
+                y=cy, x=cx, x_cells=cx_cells, y_cells=cy_cells, n_junction_frames=n_junction, source="states", kind=kind, type=typ, persist_pre=ev.pre_frames,
                 persist_post=ev.post_frames, n_swaps=ev.flips, has_fourway=int(ev.v_frames > 0), other_matching=0,
                 involves_division=int(divides), division_offset_frames="",
                 # new columns
@@ -431,14 +473,37 @@ def classify_with_definition(md: MovieData, division_frames=None, definition: di
                          workers=workers, on_progress=on_progress)
 
 
+def _crop_geometry(lab: np.ndarray, quartet: frozenset, expand: int):
+    """(3-cell vertices, adjacency) of one frame, computed only on a crop around the four cells of `quartet`.
+
+    The crop holds every pixel of the four cells plus a margin wider than the label growing (`expand`), so the grown labels, the
+    adjacency of the quartet cells and the triple points between them are the same as on the whole frame (the other cells in the
+    crop are cut at its border, but nothing reads them). Whole frames cost about 6 s each, the crop a few milliseconds."""
+    from ..celltrack.cells import build_adjacency
+    from .run_tm_fourway_vertices import frame_geometry
+    mask = np.isin(lab, list(quartet))
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return [], {}
+    m = int(expand) + 8
+    y0, y1 = max(int(ys.min()) - m, 0), min(int(ys.max()) + m + 1, lab.shape[0])
+    x0, x1 = max(int(xs.min()) - m, 0), min(int(xs.max()) + m + 1, lab.shape[1])
+    sub = lab[y0:y1, x0:x1]
+    grown = expand_labels(sub, distance=expand) if expand > 0 else sub   # grown once, used for the vertices and the adjacency
+    verts3 = frame_geometry(grown, 0)[1]
+    for v in verts3:  # back to frame coordinates
+        v["y"] += y0
+        v["x"] += x0
+    return verts3, build_adjacency(grown, expand=0)
+
+
 _JL: dict = {}   # labels / expand handed to the forked worker processes of junction_length_traces
 
 
-def _junction_frame(t: int):
-    from ..celltrack.cells import build_adjacency
-    from .run_tm_fourway_vertices import junctions_one_frame
-    lab = _JL["labels"][t].astype(np.int64)
-    return t, junctions_one_frame(lab, _JL["expand"], 3.0)[1], build_adjacency(lab, expand=_JL["expand"])
+def _junction_event_frame(job):
+    eid, t, quartet = job
+    v, a = _crop_geometry(_JL["labels"][t].astype(np.int64), quartet, _JL["expand"])
+    return eid, t, v, a
 
 
 def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: int = 3, anchor: str = "start",
@@ -448,51 +513,49 @@ def junction_length_traces(md: MovieData, ev: pd.DataFrame, pre: int = 3, post: 
     original pair (sign +1) or the new pair (sign -1) when exactly one of them touches (any contact on the grown labels, as the legacy tables);
     otherwise the length is blank and `flag` says '4way' (both touch) or 'no AB/CD contact'. vertex_px = vertex-to-vertex length of the
     junction, contact_px = 4-connected contact-pixel count (both in pixels, *_um in um); signed_* = sign * length.
-    `on_progress(done, total)` is called after every measured frame of the serial path (the plugin runs it in a Qt thread)."""
-    from ..celltrack.cells import build_adjacency
-    from .run_tm_fourway_vertices import junctions_one_frame, vertex_bond
+    Only a crop around each event's four cells is analysed in each frame (see `_crop_geometry`).
+    `on_progress(done, total)` is called after every measured (event, frame) of the serial path (the plugin runs it in a Qt thread)."""
+    from .run_tm_fourway_vertices import vertex_bond
     from .run_tm_t1 import FLAG_NV, active_abcd_pair, length_blank_flag
     T, um = md.T, md.um_per_px
-    wins, needed = [], set()
+    wins, jobs = [], []
     for eid, r in enumerate(ev.itertuples(index=False)):
         r = r._asdict()
         first = int(r["frame_first_swap"] if anchor == "first_swap" else r["frame_start"])
         t0, t1 = max(0, first - pre), min(T - 1, int(r["frame_last_swap"]) + post)
-        needed.update(range(t0, t1 + 1))
+        quartet = frozenset(int(r[k]) for k in "ABCD")
+        jobs += [(eid, t, quartet) for t in range(t0, t1 + 1)]
         wins.append((eid, r, first, t0, t1))
-    adj, verts3 = {}, {}
-    frames = sorted(needed)
-    n_workers = default_workers(len(frames), workers)
+    geo = {}
+    n_workers = default_workers(len(jobs), workers)
     if n_workers > 1 and "fork" in mp.get_all_start_methods():
-        # the vertex / adjacency step is plain Python (about 6 s per frame): separate processes, the labels are shared by fork
         _JL.update(labels=md.labels, expand=md.expand)
         try:
             with cf.ProcessPoolExecutor(n_workers, mp_context=mp.get_context("fork")) as pool:
-                for t, v, a in pool.map(_junction_frame, frames, chunksize=2):
-                    verts3[t], adj[t] = v, a
+                for eid, t, v, a in pool.map(_junction_event_frame, jobs, chunksize=8):
+                    geo[eid, t] = (v, a)
         finally:
             _JL.clear()
     else:
-        for i, t in enumerate(frames):
-            lab = md.labels[t].astype(np.int64)
-            verts3[t] = junctions_one_frame(lab, md.expand, 3.0)[1]
-            adj[t] = build_adjacency(lab, expand=md.expand)
+        for i, (eid, t, quartet) in enumerate(jobs):
+            geo[eid, t] = _crop_geometry(md.labels[t].astype(np.int64), quartet, md.expand)
             if on_progress is not None:
-                on_progress(i + 1, len(frames))
+                on_progress(i + 1, len(jobs))
     rows = []
     for eid, r, first, t0, t1 in wins:
         quartet = frozenset(int(r[k]) for k in "ABCD")
         ab = frozenset(int(v) for v in str(r["pair_breaking"]).split(";"))
         cd = frozenset(int(v) for v in str(r["pair_building"]).split(";"))
         for t in range(t0, t1 + 1):
-            pair, sign = active_abcd_pair(adj[t], ab, cd)
+            verts3, adj = geo[eid, t]
+            pair, sign = active_abcd_pair(adj, ab, cd)
             row = dict(event_id=eid, type=r["type"], t1_class=r["t1_class"], frame=t, dt=t - first, t_s=(t - first) * md.dt_s, sign=sign,
                        flag="", vertex_px=np.nan, contact_px=np.nan)
             if sign == 0 or pair is None:
-                row["flag"] = length_blank_flag(adj[t], ab, cd)
+                row["flag"] = length_blank_flag(adj, ab, cd)
             else:
                 a, b = tuple(pair)
-                lv, _, _ = vertex_bond(verts3[t], pair, quartet)
+                lv, _, _ = vertex_bond(verts3, pair, quartet)
                 c = float(md.pair_length(a, b)[t]) / um
                 if lv is None:
                     row["flag"] = FLAG_NV
