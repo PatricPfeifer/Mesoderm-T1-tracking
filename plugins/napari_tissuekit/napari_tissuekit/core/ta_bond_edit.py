@@ -1,7 +1,8 @@
-"""Headless Tissue Analyzer bond correction (EPySeg ``paint2`` algorithms).
+"""Headless bond (outline) correction on Tissue Analyzer style handCorrection arrays (255 = bond / background).
 
-Ports ``Createpaintwidget.apply_drawing`` to
-numpy arrays, calling the ported EPySeg ``wshed`` (``_wshed.py``).
+The 1 px bonds are built once from the masks with the ported EPySeg ``wshed`` (``_wshed.py``, :func:`thin_hand`).
+Edits are then applied exactly as drawn, without a watershed (:func:`apply_strokes`): lines that were not painted or
+erased never move.
 """
 from __future__ import annotations
 
@@ -178,6 +179,19 @@ def thin_hand_stack(masks: np.ndarray, progress=None) -> np.ndarray:
     return out
 
 
+def make_bonds(masks: np.ndarray, progress=None) -> tuple[np.ndarray, np.ndarray]:
+    """The outline step of segmentation: T,Y,X masks → ``(hand, outlines)``.
+
+    ``hand`` is the handCorrection stack with 1 px bonds (:func:`thin_hand_stack`), ``outlines`` the 0/1 stack of the
+    bond pixels that touch a cell (what the Outlines layer shows and ``*_cell_outlines.tif`` holds, as 0/255). Every
+    segmentation (napari, command line, cluster) runs this right after the masks, so outlines always exist.
+    """
+    from .outline_io import hand_stack_to_outline
+
+    hand = thin_hand_stack(masks, progress)
+    return hand, hand_stack_to_outline(hand)
+
+
 OUTLINE_MATCH_TOLERANCE = 20  # px per frame: a saved outline this close to its reconstruction is taken as it is
 
 
@@ -245,16 +259,11 @@ def hand_stack_from_outlines(masks: np.ndarray, outlines: np.ndarray, progress=N
     n = stack.shape[0]
 
     def one(t: int):
-        hand = hand_from_outlines(stack[t], saved[t]) if fits else None
-        fitted = hand is not None
-        if fitted:
-            gaps = enclosed_gaps(stack[t])
-            if gaps.any() and float((hand[gaps] == 255).mean()) > 0.5:
-                hand = None  # the file still draws two lines around a gap: out of date
-        if hand is not None:
-            return t, hand, (saved[t] > 0).astype(np.uint8), True
-        hand = thin_hand(stack[t])
-        return t, hand, hand_to_outline(hand), fitted
+        if not fits:
+            hand = thin_hand(stack[t])
+            return t, hand, hand_to_outline(hand), False
+        hand, rebuilt, fitted = frame_bonds(stack[t], saved[t])
+        return t, hand, ((saved[t] > 0).astype(np.uint8) if rebuilt is None else rebuilt), fitted
 
     workers = max(1, min(8, os.cpu_count() or 1))
     with ThreadPoolExecutor(workers) as pool:
@@ -265,6 +274,79 @@ def hand_stack_from_outlines(masks: np.ndarray, outlines: np.ndarray, progress=N
             if progress is not None:
                 progress(int(100 * done / n), f"preparing bonds, frame {done}/{n}")
     return hand_out, outline_out, fit
+
+
+def frame_bonds(mask_t: np.ndarray, outline_t: np.ndarray):
+    """Bonds of one frame that comes with saved outlines: ``(hand, rebuilt, fitted)``.
+
+    ``rebuilt`` is None when the saved lines are the plugin's own 1 px bonds of ``mask_t`` (they are kept, no line
+    moves); otherwise (another kind of outline file, or an older plugin version's file that still draws two lines
+    around a closed gap) the bonds are rebuilt from the masks and ``rebuilt`` holds their outlines. ``fitted``: the
+    saved lines matched the masks (even if out of date).
+    """
+    from .outline_io import hand_to_outline
+
+    hand = hand_from_outlines(mask_t, outline_t)
+    fitted = hand is not None
+    if fitted:
+        gaps = enclosed_gaps(mask_t)
+        if gaps.any() and float((hand[gaps] == 255).mean()) > 0.5:
+            hand = None  # the file still draws two lines around a gap: out of date
+    if hand is not None:
+        return hand, None, fitted
+    hand = thin_hand(mask_t)
+    return hand, hand_to_outline(hand), fitted
+
+
+class FrameBonds:
+    """The handCorrection stack (T,Y,X) built one frame at a time, the first time a frame is used.
+
+    Loading saved outlines then needs no pass over the whole movie: ``bonds[t]`` builds frame ``t`` from the current
+    masks and outlines (``source(t) -> (mask_t, outline_t)``, :func:`frame_bonds`) when it is first read, and edits
+    store their result with ``bonds[t] = ...``. Only frames that were used take memory. ``on_rebuilt(t, outline)`` is
+    called when a frame's saved outlines did not fit and its bonds were rebuilt from the masks (the caller shows the
+    new lines). Indexing is by frame only, like ``stack[t]``.
+    """
+
+    def __init__(self, shape, source, on_rebuilt=None):
+        self.shape = tuple(int(s) for s in shape)
+        self.ndim = 3
+        self.dtype = np.dtype(np.uint8)
+        self._source = source
+        self._on_rebuilt = on_rebuilt
+        self._frames: dict[int, np.ndarray] = {}
+        self.rebuilt: set[int] = set()  # frames whose saved outlines were replaced by bonds rebuilt from the masks
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def is_built(self, t) -> bool:
+        return int(t) in self._frames
+
+    def install(self, t, hand: np.ndarray, rebuilt: np.ndarray | None = None) -> None:
+        """Store frame ``t`` computed elsewhere (e.g. ahead of time in a thread): ``frame_bonds``' hand and rebuilt."""
+        t = int(t)
+        self._frames[t] = np.asarray(hand, dtype=np.uint8)
+        if rebuilt is not None:
+            self.rebuilt.add(t)
+            if self._on_rebuilt is not None:
+                self._on_rebuilt(t, rebuilt)
+
+    def __getitem__(self, t) -> np.ndarray:
+        if not isinstance(t, (int, np.integer)):
+            raise TypeError("FrameBonds is indexed by frame only")
+        t = int(t)
+        if t not in self._frames:
+            if not 0 <= t < self.shape[0]:
+                raise IndexError(t)
+            hand, rebuilt, _ = frame_bonds(*self._source(t))
+            self.install(t, hand, rebuilt)
+        return self._frames[t]
+
+    def __setitem__(self, t, value) -> None:
+        # a copy, as assigning into a numpy stack would make: edits change frames in place, and the value may be an
+        # undo snapshot that must stay as it is
+        self._frames[int(t)] = np.array(value, dtype=np.uint8, copy=True)
 
 
 def hand_to_labels(hand: np.ndarray) -> np.ndarray:
@@ -364,163 +446,182 @@ def _remap_roi_labels(
     return out.astype(np.uint32)
 
 
-MAX_SLIVER_WIDTH = 5.0  # px (minor axis): a "cell" this narrow and long is two lines drawn beside each other
-MIN_SLIVER_ELONGATION = 2.5  # length / width
-MAX_SLIVER_AREA = 200
+LOOP_MIN_INSIDE = 9  # px: a hole this small inside a stroke is a curl of the brush, not a drawn loop
+LOOP_GAP = 3  # px: a stroke whose two ends are at most this far apart counts as a closed loop
+LOOP_MAX_GAP_ANGLE = 2 * np.pi / 3  # a loop's painted pixels leave no gap wider than this, seen from its inside
+_CROSS = ndi.generate_binary_structure(2, 1)
 
 
-def merge_slivers(bonds: np.ndarray, before: np.ndarray) -> np.ndarray:
-    """Collapse the very narrow cells an edit created (two bond lines 1-4 px apart) into one line.
+def _stroke_loop(stroke: np.ndarray, painted: np.ndarray | None = None) -> np.ndarray:
+    """Inside of the loop that one stroke draws by itself (empty when it is not closed).
 
-    A stroke painted beside an existing membrane leaves a sliver between the two lines. Cells narrower than
-    ``MAX_SLIVER_WIDTH``, long and thin, smaller than ``MAX_SLIVER_AREA`` px (or smaller than the minimal cell size),
-    and cut out of a clearly larger area of
-    ``before`` (the bonds before the edit) are filled and the bonds around them thinned again. Cells that were
-    already that small before the edit, and cells touching the border of ``bonds`` (cut off by the crop), are left
-    alone.
+    A stroke closes when it encloses an area on its own, or when its two ends are at most ``LOOP_GAP`` px apart (they
+    are then joined). Enclosed areas smaller than ``LOOP_MIN_INSIDE`` px are curls of the brush and do not count.
+    ``painted`` is the part of ``stroke`` that was really painted (the rest are outline pixels joining its pieces
+    across the lines it crosses): joining pixels inside the loop belong to its inside, not to the loop.
     """
-    h, w = bonds.shape
-    lab = label(bonds, connectivity=1, background=255)
-    old = label(before, connectivity=1, background=255)
-    old_area = np.bincount(old.ravel())
-    drop = []
-    for r in regionprops(lab):
-        y0, x0, y1, x1 = r.bbox
-        if y0 == 0 or x0 == 0 or y1 == h or x1 == w:
-            continue
-        too_small = r.area < MIN_CELL_AREA  # not a cell at all (see cell_size)
-        thin = (
-            r.area < MAX_SLIVER_AREA
-            and r.minor_axis_length < MAX_SLIVER_WIDTH
-            and r.major_axis_length >= MIN_SLIVER_ELONGATION * max(r.minor_axis_length, 1.0)
-        )
-        if not (too_small or thin):
-            continue
-        was = np.bincount(old[r.coords[:, 0], r.coords[:, 1]]).argmax()
-        if was == 0 or old_area[was] >= 2 * r.area:  # it was bond or part of a bigger cell: this edit made it
-            drop.append(r.label)
-    if not drop:
-        return bonds
-    sliver = np.isin(lab, drop)
-    filled = bonds.copy()
-    filled[sliver] = 255
-    thinned = np.zeros_like(filled)
-    thinned[watershed(filled, markers=None, watershed_line=True) == 0] = 255
-    near = ndi.binary_dilation(sliver, iterations=4)  # only the neighbourhood of the slivers changes
-    out = bonds.copy()
-    out[near] = thinned[near]
-    return out
+    from skimage.draw import line as draw_line
+    from skimage.morphology import skeletonize
+
+    if painted is None:
+        painted = stroke
+
+    def holes(s):
+        filled = ndi.binary_fill_holes(s)
+        outside = ~filled
+        # joining pixels touching the outside are where the loop crosses a line: they are the loop itself
+        joint = s & ~painted & ~ndi.binary_dilation(outside, structure=np.ones((3, 3), bool))
+        inside = filled & ~(s & ~joint)
+        lab = label(inside, connectivity=1)
+        keep = []
+        for r in regionprops(lab):
+            if r.area < LOOP_MIN_INSIDE:
+                continue
+            # the painted pixels must go round the inside: seen from its centre, no gap wider than LOOP_MAX_GAP_ANGLE
+            # (a straight stroke passing a junction encloses an area together with the lines, but from one side only)
+            ring = painted & ndi.binary_dilation(lab == r.label, structure=np.ones((3, 3), bool), iterations=2)
+            ys, xs = np.nonzero(ring)
+            if ys.size < 3:
+                continue
+            ang = np.sort(np.arctan2(ys - r.centroid[0], xs - r.centroid[1]))
+            gaps = np.diff(np.concatenate([ang, ang[:1] + 2 * np.pi]))
+            if gaps.max() <= LOOP_MAX_GAP_ANGLE:
+                keep.append(r.label)
+        return np.isin(lab, keep)
+
+    nothing = np.zeros(stroke.shape, dtype=bool)
+    inside = holes(stroke)
+    if inside.any():
+        return inside, nothing
+    skel = skeletonize(painted)
+    nb = ndi.convolve(skel.astype(np.uint8), np.ones((3, 3), np.uint8), mode="constant") - skel
+    ends = np.argwhere(skel & (nb == 1))
+    gap = nothing.copy()
+    for i in range(len(ends)):
+        for j in range(i + 1, len(ends)):
+            if np.hypot(*(ends[i] - ends[j])) <= LOOP_GAP:
+                rr, cc = draw_line(*ends[i], *ends[j])
+                gap[rr, cc] = True
+    gap &= ~stroke
+    if not gap.any():
+        return inside, nothing
+    painted = painted | gap
+    inside = holes(stroke | gap)
+    return inside, (gap if inside.any() else nothing)
 
 
-def apply_drawing_hand(
-    hand: np.ndarray,
-    erased: np.ndarray,
-    drawn: np.ndarray,
-    *,
-    min_seed_area: int = 0,
-    pad: int = 128,
-) -> np.ndarray:
-    """Port of ``Createpaintwidget.apply_drawing`` on a handCorrection array.
+def apply_strokes(hand: np.ndarray, erased: np.ndarray, drawn: np.ndarray, report: list | None = None) -> np.ndarray:
+    """Apply painted / erased outline pixels to one frame's handCorrection exactly as drawn (no watershed).
 
-    Merges strokes into ``hand``, then local ``wshed(..., seeds='mask')``.
-    ``pad`` is the context margin around the edit (TA uses 128).
+    What you draw is what you get; lines you did not touch never move:
+
+    * Erased bond pixels join the cells on both sides. Erasing a cell's border with the background deletes the cell
+      (:func:`erased_into_background`). The leftover bits of an erased membrane that now separate nothing go too.
+    * Drawn pixels become membrane. The parts of a stroke that separate nothing (the loose ends sticking out past the
+      last line it crosses, a stroke drawn along an existing line) are taken off again; thick strokes are thinned to
+      the 1 px line between the cells they separate. A stroke that separates nothing at all (an open line) stays as
+      drawn, so it can be closed later.
+    * A stroke that closes on itself (:func:`_stroke_loop`) makes its inside one new cell: the old lines inside the
+      loop go, the cells around lose the part inside. A stroke that cuts off part of the background outside the
+      tissue makes that part a cell.
+    * Pieces are cells whatever their size.
+
+    ``report`` (a list) gets ``("open", n_px)`` for every stroke kept as an open line and ``("loop", n_px)`` for
+    every new cell made by a loop or cut off the background.
     """
-    pad = int(pad)
-    drawn_mask = np.asarray(hand, dtype=np.uint8).copy()
-    erased = np.asarray(erased)
-    drawn = np.asarray(drawn)
-    # Outside-the-tissue background, from the bonds before this edit (thick
-    # drawn strokes must still be thinned by the watershed).
-    exterior = exterior_mask(drawn_mask) & (erased == 0)
+    hand = np.asarray(hand, dtype=np.uint8)
+    erased = np.asarray(erased) != 0
+    drawn = np.asarray(drawn) != 0
+    new = hand.copy()
+    ext = exterior_mask(hand) & ~erased  # background outside the tissue (before this edit)
 
-    # Merge strokes into mask (edit_drawing + apply_drawing convention).
-    drawn_mask[erased != 0] = 0
-    drawn_mask[drawn != 0] = 255
+    if erased.any():
+        new[erased] = 0
+        gone = erased_into_background(hand, ext, erased, new)
+        if gone.any():
+            new[gone] = 255
+            ext |= gone
 
-    bounds = get_white_bounds([drawn, erased])
-    if np.any(erased):
-        # Erasing a cell's border with the background merges the cell into
-        # the background, i.e. deletes it.
-        gone = erased_into_background(hand, exterior, erased != 0, drawn_mask)
-        if np.any(gone):
-            drawn_mask[gone] = 255
-            exterior |= gone
-            cb = get_white_bounds(gone)
-            bounds = [min(bounds[0], cb[0]), max(bounds[1], cb[1]),
-                      min(bounds[2], cb[2]), max(bounds[3], cb[3])]
-    if np.any(drawn):
-        # Strokes in the background that cut off part of it make new cells
-        # (background is 255 like a bond, so drawing alone changes nothing).
-        new_cells = enclosed_background(exterior, drawn != 0)
-        # Keep a 1 px bond to existing cells so the new cell stays separate.
-        cells = drawn_mask == 0
-        new_cells &= ~ndi.binary_dilation(cells, structure=ndi.generate_binary_structure(2, 1))
-        if np.any(new_cells):
-            drawn_mask[new_cells] = 0
-            exterior &= ~new_cells
-            cb = get_white_bounds(new_cells)
-            bounds = [min(bounds[0], cb[0]), max(bounds[1], cb[1]),
-                      min(bounds[2], cb[2]), max(bounds[3], cb[3])]
-    if bounds is None:
-        if min_seed_area:
-            out = np.asarray(
-                wshed(drawn_mask, seeds="mask", min_seed_area=int(min_seed_area)),
-                dtype=np.uint8,
-            )
-            out[exterior] = 255
-            return out
-        return drawn_mask
+    # One stroke = drawn pixels joined across the membranes they cross: where a stroke crosses a line its pixels
+    # there were outline already, so they are not in ``drawn`` and the stroke falls apart into pieces.
+    near = ndi.binary_dilation(drawn, structure=np.ones((3, 3), bool), iterations=2)
+    from .outline_io import hand_to_outline
 
-    if np.count_nonzero(erased) != 0:
-        lab_erased = label(erased, connectivity=2, background=0)
-        rps_lab_erased = regionprops(lab_erased)
-        lab_drawn_mask = label(drawn_mask, connectivity=1, background=255)
-        rps_lab_drawn_mask = regionprops(lab_drawn_mask)
-        for erased_bond in rps_lab_erased:
-            ids = np.unique(
-                lab_drawn_mask[erased_bond.coords[:, 0], erased_bond.coords[:, 1]]
-            )
-            for id_ in ids:
-                if id_ != 0:
-                    cur_bounds = rps_lab_drawn_mask[id_ - 1].bbox
-                    bounds[0] = min(bounds[0], cur_bounds[0])
-                    bounds[1] = max(bounds[1], cur_bounds[2])
-                    bounds[2] = min(bounds[2], cur_bounds[1])
-                    bounds[3] = max(bounds[3], cur_bounds[3])
+    crossed = near & (hand_to_outline(hand) > 0) & ~drawn  # outline pixels (also the tissue's outer border)
+    groups = label(drawn | crossed, connectivity=2)  # also where a stroke runs along a line for a few px
+    strokes = np.where(drawn, groups, 0)
+    loops = np.zeros(hand.shape, dtype=bool)
+    made = []  # strokes that made a new cell by themselves (they are never "open")
+    for k, sl in enumerate(ndi.find_objects(groups), start=1):
+        if sl is None:
+            continue
+        pad = LOOP_GAP + 2
+        ys = slice(max(0, sl[0].start - pad), sl[0].stop + pad)
+        xs = slice(max(0, sl[1].start - pad), sl[1].stop + pad)
+        inside, gap = _stroke_loop(groups[ys, xs] == k, drawn[ys, xs])
+        if inside.any():
+            loops[ys, xs] |= inside
+            made.append(k)
+            if gap.any():  # the small gap between the loop's two ends is drawn in
+                drawn[ys, xs] |= gap
+                strokes[ys, xs][gap] = k
+    new[drawn] = 255
+    if loops.any():
+        new[loops] = 0  # the loop's inside is one cell: the old lines inside it go
+        ext &= ~loops
+        if report is not None:
+            report.extend(("loop", int(n)) for n in np.bincount(label(loops, connectivity=1).ravel())[1:])
+    if drawn.any():
+        # background cut off by a stroke (closed against the tissue edge) becomes a cell, 1 px away from the cells
+        cut = enclosed_background(ext & ~loops, groups > 0, min_area=LOOP_MIN_INSIDE)
+        cut &= ~ndi.binary_dilation(new == 0, structure=_CROSS)
+        if cut.any():
+            new[cut] = 0
+            ext &= ~cut
+            made.extend(int(k) for k in np.unique(strokes[ndi.binary_dilation(cut, structure=np.ones((3, 3), bool))]) if k)
+            if report is not None:
+                report.extend(("loop", int(n)) for n in np.bincount(label(cut, connectivity=1).ravel())[1:])
 
-    min_y, max_y, min_x, max_x = bounds
-    first_x = pad
-    first_y = pad
-    min_x = min_x - pad
-    max_x = max_x + pad
-    min_y = min_y - pad
-    max_y = max_y + pad
-
-    if min_x < 0:
-        first_x = pad + min_x
-        min_x = 0
-    if min_y < 0:
-        first_y = pad + min_y
-        min_y = 0
-    if max_y > drawn_mask.shape[0]:
-        max_y = drawn_mask.shape[0]
-    if max_x > drawn_mask.shape[1]:
-        max_x = drawn_mask.shape[1]
-
-    crop = drawn_mask[min_y:max_y, min_x:max_x]
-    minished = np.asarray(
-        wshed(crop, seeds="mask", min_seed_area=int(min_seed_area or 0)),
-        dtype=np.uint8,
-    )
-    minished[exterior[min_y:max_y, min_x:max_x]] = 255
-    minished = merge_slivers(minished, np.asarray(hand, dtype=np.uint8)[min_y:max_y, min_x:max_x])
-    minished[exterior[min_y:max_y, min_x:max_x]] = 255
-    y1 = first_y
-    y2 = min(first_y + (bounds[1] - bounds[0]) + 1, minished.shape[0])
-    x1 = first_x
-    x2 = min(first_x + (bounds[3] - bounds[2]) + 1, minished.shape[1])
-    drawn_mask[min_y:max_y, min_x:max_x][y1:y2, x1:x2] = minished[y1:y2, x1:x2]
-    return drawn_mask
+    # Which drawn (and erased-membrane) pixels really separate two areas: flood every cell and every background area
+    # into those pixels only; where two different areas meet the pixel stays membrane, the rest joins its area.
+    cells = label(new == 0, connectivity=1)
+    outside = label(ext & (new == 255) & ~drawn, connectivity=1)
+    markers = cells.astype(np.int64)
+    markers[outside > 0] = outside[outside > 0] + int(cells.max())
+    stroke_px = drawn & (new == 255) & (markers == 0)
+    flood = stroke_px.copy()
+    if erased.any():
+        # leftover bits of an erased membrane: bond pixels next to one cell only (the background around the tissue
+        # does not count: a bit sticking out of the tissue's outer border is a leftover too), joined to the erased
+        # pixels. A bit that touches one cell in all joins it; others are flooded like strokes.
+        p = np.pad(np.where(markers <= cells.max(), markers, 0), 1)
+        nbs = np.stack([p[:-2, 1:-1], p[2:, 1:-1], p[1:-1, :-2], p[1:-1, 2:]])
+        hi = nbs.max(axis=0)
+        lo = np.where(nbs > 0, nbs, np.iinfo(np.int64).max).min(axis=0)
+        lonely = (new == 255) & (markers == 0) & ~drawn & (hi > 0) & (hi == lo)
+        bits = label(lonely, connectivity=2)
+        touch = np.unique(bits[ndi.binary_dilation(erased, structure=np.ones((3, 3), bool))])
+        for k in touch[touch > 0]:
+            bit = bits == k
+            if np.unique(hi[bit]).size == 1:
+                new[bit] = 0
+            else:
+                flood |= bit
+    if flood.any():
+        ws = watershed(np.zeros(hand.shape, np.uint8), markers, mask=(markers > 0) | flood, watershed_line=True)
+        joined = flood & (ws > 0)
+        # pixels that join a cell become cell; those that join the background stay 255 (background)
+        new[joined & (ws <= cells.max())] = 0
+        separating = stroke_px & (ws == 0)
+        for k in np.unique(strokes[stroke_px]):
+            if k == 0 or k in made:
+                continue
+            comp = strokes == k
+            if not (separating & comp).any():
+                new[comp] = 255  # an open line: it separates nothing yet, keep it as drawn
+                if report is not None:
+                    report.append(("open", int(comp.sum())))
+    return new
 
 
 def changed_frames(base_outlines: np.ndarray, edited_outlines: np.ndarray) -> list[int]:
@@ -620,22 +721,23 @@ def apply_bond_strokes(
     edited_outlines: np.ndarray,
     *,
     frames,
-    min_seed_area: int = 0,
-    pad: int = 128,
+    report: list | None = None,
 ):
-    """Apply painted bond strokes (TA ``apply_drawing``) to T,Y,X stacks.
+    """Apply painted / erased outline pixels to T,Y,X stacks exactly as drawn (:func:`apply_strokes`).
 
     ``hand`` (T,Y,X handCorrection with 1 px bonds) is updated in place and
     ``masks`` too, unless labels outgrow its dtype (then a uint32 copy is
     returned). Returns ``(masks, rois)`` with ``rois`` = ``(t, ys, xs)``.
+    ``report`` (a list) gets ``(t, kind, n_px)`` per open line / new cell (see :func:`apply_strokes`).
     """
     rois: list[tuple[int, slice, slice]] = []
     for t in frames:
         t = int(t)
         erased, drawn = stroke_diff(base_outlines[t], edited_outlines[t])
-        new_hand = apply_drawing_hand(
-            hand[t], erased, drawn, min_seed_area=min_seed_area, pad=pad
-        )
+        notes: list = []
+        new_hand = apply_strokes(hand[t], erased, drawn, report=notes)
+        if report is not None:
+            report.extend((t, kind, n) for kind, n in notes)
         res = relabel_changed(masks[t], hand[t], new_hand)
         hand[t] = new_hand
         if res is not None:

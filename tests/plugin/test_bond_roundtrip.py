@@ -4,7 +4,7 @@ from skimage.measure import label
 from skimage.segmentation import find_boundaries, watershed
 
 from napari_tissuekit.core.outline_io import hand_to_outline
-from napari_tissuekit.core.ta_bond_edit import apply_drawing_hand, hand_stack_from_outlines, hand_from_outlines, relabel_changed, thin_hand
+from napari_tissuekit.core.ta_bond_edit import apply_strokes, hand_stack_from_outlines, hand_from_outlines, relabel_changed, thin_hand
 
 
 def _tissue():
@@ -21,8 +21,9 @@ def test_saved_outlines_are_the_starting_bonds():
     masks = _tissue()
     hand = thin_hand(masks)
     stroke = np.zeros(masks.shape, np.uint8)
-    stroke[60:140, 100:103] = 1
-    new = apply_drawing_hand(hand, np.zeros_like(stroke), stroke, min_seed_area=14, pad=128)
+    stroke[60:140, 101] = 1
+    stroke[hand_to_outline(hand) > 0] = 0  # pixels already on an outline are not painted
+    new = apply_strokes(hand, np.zeros_like(stroke), stroke)
     labels, (ys, xs) = relabel_changed(masks, hand, new)
     edited = masks.copy()
     edited[ys, xs] = labels[ys, xs]
@@ -52,21 +53,6 @@ def test_enclosed_gap_between_cells_gets_one_membrane():
     assert (thin_hand(big)[60:120, 100:120] == 255).mean() > 0.9
     sizes = np.bincount(label(thin_hand(masks), connectivity=1, background=255).ravel())[1:]
     assert sizes.min() >= 4  # closing the gap leaves no stray 1 px cells
-
-
-def test_stroke_beside_a_membrane_does_not_leave_a_double_line():
-    masks = np.zeros((200, 220), np.uint16)
-    masks[20:180, 20:100] = 1
-    masks[20:180, 100:200] = 2
-    hand = thin_hand(masks)
-    bond_x = int(np.flatnonzero(hand[100, 60:140] == 255)[0]) + 60
-    stroke = np.zeros(masks.shape, np.uint8)
-    stroke[60:121, bond_x + 3:bond_x + 6] = 1  # painted 2 px beside the membrane ...
-    stroke[58:62, bond_x:bond_x + 6] = 1  # ... and joined to it at both ends
-    stroke[118:122, bond_x:bond_x + 6] = 1
-    new = apply_drawing_hand(hand, np.zeros_like(stroke), stroke, min_seed_area=14, pad=128)
-    cells = label(new, connectivity=1, background=255)
-    assert cells.max() == 2  # no thin cell between the two lines
 
 
 def _border_pixels(o):
