@@ -882,6 +882,44 @@ def fetch_job(cfg: RemoteConfig, job: RemoteJob, progress: Progress,
     return masks_file(files)
 
 
+def my_jobs(session: Session, user: str) -> list[tuple[str, str, str]]:
+    """(job id, job name, state) of every job of ``user`` that Slurm still has queued or running."""
+    out = session.run(f"squeue -h -u {shlex.quote(user)} -o '%i|%j|%T'", check=False)
+    jobs = []
+    for line in out.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) == 3 and parts[0]:
+            jobs.append((parts[0], parts[1], parts[2]))
+    return jobs
+
+
+def cancel_all_jobs(cfg: RemoteConfig, password: str, otp: str,
+                    progress: Progress) -> list[tuple[str, str, str]]:
+    """Cancel every waiting and running job of the cluster user (``scancel -u``).
+
+    Returns the jobs that were cancelled. Remembered single-movie jobs among them are
+    forgotten (they have no results); batch jobs stay remembered, so 'Fetch cluster
+    results' can still download the items that finished before the cancel.
+    """
+    progress(0, f"connecting to {cfg.host} ...")
+    with Session.connect(cfg, password, otp) as session:
+        jobs = my_jobs(session, cfg.user)
+        if not jobs:
+            progress(0, "no waiting or running jobs on the cluster")
+            return []
+        progress(0, f"cancelling {len(jobs)} job(s) ...")
+        session.run(f"scancel -u {shlex.quote(cfg.user)}")
+        left = my_jobs(session, cfg.user)
+    gone = {j[0] for j in jobs}
+    for job in load_jobs():
+        if job.job_id in gone and not job.is_batch:
+            forget_job(job.job_id)
+    if left:
+        # scancel only asks Slurm to stop them; a running job may take a moment to end
+        progress(0, f"{len(left)} job(s) still ending on the cluster")
+    return jobs
+
+
 def _finish(session: Session, job: RemoteJob, delete_remote: bool) -> None:
     _mark_active_run(job)
     forget_job(job.job_id)
