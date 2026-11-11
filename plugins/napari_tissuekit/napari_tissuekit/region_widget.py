@@ -437,15 +437,11 @@ class AnalysisRegionWidget(QWidget):
                 colors.append(LINE_COLORS[i % len(LINE_COLORS)])
             for i, order in enumerate(self.geom.orders):
                 for tid in order:
-                    q = cell_position(self.geom.pos, self.geom.parents, self.geom.children, tid, frame)
-                    if q is not None:
-                        pts.append(q)
-                        pcol.append(LINE_COLORS[i % len(LINE_COLORS)])
+                    pts.append(cell_position(self.geom.pos, self.geom.parents, self.geom.children, tid, frame))  # None: absent now
+                    pcol.append(LINE_COLORS[i % len(LINE_COLORS)])
             for a in self.anchors:
-                q = cell_position(self.geom.pos, self.geom.parents, self.geom.children, a.track_id, frame)
-                if q is not None:
-                    pts.append(q)
-                    pcol.append("#3ddc84" if a.mode == "keep" else "#ff4d4d")
+                pts.append(cell_position(self.geom.pos, self.geom.parents, self.geom.children, a.track_id, frame))
+                pcol.append("#3ddc84" if a.mode == "keep" else "#ff4d4d")
         self._set_shapes(paths, colors, scale, translate)
         self._set_points(pts, pcol, scale, translate)
         self._set_area(frame, scale, translate)
@@ -485,15 +481,20 @@ class AnalysisRegionWidget(QWidget):
             self._show(layer)
 
     def _set_points(self, pts, cols, scale, translate) -> None:
+        """Markers of the picked cells. `pts` has one entry per picked cell, None where the cell is not on this frame.
+
+        The layer keeps one point per picked cell on every frame (absent cells are hidden through `layer.shown`), so scrolling only
+        changes the data in place. Only a changed number of picks (a click or undo) makes a fresh layer: napari redraws a Points
+        layer with the old slice indices while its data shrinks ("index 2 is out of bounds for axis 0 with size 2")."""
         layer = self._layer(CELLS_LAYER)
-        if not pts:
+        have = np.array([p is not None for p in pts], bool)
+        if not have.any():
             if layer is not None:
                 self._hide(layer)
             return
-        data = np.asarray(pts, float)
+        fill = next(p for p in pts if p is not None)
+        data = np.asarray([p if p is not None else fill for p in pts], float)
         if layer is not None and len(layer.data) != len(data):
-            # napari redraws a Points layer with the old slice indices while the data shrinks ("index 2 is out of bounds
-            # for axis 0 with size 2"): a changed number of points gets a fresh layer instead
             self.viewer.layers.remove(layer)
             layer = None
         if layer is None:
@@ -505,8 +506,11 @@ class AnalysisRegionWidget(QWidget):
                 self.viewer.layers.selection.active = active
         else:
             layer.data = data
-            layer.face_color = cols
-            self._show(layer)
+            if list(map(str, cols)) != getattr(layer, "_tk_cols", None):
+                layer.face_color = cols
+        layer._tk_cols = list(map(str, cols))
+        layer.shown = have
+        self._show(layer)
 
     def _set_area(self, frame: int, scale, translate) -> None:
         from scipy import ndimage as ndi
