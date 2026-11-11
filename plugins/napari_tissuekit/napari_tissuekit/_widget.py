@@ -119,6 +119,8 @@ def _as_rgb(data: np.ndarray) -> np.ndarray:
     return arr
 
 
+OUTLINE_BRUSH_SIZE = 1  # px: default paint/erase brush for outline correction (thin, so small cells can be drawn)
+
 HELP_HTML = """
 <h3>Workflow</h3>
 <ol>
@@ -1537,7 +1539,7 @@ class TissueKitWidget(QWidget):
         ol.visible = True
         if mode != "pan_zoom":
             ol.selected_label = 1  # 1 = outline
-            ol.brush_size = max(int(ol.brush_size), 2)
+            ol.brush_size = max(int(ol.brush_size), 1)
         ol.mode = mode
         self.status.setText(f"Outlines: {mode.replace('_', '/')} tool active. Enter applies the edit.")
 
@@ -1578,7 +1580,7 @@ class TissueKitWidget(QWidget):
                 self.viewer.layers.selection.clear()
                 self.viewer.layers.selection.add(ol)
                 ol.mode = "paint"
-                ol.brush_size = 3
+                ol.brush_size = OUTLINE_BRUSH_SIZE
             except Exception:
                 pass
 
