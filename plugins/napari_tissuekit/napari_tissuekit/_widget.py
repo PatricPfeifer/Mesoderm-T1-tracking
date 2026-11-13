@@ -13,11 +13,12 @@ from pathlib import Path
 import napari
 import numpy as np
 from napari.layers import Image, Labels
-from qtpy.QtCore import QObject, QProcess, QSize, QThread, QTimer, Qt, Signal
-from qtpy.QtGui import QKeySequence
+from qtpy.QtCore import QObject, QProcess, QSettings, QSize, QThread, QTimer, Qt, Signal
+from qtpy.QtGui import QColor, QIcon, QKeySequence, QPixmap
 from qtpy.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -49,7 +50,7 @@ from qtpy.QtWidgets import (
 from . import __version__
 from .cell_properties import CellPropertiesWidget
 from .region_widget import AnalysisRegionWidget
-from .core.cell_size import min_cell_area, set_pixel_size
+from .core.cell_size import set_pixel_size
 from .core.project import PER_RUN_STEPS, WorkingFolder, find_results_root, movie_stem
 from .core.region import TRACKING_REQUIRED, burn_region
 from .wrapped_tabs import WrappedTabs
@@ -81,6 +82,12 @@ class _Job(QObject):
             self.finished.emit(self._fn(lambda percent, message, step=-1: self.progress.emit(int(percent), str(message), int(step))))
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+
+class _Relay(QObject):
+    """Brings a result from a worker thread to the main thread (a signal emitted there is delivered here)."""
+
+    done = Signal(object)
 
 
 def _as_tyx(data: np.ndarray) -> np.ndarray:
@@ -120,6 +127,9 @@ def _as_rgb(data: np.ndarray) -> np.ndarray:
 
 
 OUTLINE_BRUSH_SIZE = 1  # px: default paint/erase brush for outline correction (thin, so small cells can be drawn)
+OUTLINE_COLOR = "#782506"  # default bond color on the Outlines layer (dark red-brown); the Color button changes it
+SETTINGS_KEY = ("napari-tissuekit", "napari-tissuekit")  # QSettings organisation / application
+PREBUILD_DELAY_MS = 300  # after you stop on a frame this long, its bonds are built ahead of the first edit
 
 HELP_HTML = """
 <h3>Workflow</h3>
@@ -141,15 +151,15 @@ HELP_HTML = """
 
 <h3>Segmentation tab</h3>
 <ul>
-<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). Run locally uses this computer's GPU when it has one, else the CPU; the cluster always uses its GPU. <i>Thin bonds right after segmentation</i> (under Parameters, off by default): thins the borders to 1 px bonds, which takes a while and is only needed for hand-editing outlines; when off, the bonds are thinned the first time you start editing. <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
+<li><b>Image</b>: the movie. <b>Run locally</b> finds the cells (Cellpose) on this computer; <b>Run on cluster</b> does it on a bwUniCluster GPU (<b>Cluster settings</b>: fetch results, job log, settings, one-time setup). <b>Preset</b>: saved settings (<i>default</i> = Cellpose's own, <i>cellflow</i>, <i>hpc</i> = big batches for the cluster); open <b>Parameters</b> to change single values. <i>Batch size</i>: 256x256 px tiles per GPU pass (tiles within a frame; speed and GPU memory only, not the result). Run locally uses this computer's GPU when it has one, else the CPU; the cluster always uses its GPU. Every segmentation (here and on the cluster) ends with its outline step: the 1 px outlines (<code>*_cell_outlines.tif</code>) are made from the masks right away, so outline editing can start at once. <i>Fill enclosed holes as new cells</i> (under Parameters): empty space that is closed in by cells becomes a cell of its own (empty space that reaches the image edge, like the outside of the embryo, never does). Every run is saved in its own folder; <b>Runs</b>: <i>Show</i> makes a run the one you edit and track, <i>Compare</i> overlays another run's outlines.</li>
 <li><b>Masks / Outlines</b>: the cell layer and the outline layer to edit (set automatically after loading).</li>
-<li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run locally / Run on cluster or loading a results folder editing starts by itself. It shows the yellow outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
+<li><b>Start outline editing (for separately imported outlines)</b>: only needed for outlines or masks you dragged in yourself and picked above; after Run locally / Run on cluster or loading a results folder editing starts by itself. It shows the outlines for editing. Without masks the cells are the regions between the outlines. Wait for 100% before editing.</li>
 <li><b>Paint / Erase / Pan-zoom</b>: pick the tool. Paint adds a bond, Erase removes one. With Paint, the <b>right mouse button</b> erases.</li>
-<li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes.</li>
+<li><b>Apply bond edits (Enter)</b>: turn your painted or erased bonds into cell changes, exactly as drawn; lines you did not touch never move. The parts of a stroke sticking out past the last line it crosses are cut off. A stroke closed into a loop (start and end within 3 px) makes its inside one new cell: the old lines inside it go (e.g. to add a cell the segmentation missed at a junction). A line that does not close a cell yet stays as drawn. Erasing part of a membrane removes its leftover bits too. Pieces are kept whatever their size.</li>
 <li><b>Save segmentation (Ctrl+S)</b>: write the masks and the 1 px outlines (<code>*_cp_masks.tif</code>, <code>*_cell_outlines.tif</code>).</li>
 <li><b>Export TIFF</b>: same as Save.</li>
-<li>A cell needs at least <b>50 px</b> in every step (segmentation, outline edits, manual drawing, tracking). Smaller regions, and empty gaps inside the tissue smaller than that, are not left empty: the neighbouring cells take them over so their membranes run across.</li>
-<li><b>Ctrl/Cmd+Z</b> takes back the last paint stroke that is not applied yet; otherwise the last applied bond edit (Enter) or cell deletion.</li>
+<li>A cell needs at least <b>50 px</b> in segmentation and tracking. Smaller regions, and empty gaps inside the tissue smaller than that, are not left empty: the neighbouring cells take them over so their membranes run across. Outline edits keep whatever you draw, also smaller cells, but tracking then gives cells under 50 px to their neighbours.</li>
+<li><b>Undo</b> button or <b>Ctrl/Cmd+Z</b> takes back the last paint stroke that is not applied yet; otherwise the last applied bond edit (Enter) or cell deletion.</li>
 <li><b>M</b> hides or shows the outlines. <i>Watershed pad</i>: area around an edit that is recomputed (smaller = faster).</li>
 <li><b>Delete cell</b>: hold <b>Option</b> and left-click a cell to delete it (Cmd/Ctrl+Z undoes it).</li>
 </ul>
@@ -253,6 +263,31 @@ def _stack_crc(stack) -> int:
     return crc
 
 
+class _ElidedLabel(QLabel):
+    """One-line label that shortens long text in the middle ("C:\\Users\\...\\folder") instead of wrapping.
+
+    The full text stays available as the tooltip, so the panel's top bar keeps a constant, thin height.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt naming)
+        self._full = text
+        self._elide()
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self) -> None:
+        shown = self.fontMetrics().elidedText(self._full, Qt.ElideMiddle, max(self.width(), 20))
+        super().setText(shown)
+
+
 class TissueKitWidget(QWidget):
     def __init__(self, napari_viewer: napari.Viewer):
         super().__init__()
@@ -265,7 +300,6 @@ class TissueKitWidget(QWidget):
         self._seg_base_masks: np.ndarray | None = None
         self._seg_base_outlines: np.ndarray | None = None
         self._autosave_outlines_ok = True  # False while editing outlines loaded from a file: never rewrite the file before the user saves
-        self._bond_pending: tuple | None = None  # (masks, saved outlines) whose bonds are not thinned yet (Thin bonds off)
         self._pending_outlines: np.ndarray | None = None  # imported outlines shown after the bonds are built; their differences apply on Enter
         self._session_cal = None  # pixel size / frame interval of the movie in use (from any file read or run)
         self._seg_cal = None  # calibration read from a loaded outlines file (pixel size / frame interval)
@@ -400,6 +434,12 @@ class TissueKitWidget(QWidget):
         self.viewer.layers.events.removed.connect(self._update_overlay)
         self._update_overlay()
         self._install_bond_shortcuts()
+        # frame bonds built ahead of time when you stop on a frame (see _prebuild_current_frame)
+        self._prebuilding: set[int] = set()
+        self._prebuild_pool = None
+        self._prebuild_relay = _Relay()
+        self._prebuild_relay.done.connect(self._prebuilt)
+        self.viewer.dims.events.current_step.connect(self._prebuild_soon)
         self._refresh_layers()
         self._announce_waiting_cluster_jobs()
 
@@ -571,14 +611,6 @@ class TissueKitWidget(QWidget):
         self.seg_params.add_rows(form)
         # In the Parameters pane, but not saved in presets.
         self.seg_params.add_body_row("", self.seg_fill_holes)
-        self.seg_thin_bonds = QCheckBox("Thin bonds right after segmentation (for outline editing)")
-        self.seg_thin_bonds.setToolTip(
-            "Thinning the cell borders to 1 px bonds takes a while (about a minute for a long movie) and is only needed to "
-            "edit outlines by hand. Off: segmentation shows the outlines straight away; the bonds are thinned when you start "
-            "editing outlines. Tracking, T1 and cell properties do not need them."
-        )
-        self.seg_thin_bonds.setChecked(False)
-        self.seg_params.add_body_row("", self.seg_thin_bonds)
         segment_box = QGroupBox("1 · Segment")
         segment_inner = QVBoxLayout()
         segment_inner.setSpacing(6)
@@ -669,10 +701,11 @@ class TissueKitWidget(QWidget):
         outline_box = QGroupBox("2 · Correct outlines")
         outline_inner = QVBoxLayout()
         outline_help = QLabel(
-            "Tissue Analyzer style. Paint bonds (label 1) / erase bonds (label 0) on yellow Outlines "
-            "(right mouse button erases while Paint is on). "
-            "Enter = Apply (local watershed, like TA). "
-            "M = toggle Outlines. Deleting a cell also redraws the outlines."
+            "Paint lines (label 1) / erase lines (label 0) on the Outlines layer "
+            "(right mouse button erases while Paint is on; Color changes their color). "
+            "Enter = Apply: lines are applied exactly as drawn, other lines never move. "
+            "Loose ends past the last line a stroke crosses are cut off; a stroke closed into a loop makes its "
+            "inside one new cell. Ctrl/Cmd+Z = Undo. M = toggle Outlines."
         )
         outline_help.setWordWrap(True)
         outline_help.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
@@ -682,14 +715,6 @@ class TissueKitWidget(QWidget):
         self.seg_outlines = QComboBox()
         import_form.addRow("Masks", self.seg_masks)
         import_form.addRow("Outlines", self.seg_outlines)
-        self.seg_pad = QSpinBox()
-        self.seg_pad.setRange(8, 512)
-        self.seg_pad.setValue(128)
-        self.seg_pad.setToolTip(
-            "Context margin (px) around each edit for the local watershed. "
-            "TA uses 128; smaller is faster."
-        )
-        import_form.addRow("Watershed pad", self.seg_pad)
         outline_inner.addLayout(import_form)
         tools = QHBoxLayout()
         for text, mode in (("Paint", "paint"), ("Erase", "erase"), ("Pan/zoom", "pan_zoom")):
@@ -697,14 +722,28 @@ class TissueKitWidget(QWidget):
             button.setToolTip("Select the Outlines layer and switch napari's tool")
             button.clicked.connect(lambda _=False, m=mode: self._set_outline_tool(m))
             tools.addWidget(button)
+        self.seg_color = QPushButton("Color")
+        self.seg_color.setToolTip("Pick the color of the outlines (kept for the next sessions)")
+        self.seg_color.clicked.connect(self._pick_outline_color)
+        self._update_outline_color_button()
+        tools.addWidget(self.seg_color)
         outline_inner.addLayout(tools)
         self.seg_start_edit = QPushButton("Start outline editing (for separately imported outlines)")
         self.seg_start_edit.setToolTip("Only needed for outlines or masks you dragged in yourself and picked above. Not needed after Run locally / Run on cluster or loading a results folder: editing starts there by itself.")
         self.seg_start_edit.clicked.connect(self._start_outline_editing)
         outline_inner.addWidget(self.seg_start_edit)
+        apply_row = QHBoxLayout()
         self.seg_commit = QPushButton("Apply bond edits (Enter)")
         self.seg_commit.clicked.connect(lambda: self._apply_bond_edits())
-        outline_inner.addWidget(self.seg_commit)
+        self.seg_undo = QPushButton("Undo (Ctrl+Z)")
+        self.seg_undo.setToolTip(
+            "Takes back the last stroke not applied yet, else the last applied edit "
+            "(an Enter or a deleted cell). Up to 20 steps."
+        )
+        self.seg_undo.clicked.connect(self._undo_edit)
+        apply_row.addWidget(self.seg_commit, 1)
+        apply_row.addWidget(self.seg_undo)
+        outline_inner.addLayout(apply_row)
         self._add_correction(outline_inner)
         outline_box.setLayout(outline_inner)
         layout.addWidget(outline_box)
@@ -754,6 +793,7 @@ class TissueKitWidget(QWidget):
                 self.viewer, self._data_manager, self._vis
             )
             self.correction.layout().setContentsMargins(0, 0, 0, 0)
+            self.correction.snapshot_hook = self._snapshot_seg_frame
             inner.addWidget(self.correction)
             self._mirror_cell_edits_on_outlines()
 
@@ -775,6 +815,7 @@ class TissueKitWidget(QWidget):
         work = Path(tempfile.mkdtemp(prefix="tissuekit_seg_"))
         image_path = work / "image.npy"
         out_path = work / "masks.npy"
+        hand_path = work / "bonds.npy"
         np.save(image_path, np.asarray(image))
         self._seg_dir = work
         self._seg_out = out_path
@@ -799,6 +840,11 @@ class TissueKitWidget(QWidget):
             f"    fill_holes={fill_holes},\n"
             ")\n"
             f"np.save({str(out_path)!r}, masks)\n"
+            # the outline step of segmentation (as on the cluster): 1 px outlines from the masks
+            "from napari_tissuekit.core.segmentation import outline_progress_printer\n"
+            "from napari_tissuekit.core.ta_bond_edit import make_bonds\n"
+            "hand, _ = make_bonds(masks, outline_progress_printer('OUTLINES '))\n"
+            f"np.save({str(hand_path)!r}, hand)\n"
             "print('SEGMENT_DONE', int(masks.max()), flush=True)\n"
         )
         self._proc = QProcess(self)
@@ -821,6 +867,8 @@ class TissueKitWidget(QWidget):
             line = line.strip()
             if line.startswith("frame "):
                 self.status.setText(line)
+            elif line.startswith("OUTLINES "):
+                self.status.setText(f"Making the 1 px outlines: {line[len('OUTLINES '):]}")
             elif line.startswith("SEGMENT_DONE"):
                 self.status.setText(line)
             elif line:
@@ -838,14 +886,16 @@ class TissueKitWidget(QWidget):
                 )
                 return
             masks = np.load(out)
-            self._segmentation_done(masks)
+            hand_path = out.with_name("bonds.npy")
+            self._segmentation_done(masks, np.load(hand_path) if hand_path.is_file() else None)
         finally:
             if work is not None:
                 shutil.rmtree(work, ignore_errors=True)
             self._seg_dir = None
             self._seg_out = None
 
-    def _segmentation_done(self, masks: np.ndarray) -> None:
+    def _segmentation_done(self, masks: np.ndarray, hand: np.ndarray | None = None) -> None:
+        """A local segmentation finished: ``masks`` and, from its outline step, the 1 px bonds ``hand``."""
         masks = np.asarray(masks)
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
@@ -855,7 +905,8 @@ class TissueKitWidget(QWidget):
         self._show_segmentation_layers(
             masks,
             f"Segmentation done. max label {int(np.max(masks))}. "
-            "Paint/erase yellow Outlines, Enter to Apply, then Save / track.",
+            "Paint/erase Outlines, Enter to Apply, then Save / track.",
+            hand=hand,
         )
         self._refresh_layers()
         self._autosave_segmentation()
@@ -1207,9 +1258,18 @@ class TissueKitWidget(QWidget):
         self._refresh_seg_runs()
         self._pending_outlines = None
         self._autosave_outlines_ok = False  # the cluster already wrote the outlines; only Save rewrites them
+        # the cluster's outline step wrote the 1 px outlines next to the masks: use them (no second outline step here)
+        saved = None
+        outline_file = masks_path.with_name(masks_path.name.replace("_cp_masks.tif", "_cell_outlines.tif"))
+        if outline_file.is_file():
+            from .core.outline_io import rgb_or_labels_to_outline_labels
+
+            saved = rgb_or_labels_to_outline_labels(tifffile.imread(outline_file))
+            saved = saved if saved.shape == masks.shape else None
         self._show_segmentation_layers(
             masks, f"[cluster] Segmentation run '{run}' done on the GPU (max label {int(masks.max())}). "
-            "Bonds are being prepared: wait for 100%, then edit / track.",
+            "Ready to edit / track.",
+            saved_outlines=saved,
         )
         self._refresh_layers()
         self._pick(self.seg_masks, "Segmentation")
@@ -1378,9 +1438,8 @@ class TissueKitWidget(QWidget):
         self._show_segmentation_layers(
             masks,
             f"Outline editing ready{' from the outlines' if from_outlines else ''} (max label {int(masks.max())}). "
-            "Paint/erase bonds, Enter to Apply (TA watershed), then Save.",
+            "Paint/erase bonds, Enter to Apply, then Save.",
             saved_outlines=outlines,
-            force_bonds=True,  # the user asked for outline editing: the bonds are needed now
         )
         self._refresh_layers()
 
@@ -1418,8 +1477,10 @@ class TissueKitWidget(QWidget):
                 ol.undo()
                 self.status.setText("Undid the last paint stroke.")
                 return
-        if self.correction is not None:
+        if self.correction is not None and self.correction.undo_stack:
             self.correction.undo_last_action()
+        else:
+            self.status.setText("Nothing to undo.")
 
     def _toggle_outlines_visibility(self) -> None:
         ol = self._layer("Outlines")
@@ -1430,9 +1491,12 @@ class TissueKitWidget(QWidget):
             )
 
     def _show_segmentation_layers(self, masks: np.ndarray, message: str, saved_outlines: np.ndarray | None = None,
-                                  force_bonds: bool = False) -> None:
-        """Show masks, then build 1 px TA bonds in the background for Outlines. ``saved_outlines`` (0/1, T,Y,X) are kept
-        as the starting bonds where they are the plugin's own 1 px bonds, so loading a saved edit moves no line."""
+                                  hand: np.ndarray | None = None) -> None:
+        """Show masks and their 1 px outlines, ready for outline editing.
+
+        ``hand``: the bonds from the segmentation's outline step (used as they are). ``saved_outlines`` (0/1, T,Y,X):
+        a saved outlines file, kept as the starting bonds where it is the plugin's own 1 px bonds, so loading a saved
+        edit moves no line. Without either, the outline step runs now (in the background)."""
         masks = np.asarray(masks)
         if masks.ndim == 2:
             masks = masks[np.newaxis, ...]
@@ -1441,7 +1505,6 @@ class TissueKitWidget(QWidget):
             return
         self._seg_base_hand = None
         self._seg_base_outlines = None
-        self._bond_pending = None
 
         if self.correction is not None:
             # A "Segmentation" layer that already exists (e.g. loaded from the results folder) is the one the cell
@@ -1469,40 +1532,141 @@ class TissueKitWidget(QWidget):
 
         self._hand_msg = message
 
-        # Show outlines right away from the masks; the 1 px TA bonds replace them
-        # when the background job finishes (or they stay if that job fails).
+        if hand is not None and np.shape(hand) == masks.shape:
+            # the segmentation's own outline step made the bonds: ready to edit at once
+            from .core.outline_io import hand_stack_to_outline
+
+            hand = np.asarray(hand, dtype=np.uint8)
+            # no early outline autosave (it writes outside the run folder): the run's own save writes both files
+            self._autosave_outlines_ok = False
+            self._hand_ready((hand, hand_stack_to_outline(hand), True))
+            return
+
+        # Show the saved outlines (or quick ones from the masks) right away; the 1 px bonds replace them when the
+        # background job finishes (or they stay if that job fails).
         from .core.outline_io import masks_to_outline_labels
 
         interim = (np.asarray(saved_outlines) > 0).astype(np.uint8) if saved_outlines is not None and np.shape(saved_outlines) == masks.shape else masks_to_outline_labels(masks)
         self._replace_labels("Outlines", interim)
         self._style_outlines_layer(self._layer("Outlines"))
+        self._start_bond_job(masks, saved_outlines)
 
-        self._bond_pending = (masks, saved_outlines)
-        if not (self.seg_thin_bonds.isChecked() or force_bonds):
-            # bonds are only needed for outline editing: thin them when editing starts (see _bonds_ready)
-            self.status.setText(f"{message} Bonds are not thinned yet (option 'Thin bonds' is off): they are prepared when you start editing outlines.")
-            return
-        self._start_bond_job()
-
-    def _start_bond_job(self) -> None:
-        """Thin the bonds of the pending masks in the background (Outlines layer; needed for outline editing)."""
-        if self._bond_pending is None or self._job_running():
-            return
-        masks, saved_outlines = self._bond_pending
-        self._bond_pending = None
+    def _start_bond_job(self, masks: np.ndarray, saved_outlines: np.ndarray | None) -> None:
+        """Get the 1 px bonds: from the saved outlines file (the segmentation's outline step wrote it), one frame at a
+        time when it is first edited (no wait); or, for masks without such a file (older results, masks imported by
+        hand, another kind of outline file), for the whole movie in the background (the outline step runs now)."""
+        if saved_outlines is not None and np.shape(saved_outlines) == masks.shape:
+            sampled = self._sample_saved_outlines(masks, saved_outlines)
+            if 2 * sum(fitted for _h, _r, fitted in sampled.values()) >= len(sampled):
+                self._use_frame_bonds(masks, saved_outlines, sampled)
+                return
 
         def work(progress):
-            from .core.outline_io import hand_stack_to_outline
-            from .core.ta_bond_edit import hand_stack_from_outlines, thin_hand_stack
+            from .core.ta_bond_edit import hand_stack_from_outlines, make_bonds
 
             if saved_outlines is None:
-                hand = thin_hand_stack(masks, progress)
-                return hand, hand_stack_to_outline(hand), False
+                return (*make_bonds(masks, progress), False)
             hand, outlines, fits = hand_stack_from_outlines(masks, saved_outlines, progress)
             # most frames fit: the file is the plugin's own, so its other frames are not edits made elsewhere
             return hand, outlines, bool(fits.mean() >= 0.5)
 
         self._start(work, self._hand_ready)
+
+    def _sample_saved_outlines(self, masks: np.ndarray, saved: np.ndarray) -> dict:
+        """Bonds of the frame on screen from the saved outlines (``frame_bonds``): whether they fit tells if the file is
+        the plugin's own 1 px outlines of these masks. The frame is kept (the first edit there needs no build); any
+        other frame that turns out not to fit is rebuilt on its own when it is used (``FrameBonds``)."""
+        from .core.ta_bond_edit import frame_bonds
+
+        try:
+            t = int(self.viewer.dims.point[0])
+        except Exception:
+            t = 0
+        t = min(max(t, 0), masks.shape[0] - 1)
+        return {t: frame_bonds(masks[t], (np.asarray(saved[t]) > 0).astype(np.uint8))}
+
+    def _use_frame_bonds(self, masks: np.ndarray, saved: np.ndarray, sampled: dict) -> None:
+        """Edit on the saved outlines straight away: each frame's bonds are built when that frame is first edited
+        (or ahead of time, when you stop on it); see ``FrameBonds``."""
+        from .core.ta_bond_edit import FrameBonds
+
+        self._seg_base_outlines = (np.asarray(saved) > 0).astype(np.uint8)
+
+        def source(t: int):
+            base = self._seg_base_masks if self._seg_base_masks is not None else masks
+            return base[t], self._seg_base_outlines[t]
+
+        bonds = FrameBonds(masks.shape, source, on_rebuilt=self._frame_outlines_rebuilt)
+        self._seg_base_hand = bonds
+        ol = self._layer("Outlines")
+        if not (isinstance(ol, Labels) and np.array_equal(np.asarray(ol.data) > 0, self._seg_base_outlines > 0)):
+            self._replace_labels("Outlines", self._seg_base_outlines.copy())
+            self._style_outlines_layer(self._layer("Outlines"))
+        for t, (hand, rebuilt, _fitted) in sampled.items():
+            bonds.install(t, hand, rebuilt)
+        self._pending_outlines = None  # the file is the plugin's own: nothing in it to apply
+        self.status.setText(self._hand_msg)
+        self._prebuild_soon()
+
+    def _frame_outlines_rebuilt(self, t: int, outline: np.ndarray) -> None:
+        """A frame's saved outlines did not fit its masks (older or other kind of file): show the rebuilt ones."""
+        self._seg_base_outlines[t] = outline
+        ol = self._layer("Outlines")
+        if isinstance(ol, Labels):
+            self._writable_stack(ol)[t] = outline
+            ol.refresh()
+        self.status.setText(f"Frame {t + 1}: the saved outlines did not match the masks (an older or other kind of "
+                            "file), so they were rebuilt from the masks.")
+
+    def _prebuild_soon(self, _event=None) -> None:
+        """When you stop on a frame, build its bonds ahead of time, so the first edit there does not wait."""
+        if getattr(self, "_prebuild_timer", None) is None:
+            self._prebuild_timer = QTimer(self)
+            self._prebuild_timer.setSingleShot(True)
+            self._prebuild_timer.timeout.connect(self._prebuild_current_frame)
+        self._prebuild_timer.start(PREBUILD_DELAY_MS)
+
+    def _prebuild_current_frame(self) -> None:
+        from .core.ta_bond_edit import FrameBonds
+
+        bonds = self._seg_base_hand
+        if not isinstance(bonds, FrameBonds) or self._seg_base_masks is None:
+            return
+        try:
+            t = int(self.viewer.dims.point[0]) if self._seg_base_masks.ndim == 3 else 0
+        except Exception:
+            return
+        if not 0 <= t < len(bonds) or bonds.is_built(t) or t in self._prebuilding:
+            return
+        mask_t, outline_t = self._seg_base_masks[t].copy(), self._seg_base_outlines[t].copy()
+        self._prebuilding.add(t)
+
+        def work():
+            from .core.ta_bond_edit import frame_bonds
+
+            try:
+                result = frame_bonds(mask_t, outline_t)
+            except Exception:
+                print(traceback.format_exc(), flush=True)
+                result = None
+            self._prebuild_relay.done.emit((bonds, t, mask_t, outline_t, result))
+
+        if self._prebuild_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._prebuild_pool = ThreadPoolExecutor(max_workers=1)
+        self._prebuild_pool.submit(work)
+
+    def _prebuilt(self, payload) -> None:
+        """A frame built ahead of time (main thread): keep it if nothing changed meanwhile."""
+        bonds, t, mask_t, outline_t, result = payload
+        self._prebuilding.discard(t)
+        if result is None or bonds is not self._seg_base_hand or bonds.is_built(t):
+            return
+        if not (np.array_equal(self._seg_base_masks[t], mask_t) and np.array_equal(self._seg_base_outlines[t], outline_t)):
+            return  # the frame changed while it was being built
+        hand, rebuilt, _fitted = result
+        bonds.install(t, hand, rebuilt)
 
     def _hand_ready(self, result: tuple) -> None:
         hand, outlines, own_file = result
@@ -1559,7 +1723,7 @@ class TissueKitWidget(QWidget):
             layer._mode = Mode.PAINT
 
     def _style_outlines_layer(self, ol) -> None:
-        """Yellow 1 px outlines, brush ready for painting."""
+        """1 px outlines in the chosen color, brush ready for painting."""
         if isinstance(ol, Labels):
             if self._right_click_erase not in ol.mouse_drag_callbacks:
                 ol.mouse_drag_callbacks.insert(0, self._right_click_erase)  # before napari's own brush
@@ -1569,13 +1733,7 @@ class TissueKitWidget(QWidget):
                 ol.contour = 0
             except Exception:
                 pass
-            try:
-                ol.color = {0: None, 1: "yellow"}
-            except Exception:
-                try:
-                    ol.colormap = {0: [0, 0, 0, 0], 1: [1, 1, 0, 1]}
-                except Exception:
-                    pass
+            self._apply_outline_color(ol)
             try:
                 self.viewer.layers.selection.clear()
                 self.viewer.layers.selection.add(ol)
@@ -1583,6 +1741,37 @@ class TissueKitWidget(QWidget):
                 ol.brush_size = OUTLINE_BRUSH_SIZE
             except Exception:
                 pass
+
+    @staticmethod
+    def _outline_color() -> QColor:
+        """Color of the bonds on the Outlines layer (picked with the Color button, kept between sessions)."""
+        color = QColor(str(QSettings(*SETTINGS_KEY).value("outline_color", OUTLINE_COLOR)))
+        return color if color.isValid() else QColor(OUTLINE_COLOR)
+
+    def _apply_outline_color(self, ol) -> None:
+        """Label 1 (bond) in the chosen color, everything else transparent. A direct colormap: ``ol.color = {...}``
+        is silently ignored by napari >= 0.5."""
+        r, g, b, _ = self._outline_color().getRgbF()
+        try:
+            ol.colormap = {None: [0, 0, 0, 0], 0: [0, 0, 0, 0], 1: [r, g, b, 1]}
+        except Exception:
+            pass
+
+    def _update_outline_color_button(self) -> None:
+        swatch = QPixmap(14, 14)
+        swatch.fill(self._outline_color())
+        self.seg_color.setIcon(QIcon(swatch))
+
+    def _pick_outline_color(self) -> None:
+        color = QColorDialog.getColor(self._outline_color(), self, "Outline color")
+        if not color.isValid():
+            return  # cancelled
+        QSettings(*SETTINGS_KEY).setValue("outline_color", color.name())
+        self._update_outline_color_button()
+        ol = self._layer("Outlines")
+        if isinstance(ol, Labels):
+            self._apply_outline_color(ol)
+        self.status.setText(f"Outline color set to {color.name()}.")
 
     def _autosave_outlines(self) -> None:
         """Write the outline-only TIFF as soon as the 1 px outlines exist (no click needed)."""
@@ -1609,10 +1798,6 @@ class TissueKitWidget(QWidget):
             self.status.setText(
                 "No base masks — run segmentation or Start outline editing first."
             )
-            return False
-        if self._seg_base_hand is None and self._bond_pending is not None and not self._job_running():
-            self._start_bond_job()
-            self.status.setText("Thinning the bonds now (needed for outline editing): wait for 100%, then repeat the edit.")
             return False
         if self._seg_base_hand is None or self._seg_base_outlines is None:
             if self._last_job_error and not self._job_running():
@@ -1642,11 +1827,27 @@ class TissueKitWidget(QWidget):
         if edited.ndim == 2:
             edited = edited[np.newaxis, ...]
         frames = changed_frames(self._seg_base_outlines, edited)
+        from .core.ta_bond_edit import FrameBonds
+
+        bonds = self._seg_base_hand
+        if isinstance(bonds, FrameBonds):
+            # bonds of these frames are built now if they were not yet (normally ahead of time, when you stopped there)
+            fresh = [t for t in frames if not bonds.is_built(t)]
+            for t in fresh:
+                bonds[t]
+            redo = [t for t in fresh if t in bonds.rebuilt]
+            if redo:
+                self.status.setText(
+                    f"The saved outlines of frame(s) {', '.join(str(t + 1) for t in redo)} did not match the masks and "
+                    "were rebuilt from them, which replaced your strokes there: draw the edit again."
+                )
+                return False
         # cells, bonds and outlines of the frames about to change, for Undo (the edit writes into these arrays in place)
         before = {int(t): (self._seg_base_masks[t].copy(), self._seg_base_hand[t].copy(), self._seg_base_outlines[t].copy()) for t in frames}
         if not frames:
             self.status.setText("No bond edits to apply.")
             return False
+        notes: list = []
         try:
             updated, rois = apply_bond_strokes(
                 self._seg_base_masks,
@@ -1654,8 +1855,7 @@ class TissueKitWidget(QWidget):
                 self._seg_base_outlines,
                 edited,
                 frames=frames,
-                min_seed_area=min_cell_area() - 1,  # the watershed removes regions of up to this many px (4 um^2)
-                pad=int(self.seg_pad.value()),
+                report=notes,
             )
         except Exception as exc:
             self.status.setText(f"Apply bond edits failed: {exc}")
@@ -1667,14 +1867,20 @@ class TissueKitWidget(QWidget):
             self._push_bond_undo(before)
         if not rois:
             self.status.setText(
-                "No cells changed. A stroke outside the tissue must enclose "
-                "an area (closed loop, or closed against the tissue edge)."
+                "Nothing changed. A stroke in the empty background must enclose an area "
+                "(a closed loop, or closed against the tissue edge)."
             )
             return False
+        loops = sum(kind == "loop" for _t, kind, _n in notes)
+        opened = sum(kind == "open" for _t, kind, _n in notes)
+        extra = ""
+        if loops:
+            extra += f" {loops} new cell(s) from a closed loop."
+        if opened:
+            extra += (f" {opened} line(s) kept open: they do not close a cell yet "
+                      "(draw on until they touch lines at both ends).")
         self.status.setText(
-            f"Applied bond edits on {len(frames)} frame(s) (TA wshed) "
-            f"in {time.perf_counter() - t0:.2f}s. max label "
-            f"{int(self._seg_base_masks.max())}."
+            f"Applied the edits on {len(frames)} frame(s) in {time.perf_counter() - t0:.2f}s.{extra} Ctrl/Cmd+Z undoes."
         )
         return True
 
@@ -1787,17 +1993,50 @@ class TissueKitWidget(QWidget):
             return
         if masks.dtype != self._seg_base_masks.dtype:
             self._seg_base_masks = self._seg_base_masks.astype(masks.dtype)
+        from .core.outline_io import update_outline_roi
+
         ol = self._layer("Outlines")
         ol_data = self._writable_stack(ol) if isinstance(ol, Labels) else None
+        local = True
         for t in frames:
+            changed = self._seg_base_masks[t] != masks[t]
+            if not np.any(masks[t][changed]):
+                # only cells removed (Alt + click): their area becomes background; no other line moves
+                self._seg_base_hand[t][changed] = 255
+                ys, xs = np.nonzero(changed)
+                update_outline_roi(self._seg_base_outlines[t], self._seg_base_hand[t],
+                                   slice(int(ys.min()), int(ys.max()) + 1), slice(int(xs.min()), int(xs.max()) + 1))
+            else:  # the masks were changed some other way (e.g. painted on the Segmentation layer): rebuild the frame
+                local = False
+                self._seg_base_hand[t] = thin_hand(masks[t])
+                self._seg_base_outlines[t] = hand_to_outline(self._seg_base_hand[t])
             self._seg_base_masks[t] = masks[t]
-            self._seg_base_hand[t] = thin_hand(masks[t])
-            self._seg_base_outlines[t] = hand_to_outline(self._seg_base_hand[t])
             if ol_data is not None:
                 ol_data[t] = self._seg_base_outlines[t]
         if ol_data is not None:
             ol.refresh()
-        self.status.setText(f"Outlines redrawn on {len(frames)} frame(s) after the cell edit.")
+        self.status.setText("Cell deleted; only its outline was removed." if local
+                            else f"Outlines redrawn on {len(frames)} frame(s) after the cell edit.")
+
+    def _snapshot_seg_frame(self, t: int):
+        """Before a cell is deleted: save frame ``t``'s cells, bonds and outlines; returns the function that puts
+        them back (the delete's undo step), so undo restores the lines exactly as they were."""
+        masks, hand, outlines = self._seg_base_masks, self._seg_base_hand, self._seg_base_outlines
+        if masks is None or hand is None or outlines is None or not 0 <= t < masks.shape[0]:
+            return None
+        saved = (masks[t].copy(), hand[t].copy(), outlines[t].copy())
+
+        def restore() -> None:
+            m, h, o = self._seg_base_masks, self._seg_base_hand, self._seg_base_outlines
+            if m is None or h is None or o is None or t >= m.shape[0]:
+                return
+            m[t], h[t], o[t] = saved
+            ol = self._layer("Outlines")
+            if isinstance(ol, Labels):
+                self._writable_stack(ol)[t] = o[t]
+                ol.refresh()
+
+        return restore
 
     def _save_segmentation(self) -> None:
         if self._seg_base_masks is None and self._layer("Segmentation") is None:
@@ -1820,7 +2059,6 @@ class TissueKitWidget(QWidget):
             masks = masks[np.newaxis, ...]
         try:
             from .core.movie_calibration import save_tiff
-            from .core.outline_io import masks_to_outline_rgb
         except Exception as exc:
             self.status.setText(f"Save imports failed: {exc}")
             return
@@ -1850,11 +2088,15 @@ class TissueKitWidget(QWidget):
         ) or self._seg_cal
         save_tiff(masks_path, masks.astype(np.uint16, copy=False), cal)
         bonds = self._seg_base_outlines
-        # Outline file: T,Y,X uint8, 255 on the 1 px cell outlines, 0 elsewhere.
-        outline_only = (
-            bonds if bonds is not None and bonds.shape == masks.shape and self._seg_base_hand is not None
-            else (masks_to_outline_rgb(masks).max(axis=-1) > 0)
-        )
+        # Outline file: T,Y,X uint8, 255 on the 1 px cell outlines, 0 elsewhere. Always the 1 px bonds (the same file
+        # the segmentation's outline step writes); if they are not ready yet, the outline step runs now.
+        if bonds is not None and bonds.shape == masks.shape and self._seg_base_hand is not None:
+            outline_only = bonds
+        else:
+            from .core.ta_bond_edit import make_bonds
+
+            self.status.setText("Making the 1 px outlines for saving...")
+            outline_only = make_bonds(masks)[1]
         cell_outlines_path = outdir / f"{stem}_cell_outlines.tif"
         save_tiff(cell_outlines_path, (np.asarray(outline_only) > 0).astype(np.uint8) * 255, cal)
         self._seg_base_masks = masks.copy()
@@ -3188,9 +3430,7 @@ class TissueKitWidget(QWidget):
     # ---- working folder ---------------------------------------------------
     def _folder_bar(self) -> QHBoxLayout:
         bar = QHBoxLayout()
-        self.folder_label = QLabel("Results: set automatically next to the movie")
-        self.folder_label.setWordWrap(True)
-        self.folder_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
+        self.folder_label = _ElidedLabel("Results: set automatically next to the movie")
         choose = QPushButton("Folder...")
         choose.setToolTip("Choose where results are saved (default: next to the movie)")
         choose.clicked.connect(self._choose_folder)
@@ -3207,14 +3447,11 @@ class TissueKitWidget(QWidget):
         help_button = QPushButton("Help")
         help_button.setToolTip("How to use this panel: the workflow and what every button does")
         help_button.clicked.connect(self._show_help)
-        # the buttons sit under each other on the left, the name of the results folder on their right
-        buttons = QVBoxLayout()
-        buttons.setSpacing(2)
+        # One thin row: the buttons, then the results folder name (shortened in the middle; full path as tooltip).
+        # No stretch spacers here: they would let the bar take a share of the panel's spare height.
         for b in (choose, load, save_all, help_button):
-            buttons.addWidget(b)
-        buttons.addStretch(1)
-        self.folder_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        bar.addLayout(buttons)
+            bar.addWidget(b)
+        self.folder_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         bar.addWidget(self.folder_label, 1)
         return bar
 
@@ -3517,7 +3754,7 @@ class TissueKitWidget(QWidget):
                 np.asarray(masks), f"Outline editing ready from the masks (max label {int(np.asarray(masks).max())}). "
                 "Paint/erase bonds, Enter to Apply, then Save."
             )
-            outline_note = " Bonds are being prepared: wait for 100% before editing."
+            outline_note = " No outlines file: making the 1 px outlines, wait for 100% before editing."
         if "outlines" in found:
             from .core.movie_calibration import read_calibration
             from .core.outline_io import outline_labels_to_rgb, outlines_rgb_to_masks, rgb_or_labels_to_outline_labels
@@ -3534,7 +3771,7 @@ class TissueKitWidget(QWidget):
                     np.asarray(masks), f"Outline editing ready from {ofile.name} (max label {int(np.asarray(masks).max())}). "
                     "Paint/erase bonds, Enter to Apply, then Save.", saved_outlines=outlines,
                 )
-                outline_note = " Bonds are being prepared: wait for 100% before editing."
+                outline_note = " Loading the outlines: wait for 100% before editing."
                 loaded.append(f"outlines {ofile.name}")
             else:
                 self._pending_outlines = None
@@ -3546,7 +3783,7 @@ class TissueKitWidget(QWidget):
                     "Paint/erase bonds, Enter to Apply, then Save (writes *_cp_masks.tif and *_cell_outlines.tif).",
                     saved_outlines=outlines,
                 )
-                outline_note = " Bonds are being prepared: wait for 100% before editing."
+                outline_note = " Loading the outlines: wait for 100% before editing."
                 loaded.append(f"outlines {ofile.name} (cells derived from the outlines)")
         if "tracking" not in found and self._tracked_run not in (None, run):
             self._drop_tracking_layers()  # they belong to another run
@@ -3564,7 +3801,7 @@ class TissueKitWidget(QWidget):
         self._refresh_seg_runs()
         self._select_loaded_layers(movie_layer)
         self.region_tab.tracking_changed()
-        self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}.{outline_note}{self._tracking_run_note(wf)}")
+        self.status.setText(f"Loaded {', '.join(loaded)} from {wf.root}.{outline_note if self._job_running() else ''}{self._tracking_run_note(wf)}")
 
     def _tracking_run_note(self, wf) -> str:
         """Warning when the shown tracking is an older one that may not come from the active run."""

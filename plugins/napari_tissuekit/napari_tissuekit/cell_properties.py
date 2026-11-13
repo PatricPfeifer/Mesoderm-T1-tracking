@@ -501,7 +501,7 @@ class CellPropertiesWidget(QWidget):
     def _watch_layers(self) -> None:
         """Invalidate the overlay cache when any labels layer is repainted or replaced."""
         for ly in self.viewer.layers:
-            if isinstance(ly, Labels) and ly.name != SELECTED_LAYER and id(ly) not in self._watched:
+            if isinstance(ly, Labels) and ly.name not in (SELECTED_LAYER, HOVER_LAYER) and id(ly) not in self._watched:
                 self._watched.add(id(ly))
                 for ev in ("data", "set_data", "paint"):
                     getattr(ly.events, ev).connect(self._bump_version)
@@ -511,7 +511,7 @@ class CellPropertiesWidget(QWidget):
         names = [
             ly.name
             for ly in self.viewer.layers
-            if isinstance(ly, Labels) and ly.name != SELECTED_LAYER
+            if isinstance(ly, Labels) and ly.name not in (SELECTED_LAYER, HOVER_LAYER)
         ]
         current = self.labels_combo.currentText()
         self.labels_combo.blockSignals(True)
@@ -523,7 +523,17 @@ class CellPropertiesWidget(QWidget):
             self.labels_combo.setCurrentText("Tracked")
         self.labels_combo.blockSignals(False)
 
+    def _frame_key(self) -> tuple:
+        """The non-spatial part of the current dims position (the time frame)."""
+        return tuple(self.viewer.dims.current_step[:-2])
+
     def _on_frame_change(self, *_a) -> None:
+        # Adding/removing a layer (e.g. the 2D hover layer itself) re-emits current_step without the
+        # frame actually changing; only drop the hover when the frame really moved.
+        key = self._frame_key()
+        if key == getattr(self, "_hover_frame", None):
+            return
+        self._hover_frame = key
         self._hover_id = 0
         self._clear_hover()
 
@@ -565,12 +575,13 @@ class CellPropertiesWidget(QWidget):
         rgba = np.asarray(src.get_color(self._hover_id), dtype=float).copy()
         rgba[3] = 1.0  # same hue as the cell, fully opaque
         cmap = DirectLabelColormap(color_dict={None: [0, 0, 0, 0], 1: rgba})
+        self._hover_frame = self._frame_key()
         if HOVER_LAYER in self.viewer.layers:
             lay = self.viewer.layers[HOVER_LAYER]
             lay.colormap = cmap
             lay.data = data
         else:
-            self.viewer.add_labels(
+            lay = self.viewer.add_labels(
                 data,
                 name=HOVER_LAYER,
                 opacity=0.85,
@@ -578,7 +589,7 @@ class CellPropertiesWidget(QWidget):
                 translate=src.translate[-2:],
                 colormap=cmap,
             )
-            self.viewer.layers[HOVER_LAYER].editable = False
+            lay.editable = False
         self._raise_hover()
 
     def _clear_hover(self) -> None:
@@ -587,10 +598,14 @@ class CellPropertiesWidget(QWidget):
 
     def _raise_hover(self) -> None:
         layers = self.viewer.layers
-        if HOVER_LAYER in layers and layers.index(HOVER_LAYER) != len(layers) - 1:
+        try:
+            idx = layers.index(HOVER_LAYER)
+        except ValueError:
+            return
+        if idx != len(layers) - 1:
             active = layers.selection.active
-            layers.move(layers.index(HOVER_LAYER), len(layers))
-            if active is not None and active.name != HOVER_LAYER:
+            layers.move(idx, len(layers))
+            if active is not None and active.name != HOVER_LAYER and active in layers:
                 layers.selection.active = active
 
     def _dim_background(self, on: bool) -> None:

@@ -24,6 +24,16 @@ def test_cell_outlines_are_255_on_black_and_match_the_plugin_path():
     assert out[0, 8, 10] == 0  # cell interior stays empty
 
 
+def test_napari_and_cluster_share_one_outline_step():
+    from napari_tissuekit.core.ta_bond_edit import hand_from_outlines, make_bonds
+
+    masks = _masks()
+    hand, outlines = make_bonds(masks)  # what a napari segmentation hands to the editor
+    assert np.array_equal((outlines > 0).astype(np.uint8) * 255, cell_outline_stack(masks))  # the cluster's file
+    for t in range(masks.shape[0]):  # loading the cluster's file gives the same bonds back (no line moves)
+        assert np.array_equal(hand_from_outlines(masks[t], outlines[t]), hand[t])
+
+
 def test_progress_callback_is_called():
     seen = []
     cell_outline_stack(_masks(), lambda pct, msg: seen.append(pct))

@@ -53,7 +53,7 @@ def test_sigterm_saves_checkpoint_and_run_resumes(movie, tmp_path, monkeypatch):
     def eval_then_term(self, img, **k):
         seen["n"] += 1
         if seen["n"] == 7:
-            os.kill(os.getpid(), signal.SIGTERM)
+            signal.raise_signal(signal.SIGTERM)  # os.kill on Windows = TerminateProcess: kills pytest, no handler
         return real_eval(self, img, **k)
 
     monkeypatch.setattr(FakeModel, "eval", eval_then_term)
