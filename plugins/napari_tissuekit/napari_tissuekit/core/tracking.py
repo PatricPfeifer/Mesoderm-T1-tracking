@@ -128,6 +128,20 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Smallest cell in square micrometres (default: 4). Smaller regions are not cells.",
     )
     p.add_argument(
+        "--gap-repair",
+        dest="gap_repair",
+        action="store_true",
+        default=True,
+        help="(default) After tracking, fill every empty area enclosed by cells using the neighbouring frames: given back to the cell that "
+        "covers it before and after (a missed detection), else taken over by the nearest cells.",
+    )
+    p.add_argument(
+        "--no-gap-repair",
+        dest="gap_repair",
+        action="store_false",
+        help="Leave the empty areas enclosed by cells as they are.",
+    )
+    p.add_argument(
         "--divisions",
         action="store_true",
         help="Divisions: a dividing cell ends its track and its daughters get new IDs (lineage mode, writes *_lineage.csv). "
@@ -212,6 +226,7 @@ def main(argv=None) -> None:
         max_distance=args.max_distance,
         run_backward=args.backward,
         n_jobs=args.n_jobs,
+        gap_repair=args.gap_repair,
         motion="phase" if args.motion in ("legacy", "phase") else args.motion,
         division_mode="lineage" if args.divisions else "legacy",
         fill_holes=args.fill_holes,

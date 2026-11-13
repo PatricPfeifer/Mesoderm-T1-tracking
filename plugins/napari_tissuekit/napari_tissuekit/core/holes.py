@@ -185,3 +185,60 @@ def fill_holes_stack(
             _, (iy, ix) = ndi.distance_transform_edt(frame == 0, return_indices=True)
             frame[rejected] = frame[iy[rejected], ix[rejected]]
     return out, report
+
+
+def repair_gaps(labels: np.ndarray, same_share: float = 0.6, edge_share: float = 0.8) -> tuple[np.ndarray, dict]:
+    """Fill every empty area enclosed by cells in a TRACKED (T,Y,X) stack, deciding with the neighbouring frames.
+
+    For a gap (any size or shape, not touching the image edge) the cell that covers its pixels in the frame before and in the frame after is
+    looked up. If it is the SAME cell (track id) in both and covers at least ``same_share`` of the gap in each, the cell was missed in this
+    frame: the gap gets that id and the track is not broken. In the first or last frame only one neighbour exists and it must cover at least
+    ``edge_share``. In every other case (several cells cover the spot, the cell is gone or only appears, different cells before and after) the
+    tissue closed up there: the nearest cells take the gap over. Evidence is read from the unchanged stack, so repairs do not feed each other.
+    Returns the copy and a report: counts per outcome."""
+    out = np.array(labels, copy=True)
+    stack = out[np.newaxis] if out.ndim == 2 else out
+    src = stack.copy() if stack.shape[0] > 1 else stack
+    n = stack.shape[0]
+    report = dict(gaps=0, restored=0, absorbed=0)
+    for f in range(n):
+        frame = stack[f]
+        bg, k = ndi.label(frame == 0)
+        if k == 0:
+            continue
+        edge = set(np.unique(np.concatenate([bg[0], bg[-1], bg[:, 0], bg[:, -1]])).tolist())
+        objects = ndi.find_objects(bg)
+        take = []
+        rejected = np.zeros(frame.shape, dtype=bool)
+        for i in range(1, k + 1):
+            if i in edge:
+                continue
+            sl = objects[i - 1]
+            m = bg[sl] == i
+            report["gaps"] += 1
+            tops = []
+            for g in (f - 1, f + 1):
+                if 0 <= g < n:
+                    ids = src[g][sl][m]
+                    ids = ids[ids > 0]
+                    if ids.size:
+                        c = np.bincount(ids)
+                        tops.append((int(c.argmax()), float(c.max()) / m.sum()))
+                    else:
+                        tops.append((0, 0.0))
+            if len(tops) == 2:
+                same = tops[0][0] == tops[1][0] and tops[0][0] > 0 and min(tops[0][1], tops[1][1]) >= same_share
+            else:
+                same = len(tops) == 1 and tops[0][0] > 0 and tops[0][1] >= edge_share
+            if same:
+                take.append((sl, m, tops[0][0]))
+                report["restored"] += 1
+            else:
+                rejected[sl] |= m
+                report["absorbed"] += 1
+        for sl, m, tid in take:
+            frame[sl][m] = tid
+        if rejected.any():
+            _, (iy, ix) = ndi.distance_transform_edt(frame == 0, return_indices=True)
+            frame[rejected] = frame[iy[rejected], ix[rejected]]
+    return out, report

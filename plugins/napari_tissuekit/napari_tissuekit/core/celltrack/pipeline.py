@@ -150,6 +150,7 @@ def track_loaded(
     n_jobs: int = 1,
     progress=None,
     motion: str = "flow",
+    gap_repair: bool = True,
 ) -> dict[str, Any]:
     """Track a loaded movie. Writes files when ``output_dir`` is set.
 
@@ -252,6 +253,13 @@ def track_loaded(
         tracked = render_tracked_labels(
             movie.masks, result.frames, result.label_to_track
         )
+        if gap_repair:
+            from ..holes import repair_gaps
+
+            tracked, rep = repair_gaps(tracked)
+            if verbose:
+                print(f"Gap repair: {rep['gaps']} enclosed empty areas: {rep['restored']} given back to the cell that covers them "
+                      f"before and after, {rep['absorbed']} taken over by the nearest cells", flush=True)
         rgb = render_tracked_rgb(tracked) if write_rgb else None
         if rgb is not None and division_mode == "lineage":
             mark_divisions(rgb, result)
@@ -340,6 +348,7 @@ def track_arrays(
     n_jobs: int = 1,
     progress=None,
     motion: str = "flow",
+    gap_repair: bool = True,
     fill_holes: bool = False,
 ) -> dict[str, Any]:
     """Track in-memory label (and optional intensity) stacks."""
@@ -370,6 +379,7 @@ def track_arrays(
         n_jobs=n_jobs,
         progress=progress,
         motion=motion,
+        gap_repair=gap_repair,
     )
 
 
@@ -398,6 +408,7 @@ def run_tracking(
     n_jobs: int = 1,
     progress=None,
     motion: str = "flow",
+    gap_repair: bool = True,
     fill_holes: bool = False,
 ) -> dict[str, Any]:
     """Track a Cellpose movie and write all outputs under ``output_dir``."""
@@ -435,6 +446,7 @@ def run_tracking(
         n_jobs=n_jobs,
         progress=progress,
         motion=motion,
+        gap_repair=gap_repair,
     )
 
 

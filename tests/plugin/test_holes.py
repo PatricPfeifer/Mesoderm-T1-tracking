@@ -87,3 +87,38 @@ def test_fill_holes_stack_in_one_frame_a_single_rule_failure_is_taken_over():
     out, rep = fill_holes_stack(_hole_stack()[0], min_area=100, min_radius=5)
     assert rep["cells"] == 1 and rep["persistent"] == 0 and rep["absorbed_short"] == 1 and rep["absorbed_both"] == 1
     assert (out[100:106, 20:80] == 1).all()
+
+
+def _tracked_frames():
+    """3 frames, cells 1-4 in the corners/sides; cell 5 in the middle in frames 0 and 2. In frame 1 cell 5 is not detected: an empty gap."""
+    st = np.zeros((3, 60, 60), np.uint16)
+    for t in range(3):
+        st[t, :, :20] = 1
+        st[t, :, 40:] = 2
+        st[t, :20, 20:40] = 3
+        st[t, 40:, 20:40] = 4
+        st[t, 20:40, 20:40] = 5
+    st[1, 20:40, 20:40] = 0                       # missed cell: an enclosed gap (nothing touches the image edge)
+    # a second spot, on the border between cells 1 and 3 (their corner) in every frame: covered by two cells before and after
+    st[:, 5:9, 17:23] = 0
+    st[0, 5:9, 17:20] = 1; st[0, 5:9, 20:23] = 3   # frame 0 and 2: half cell 1, half cell 3
+    st[2, 5:9, 17:20] = 1; st[2, 5:9, 20:23] = 3
+    return st
+
+
+def test_repair_gaps_restores_a_missed_cell_and_closes_up_the_rest():
+    from napari_tissuekit.core.holes import repair_gaps
+
+    out, rep = repair_gaps(_tracked_frames())
+    assert rep == dict(gaps=2, restored=1, absorbed=1)
+    assert (out[1, 20:40, 20:40] == 5).all()                       # the same cell before and after: the gap is cell 5 again
+    assert set(np.unique(out[1, 5:9, 17:23]).tolist()) <= {1, 3}  # covered by two cells: the neighbours take it over
+    assert not (out == 0).any() or (out[1] == 0).sum() == 0       # nothing is left empty in the repaired frame
+
+
+def test_repair_gaps_in_the_last_frame_needs_one_cell_to_cover_most_of_it():
+    from napari_tissuekit.core.holes import repair_gaps
+
+    st = _tracked_frames()[:2]                                      # frame 1 is now the last: only frame 0 can vote
+    out, rep = repair_gaps(st)
+    assert rep["restored"] == 1 and (out[1, 20:40, 20:40] == 5).all()

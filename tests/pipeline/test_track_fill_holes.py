@@ -21,8 +21,9 @@ def stack(n=4):
     return np.stack([lab] * n)
 
 
-def tracked(tmp_path, fill):
-    track_arrays(stack(), None, tmp_path, stem="t", verbose=False, fill_holes=fill, gap_close=False, write_rgb=False)
+def tracked(tmp_path, fill, gap_repair=False):
+    track_arrays(stack(), None, tmp_path, stem="t", verbose=False, fill_holes=fill, gap_close=False, write_rgb=False,
+                 gap_repair=gap_repair)
     return tifffile.imread(next(tmp_path.glob("*_tracked_labels.tif")))
 
 
@@ -34,10 +35,21 @@ def test_hole_gets_an_id_when_filled(tmp_path):
     assert len(set(np.unique(area[0]))) == 1 and len({int(np.unique(area[t])[0]) for t in range(len(out))}) == 1  # same id throughout
 
 
-def test_hole_stays_empty_without_filling(tmp_path):
-    out = tracked(tmp_path, False)
+def test_hole_stays_empty_without_filling_and_without_gap_repair(tmp_path):
+    out = tracked(tmp_path, False, gap_repair=False)
     r, c = HOLE
     assert not out[:, r * CELL : (r + 1) * CELL, c * CELL : (c + 1) * CELL].any()
+
+
+def test_gap_repair_is_on_by_default_and_the_neighbours_take_a_never_detected_hole(tmp_path):
+    from napari_tissuekit.core.tracking import parse_args
+
+    assert parse_args(["--masks", "m.tif", "--output-dir", "o"]).gap_repair is True
+    assert parse_args(["--masks", "m.tif", "--output-dir", "o", "--no-gap-repair"]).gap_repair is False
+    track_arrays(stack(), None, tmp_path, stem="t", verbose=False, fill_holes=False, gap_close=False, write_rgb=False)  # default: repair on
+    out = tifffile.imread(next(tmp_path.glob("*_tracked_labels.tif")))
+    r, c = HOLE
+    assert (out[:, r * CELL : (r + 1) * CELL, c * CELL : (c + 1) * CELL] > 0).all()  # nobody covered it before or after: the neighbours took it
 
 
 def test_cli_fills_by_default_and_can_be_switched_off():
