@@ -122,6 +122,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         "(default: 1 = serial; -1 = all cores). Results are identical.",
     )
     p.add_argument(
+        "--min-area-um2",
+        type=float,
+        default=None,
+        help="Smallest cell in square micrometres (default: 4). Smaller regions are not cells.",
+    )
+    p.add_argument(
         "--divisions",
         action="store_true",
         help="Divisions: a dividing cell ends its track and its daughters get new IDs (lineage mode, writes *_lineage.csv). "
@@ -185,6 +191,10 @@ def write_interior_tracks(out_dir: Path, margin: int) -> None:
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    if args.min_area_um2:
+        from .cell_size import set_min_area_um2
+
+        set_min_area_um2(args.min_area_um2)
     run_tracking(
         args.masks,
         args.intensity,

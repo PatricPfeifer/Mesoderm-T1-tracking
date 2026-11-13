@@ -10,10 +10,21 @@ import numpy as np
 from scipy import ndimage as ndi
 from skimage.measure import label
 
-MIN_CELL_AREA_UM2 = 4.0  # um^2: a labelled region with a smaller area is not a cell
+MIN_CELL_AREA_UM2 = 4.0  # um^2: the default; a labelled region with a smaller area is not a cell
 MIN_CELL_AREA = 50  # px: the minimum when the pixel size is not known
 
 _um_per_px: float | None = None  # pixel size of the movie being worked on (set by the plugin when it knows it)
+_min_area_um2: float = MIN_CELL_AREA_UM2  # the minimum in use (an option: plugin spin box, --min-area-um2)
+
+
+def set_min_area_um2(value: float | None) -> None:
+    """Minimum cell area in um^2 for everything that follows (None: back to the default of 4 um^2)."""
+    global _min_area_um2
+    _min_area_um2 = float(value) if value and value > 0 else MIN_CELL_AREA_UM2
+
+
+def get_min_area_um2() -> float:
+    return _min_area_um2
 
 
 def set_pixel_size(um_per_px: float | None) -> None:
@@ -23,9 +34,9 @@ def set_pixel_size(um_per_px: float | None) -> None:
 
 
 def min_cell_area(um_per_px: float | None = None) -> int:
-    """Minimum cell area in pixels: MIN_CELL_AREA_UM2 at this pixel size (else the one set with set_pixel_size, else MIN_CELL_AREA)."""
+    """Minimum cell area in pixels: the minimum in um^2 (default 4) at this pixel size (else the one set with set_pixel_size, else MIN_CELL_AREA px)."""
     um = um_per_px if um_per_px and um_per_px > 0 else _um_per_px
-    return MIN_CELL_AREA if not um else max(1, math.ceil(MIN_CELL_AREA_UM2 / (um * um)))
+    return MIN_CELL_AREA if not um else max(1, math.ceil(_min_area_um2 / (um * um)))
 
 
 def remove_small_labels(labels: np.ndarray, min_area: int | None = None) -> tuple[np.ndarray, int]:

@@ -23,7 +23,7 @@ import numpy as np
 from cellpose import models
 from tifffile import imread, imwrite
 
-from .cell_size import absorb_small_labels, min_cell_area
+from .cell_size import absorb_small_labels, min_cell_area, set_min_area_um2
 from .holes import fill_enclosed_holes
 from .ta_bond_edit import make_bonds
 
@@ -54,6 +54,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--force-cpu",
         action="store_true",
         help="Disable GPU even if available.",
+    )
+    p.add_argument(
+        "--min-area-um2",
+        type=float,
+        default=None,
+        help="Smallest cell in square micrometres (default: 4). Smaller regions are not cells.",
     )
     p.add_argument(
         "--no-fill-holes",
@@ -175,6 +181,8 @@ CHECKPOINT_EVERY = 25  # frames between resume-file writes (env TISSUEKIT_CHECKP
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    if args.min_area_um2:
+        set_min_area_um2(args.min_area_um2)
     inp = args.input.expanduser().resolve()
     if not inp.is_file():
         raise SystemExit(f"input not found: {inp}")

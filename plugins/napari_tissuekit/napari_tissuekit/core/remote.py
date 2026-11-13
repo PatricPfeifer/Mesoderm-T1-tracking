@@ -344,8 +344,11 @@ def _segment_cmd(movie_name: str, preset: str, batch_size: int, run: str = "",
                  params: dict | None = None, fill_holes: bool = True) -> str:
     """The ``tissuekit segment`` line of a job script."""
     q = shlex.quote
+    params = dict(params or {})
+    min_area = params.pop("min_area_um2", None)  # not a Cellpose value: its own command line option
     return (
         f"tissuekit segment {q(movie_name)} --preset {q(preset)} --batch-size {int(batch_size)}"
+        + (f" --min-area-um2 {float(min_area):g}" if min_area else "")
         + (f" --run {q(run)}" if run else "")
         + (f" --params {q(json.dumps(params, separators=(',', ':')))}" if params else "")
         + ("" if fill_holes else " --no-fill-holes")

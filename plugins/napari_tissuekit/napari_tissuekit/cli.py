@@ -18,6 +18,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from .core.cell_size import get_min_area_um2
 from .core.project import WorkingFolder, find_results_root, results_dir_for
 
 
@@ -81,7 +82,8 @@ def cmd_segment(args, extra) -> None:
         argv.append("--no-fill-holes")
     segmentation.main(argv + extra)
     run_info = {"preset": args.preset, "params": {**params, "batch_size": batch},
-                "batch_size": batch, "gpu": not args.force_cpu, "fill_holes": args.fill_holes}
+                "batch_size": batch, "gpu": not args.force_cpu, "fill_holes": args.fill_holes,
+                "min_area_um2": get_min_area_um2()}
     wf.write_run_params(run, run_info)
     wf.set_active_seg_run(run)
     wf.write_settings("segmentation", {"run": run, **run_info}, movie=str(movie))
@@ -102,7 +104,8 @@ def cmd_track(args, extra) -> None:
     if args.fill_holes:
         argv.append("--fill-holes")
     tracking.main(argv + extra)
-    wf.write_step_params("tracking", out.name, {"extra_args": extra, "masks": str(masks), "fill_holes": bool(args.fill_holes)},
+    wf.write_step_params("tracking", out.name, {"extra_args": extra, "masks": str(masks), "fill_holes": bool(args.fill_holes),
+                                                    "min_area_um2": get_min_area_um2()},
                          movie=str(movie) if movie else None)
 
 

@@ -50,7 +50,7 @@ from qtpy.QtWidgets import (
 from . import __version__
 from .cell_properties import CellPropertiesWidget
 from .region_widget import AnalysisRegionWidget
-from .core.cell_size import set_pixel_size
+from .core.cell_size import get_min_area_um2, min_cell_area, set_min_area_um2, set_pixel_size
 from .core.project import PER_RUN_STEPS, WorkingFolder, find_results_root, movie_stem
 from .core.region import TRACKING_REQUIRED, burn_region
 from .wrapped_tabs import WrappedTabs
@@ -603,6 +603,19 @@ class TissueKitWidget(QWidget):
             "(the outside of the embryo) is never filled. Recorded in each run's params.json."
         )
         self.seg_fill_holes.setChecked(True)
+        self.min_area_um2 = QDoubleSpinBox()
+        self.min_area_um2.setDecimals(2)
+        self.min_area_um2.setRange(0.1, 1000.0)
+        self.min_area_um2.setSingleStep(0.5)
+        self.min_area_um2.setSuffix(" \u00b5m\u00b2")
+        self.min_area_um2.setValue(get_min_area_um2())
+        self.min_area_um2.setToolTip(
+            "Smallest cell, in square micrometres (default 4). Regions below it are not cells: segmentation drops them and "
+            "neighbouring cells take over their space, tracking does the same, and outline edits never make a cell this small. "
+            "It becomes a number of pixels with the movie's pixel size (4 \u00b5m\u00b2 = 376 px at 0.103 \u00b5m/px). "
+            "Recorded in each run's params.json. Applies to everything you run or edit after changing it."
+        )
+        self.min_area_um2.valueChanged.connect(set_min_area_um2)
         from .seg_params_widget import SegParamsPanel
 
         # One form, one label column: Image, Preset, Run name, Parameters (incl. batch size).
@@ -611,6 +624,7 @@ class TissueKitWidget(QWidget):
         self.seg_params.add_rows(form)
         # In the Parameters pane, but not saved in presets.
         self.seg_params.add_body_row("", self.seg_fill_holes)
+        self.seg_params.add_body_row("Min cell area", self.min_area_um2)
         segment_box = QGroupBox("1 · Segment")
         segment_inner = QVBoxLayout()
         segment_inner.setSpacing(6)
@@ -821,7 +835,8 @@ class TissueKitWidget(QWidget):
         self._seg_out = out_path
         # Settings of this run (preset + every Cellpose value); the run folder is named when it is saved.
         self._seg_pending = {**self.seg_params.run_info(), "run_base": self.seg_params.run_base(),
-                             "batch_size": batch, "gpu": "auto", "fill_holes": fill_holes, "where": "local"}
+                             "batch_size": batch, "gpu": "auto", "fill_holes": fill_holes, "where": "local",
+                             "min_area_um2": float(self.min_area_um2.value())}
         import json
 
         from .core.seg_params import eval_kwargs
@@ -838,6 +853,7 @@ class TissueKitWidget(QWidget):
             f"    use_gpu={use_gpu},\n"
             f"    eval_kwargs=json.loads({kwargs_json!r}),\n"
             f"    fill_holes={fill_holes},\n"
+            f"    min_area={min_cell_area()},\n"
             ")\n"
             f"np.save({str(out_path)!r}, masks)\n"
             # the outline step of segmentation (as on the cluster): 1 px outlines from the masks
@@ -978,7 +994,7 @@ class TissueKitWidget(QWidget):
         cfg = replace(cfg, preset=self.seg_params.preset_name().replace(" ", "_"),
                       batch_size=int(self.seg_params.values()["batch_size"]))
         run = wf.new_run_name(self.seg_params.run_base())
-        params = self.seg_params.values()
+        params = {**self.seg_params.values(), "min_area_um2": float(self.min_area_um2.value())}
         fill_holes = self.seg_fill_holes.isChecked()
 
         def work(progress, log):

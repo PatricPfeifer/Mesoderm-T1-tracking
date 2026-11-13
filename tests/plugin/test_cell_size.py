@@ -56,3 +56,24 @@ def test_flow_motion_field_follows_a_shifted_pattern_and_keeps_its_interface():
     moved = warp_labels(labels, field)
     ys, xs = np.nonzero(moved == 5)
     assert abs(ys.mean() - (59.5 + 4)) < 1.5 and abs(xs.mean() - (94.5 + 7)) < 1.5
+
+
+def test_minimum_area_is_an_option_in_square_micrometres():
+    from napari_tissuekit.core.cell_size import get_min_area_um2, set_min_area_um2
+    from napari_tissuekit.core.remote import _segment_cmd
+    from napari_tissuekit.core.segmentation import parse_args as seg_args
+    from napari_tissuekit.core.tracking import parse_args as track_args
+
+    assert get_min_area_um2() == 4.0
+    try:
+        set_min_area_um2(8)
+        assert min_cell_area(0.1032) == 752 and get_min_area_um2() == 8.0
+        set_min_area_um2(None)  # back to the default
+        assert get_min_area_um2() == 4.0 and min_cell_area(0.1032) == 376
+    finally:
+        set_min_area_um2(None)
+    assert seg_args(["--input", "x.tif", "--min-area-um2", "6"]).min_area_um2 == 6.0
+    assert track_args(["--masks", "m.tif", "--output-dir", "o", "--min-area-um2", "6"]).min_area_um2 == 6.0
+    assert seg_args(["--input", "x.tif"]).min_area_um2 is None
+    cmd = _segment_cmd("movie.tif", "default", 8, "", {"diameter": 0.0, "min_area_um2": 6.0})
+    assert "--min-area-um2 6" in cmd and "min_area_um2" not in cmd.split("--params")[1]
