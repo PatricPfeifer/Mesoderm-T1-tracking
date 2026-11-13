@@ -5,9 +5,12 @@ import numpy as np
 from scipy import ndimage as ndi
 from skimage.measure import label
 
-from .cell_size import min_cell_area
+from .cell_size import min_cell_area, min_cell_radius
 
 MIN_HOLE_HALFWIDTH = 2.5  # px: thinner gaps are membrane gaps between neighbours, not missing cells
+MIN_HOLE_SOLIDITY = 0.6  # area / convex area: below this a hole is a tangle of membrane gaps, not a cell
+MIN_HOLE_FRAMES = 3  # a hole that fails only ONE of the shape rules is a cell only if it lasts this many frames in a row
+LINK_OVERLAP = 0.25  # holes of consecutive frames are the same one when this much of the smaller overlaps (after growing 3 px)
 
 
 def fill_enclosed_holes(
@@ -56,3 +59,129 @@ def fill_enclosed_holes(
         frame[sel] = new_id[regions][sel]
         added += int(todo.size)
     return out, added
+
+
+def _hole_nodes(frame: np.ndarray, min_area: int, min_radius: float, min_solidity: float, min_halfwidth: float) -> list[dict]:
+    """The enclosed empty areas of one frame that are big enough to be cells, each with its shape measures and the rule it fails.
+
+    rule: 'pass', 'both' (radius and solidity), 'radius' (the biggest circle inside has a radius under ``min_radius`` px) or 'solidity'
+    (area / convex area under ``min_solidity``)."""
+    from skimage.morphology import convex_hull_image
+
+    background = frame == 0
+    regions = label(background, connectivity=1)
+    n = int(regions.max())
+    if n == 0:
+        return []
+    ids = np.arange(1, n + 1)
+    area = np.asarray(ndi.sum(background, regions, ids))
+    widest = np.asarray(ndi.maximum(ndi.distance_transform_edt(background), regions, ids))
+    edge = np.zeros(n + 1, dtype=bool)
+    edge[np.unique(np.concatenate([regions[0], regions[-1], regions[:, 0], regions[:, -1]]))] = True
+    keep = (area >= min_area) & (widest >= min_halfwidth) & ~edge[1:]
+    objects = ndi.find_objects(regions)
+    nodes = []
+    for i in ids[keep]:
+        sl = objects[i - 1]
+        crop = regions[sl] == i
+        hull = int(convex_hull_image(crop).sum())
+        solidity = float(area[i - 1]) / max(hull, 1)
+        bad_r, bad_s = widest[i - 1] < min_radius, solidity < min_solidity
+        nodes.append(dict(slice=sl, mask=crop, area=int(area[i - 1]), radius=float(widest[i - 1]), solidity=solidity,
+                          rule="both" if bad_r and bad_s else "radius" if bad_r else "solidity" if bad_s else "pass"))
+    return nodes
+
+
+def _same_hole(a: dict, b: dict, grow: int = 3) -> bool:
+    """Two holes of consecutive frames are the same one when they overlap (the first grown by ``grow`` px, so a hole that moved a little still counts)."""
+    ys = slice(max(min(a["slice"][0].start, b["slice"][0].start) - grow, 0), max(a["slice"][0].stop, b["slice"][0].stop) + grow)
+    xs = slice(max(min(a["slice"][1].start, b["slice"][1].start) - grow, 0), max(a["slice"][1].stop, b["slice"][1].stop) + grow)
+    shape = (ys.stop - ys.start, xs.stop - xs.start)
+
+    def place(node):
+        canvas = np.zeros(shape, dtype=bool)
+        sy, sx = node["slice"]
+        canvas[sy.start - ys.start:sy.stop - ys.start, sx.start - xs.start:sx.stop - xs.start] = node["mask"]
+        return canvas
+
+    first = ndi.binary_dilation(place(a), iterations=grow)
+    return (first & place(b)).sum() >= LINK_OVERLAP * min(a["area"], b["area"])
+
+
+def fill_holes_stack(
+    masks: np.ndarray,
+    min_area: int | None = None,
+    min_radius: float | None = None,
+    min_solidity: float = MIN_HOLE_SOLIDITY,
+    min_frames: int = MIN_HOLE_FRAMES,
+    min_halfwidth: float = MIN_HOLE_HALFWIDTH,
+) -> tuple[np.ndarray, dict]:
+    """Fill the empty areas enclosed by cells of a (T,Y,X) label stack, but only those that can be cells.
+
+    An enclosed empty area of at least ``min_area`` px is checked on two shapes: the biggest circle inside it must have a radius of at least
+    ``min_radius`` px (``cell_size.min_cell_radius``), and area / convex area must be at least ``min_solidity``.
+      - passes both: a new cell (ids follow the highest id of its frame);
+      - fails both: never a cell, its space is taken over by the nearest cells;
+      - fails one: a cell only if the same area is found in ``min_frames`` frames in a row (areas of consecutive frames that overlap are the
+        same one; areas that fail both do not count), otherwise taken over like the first case.
+    Areas touching the image edge (the outside of the tissue) are left as they are. A 2D input has no neighbouring frames, so an area that
+    fails one rule is taken over. Returns the copy and a report with the number of areas per outcome."""
+    min_area = min_cell_area() if min_area is None else min_area
+    min_radius = min_cell_radius() if min_radius is None else min_radius
+    out = np.array(masks, copy=True)
+    stack = out[np.newaxis] if out.ndim == 2 else out
+    nodes = [_hole_nodes(f, min_area, min_radius, min_solidity, min_halfwidth) for f in stack]
+
+    # union-find over the areas that fail at most one rule: chains through consecutive frames
+    parent = {}
+
+    def find(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    for t, ns in enumerate(nodes):
+        for i, n in enumerate(ns):
+            if n["rule"] != "both":
+                parent[(t, i)] = (t, i)
+    for t in range(len(nodes) - 1):
+        for i, a in enumerate(nodes[t]):
+            if a["rule"] == "both":
+                continue
+            for j, b in enumerate(nodes[t + 1]):
+                if b["rule"] != "both" and _same_hole(a, b):
+                    parent[find((t, i))] = find((t + 1, j))
+    frames_of: dict = {}
+    for k in parent:
+        frames_of.setdefault(find(k), set()).add(k[0])
+
+    report = dict(candidates=0, cells=0, persistent=0, absorbed_both=0, absorbed_short=0)
+    for t, ns in enumerate(nodes):
+        frame = stack[t]
+        take, give = [], []  # to become cells / to be taken over
+        for i, n in enumerate(ns):
+            report["candidates"] += 1
+            if n["rule"] == "pass":
+                take.append(n)
+                report["cells"] += 1
+            elif n["rule"] != "both" and len(frames_of[find((t, i))]) >= min_frames:
+                take.append(n)
+                report["persistent"] += 1
+            else:
+                give.append(n)
+                report["absorbed_both" if n["rule"] == "both" else "absorbed_short"] += 1
+        if give:
+            rejected = np.zeros(frame.shape, dtype=bool)
+            for n in give:
+                rejected[n["slice"]] |= n["mask"]
+        top = int(frame.max())
+        if take and top + len(take) > np.iinfo(frame.dtype).max:
+            raise ValueError(f"label dtype {frame.dtype} cannot hold {top + len(take)} labels")
+        for k, n in enumerate(take):
+            view = frame[n["slice"]]
+            view[n["mask"]] = top + 1 + k
+        if give:
+            _, (iy, ix) = ndi.distance_transform_edt(frame == 0, return_indices=True)
+            frame[rejected] = frame[iy[rejected], ix[rejected]]
+    return out, report

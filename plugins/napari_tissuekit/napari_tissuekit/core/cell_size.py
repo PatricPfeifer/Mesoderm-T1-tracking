@@ -33,10 +33,20 @@ def set_pixel_size(um_per_px: float | None) -> None:
     _um_per_px = float(um_per_px) if um_per_px and um_per_px > 0 else None
 
 
+MIN_CELL_RADIUS_FRACTION = 0.58  # of the radius of a round cell of the minimum area (4 um^2: 0.65 um)
+
+
 def min_cell_area(um_per_px: float | None = None) -> int:
     """Minimum cell area in pixels: the minimum in um^2 (default 4) at this pixel size (else the one set with set_pixel_size, else MIN_CELL_AREA px)."""
     um = um_per_px if um_per_px and um_per_px > 0 else _um_per_px
     return MIN_CELL_AREA if not um else max(1, math.ceil(_min_area_um2 / (um * um)))
+
+
+def min_cell_radius(um_per_px: float | None = None) -> float:
+    """Smallest allowed 'half width' of a cell in pixels: the biggest circle that fits inside a hole-filled cell must have at least this
+    radius (a fraction of the radius of a round cell of the minimum area), so thin ribbons of empty space are no cells but a misshapen cell
+    with a solid core is."""
+    return MIN_CELL_RADIUS_FRACTION * math.sqrt(min_cell_area(um_per_px) / math.pi)
 
 
 def remove_small_labels(labels: np.ndarray, min_area: int | None = None) -> tuple[np.ndarray, int]:

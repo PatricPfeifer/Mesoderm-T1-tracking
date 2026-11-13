@@ -64,15 +64,18 @@ def _stage(timings: dict[str, float], name: str):
         timings[name] = round(timings.get(name, 0.0) + timer() - t0, 3)
 
 
-def fill_movie_holes(movie: Movie, verbose: bool = True) -> Movie:
-    """Give every empty area enclosed by cells a cell id of its own (core/holes.py), so tracking sees and numbers it.
+def fill_movie_holes(movie: Movie, verbose: bool = True, um_per_px: float | None = None) -> Movie:
+    """Give every empty area enclosed by cells that can be a cell an id of its own (core/holes.py), so tracking sees and numbers it.
 
-    Without this, a cell the segmentation missed (or one deleted by hand) stays an empty hole with no id in the tracked stack."""
-    from ..holes import fill_enclosed_holes
+    Without this, a cell the segmentation missed (or one deleted by hand) stays an empty hole with no id in the tracked stack. Areas that are
+    too thin or tangled, or fail one shape rule and last under 3 frames, are taken over by the neighbouring cells instead (see fill_holes_stack)."""
+    from ..cell_size import min_cell_radius
+    from ..holes import fill_holes_stack
 
-    movie.masks, added = fill_enclosed_holes(movie.masks)
+    movie.masks, rep = fill_holes_stack(movie.masks, min_area=min_cell_area(um_per_px), min_radius=min_cell_radius(um_per_px))
     if verbose:
-        print(f"Filled {added} enclosed empty area(s) as new cells before tracking", flush=True)
+        print(f"Filled {rep['cells'] + rep['persistent']} enclosed empty area(s) as new cells before tracking "
+              f"({rep['absorbed_both'] + rep['absorbed_short']} taken over by neighbours)", flush=True)
     return movie
 
 
@@ -342,7 +345,7 @@ def track_arrays(
     """Track in-memory label (and optional intensity) stacks."""
     movie = movie_from_arrays(masks, intensity, drop_blank=True)
     if fill_holes:
-        fill_movie_holes(movie, verbose)
+        fill_movie_holes(movie, verbose, getattr(calibration, "um_per_px", None))
     return track_loaded(
         movie,
         output_dir,
@@ -405,7 +408,7 @@ def run_tracking(
         drop_blank=True,
     )
     if fill_holes:
-        fill_movie_holes(movie, verbose)
+        fill_movie_holes(movie, verbose, getattr(calibration_for(intensity_path, masks_path), "um_per_px", None))
     stem = input_stem(intensity_path or masks_path)
     return track_loaded(
         movie,

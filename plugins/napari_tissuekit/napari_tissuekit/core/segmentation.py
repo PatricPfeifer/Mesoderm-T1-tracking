@@ -23,8 +23,8 @@ import numpy as np
 from cellpose import models
 from tifffile import imread, imwrite
 
-from .cell_size import absorb_small_labels, min_cell_area, set_min_area_um2
-from .holes import fill_enclosed_holes
+from .cell_size import absorb_small_labels, min_cell_area, min_cell_radius, set_min_area_um2
+from .holes import fill_holes_stack
 from .ta_bond_edit import make_bonds
 
 from .movie_calibration import read_calibration, save_tiff  # noqa: E402
@@ -122,13 +122,18 @@ def segment_stack(
     eval_kwargs: dict | None = None,
     fill_holes: bool = True,
     min_area: int | None = None,
+    min_radius: float | None = None,
 ) -> np.ndarray:
     """Segment each frame with Cellpose cpsam. Shared by the CLI and napari plugin.
 
     ``min_area`` (px): the smallest cell; None = ``cell_size.min_cell_area()`` (4 um^2 at the movie's pixel size once known).
 
-    ``fill_holes`` (on by default): every empty region enclosed by cells (touching no image edge) becomes a cell of its own,
-    see :func:`napari_tissuekit.core.holes.fill_enclosed_holes`."""
+    ``min_radius`` (px): the biggest circle inside a hole-filled cell must be at least this wide; None = ``cell_size.min_cell_radius()``.
+
+    ``fill_holes`` (on by default): after all frames are segmented, an empty region enclosed by cells (touching no image edge) becomes a
+    cell of its own if its shape allows it (:func:`napari_tissuekit.core.holes.fill_holes_stack`): thin or tangled gaps are taken over by the
+    neighbouring cells, and a gap that fails only one shape rule is a cell only if it lasts 3 frames in a row. Cells under the minimum size are
+    always given to their neighbours. While the frames are segmented, the masks of ``on_frame`` are the raw Cellpose masks."""
     img = as_stack(img)
     min_area = min_cell_area() if min_area is None else int(min_area)
     eval_kwargs = dict(eval_kwargs or {})
@@ -144,14 +149,17 @@ def segment_stack(
         print(f"frame {t + 1}/{n_frames}", flush=True)
         m = model.eval(img[t], batch_size=batch_size, **eval_kwargs)[0]
         masks[t] = np.asarray(m, dtype=np.uint16)
-        if fill_holes:
-            masks[t], n_new = fill_enclosed_holes(masks[t], min_area=min_area)
-            if n_new:
-                print(f"  filled {n_new} enclosed holes as new cells", flush=True)
-        masks[t] = absorb_small_labels(masks[t], min_area=min_area)[0]  # under the minimal cell size: neighbours take over (no empty spots)
         if on_frame is not None:
             on_frame(t, masks)
         print(f"  labels={int(masks[t].max())}", flush=True)
+    if fill_holes:
+        min_radius = min_cell_radius() if min_radius is None else float(min_radius)
+        masks, rep = fill_holes_stack(masks, min_area=min_area, min_radius=min_radius)
+        print(f"hole filling: {rep['candidates']} enclosed empty areas of at least {min_area} px: {rep['cells']} became cells, "
+              f"{rep['persistent']} more lasted 3+ frames; taken over by neighbours: {rep['absorbed_both']} failing both shape rules, "
+              f"{rep['absorbed_short']} failing one and lasting under 3 frames", flush=True)
+    for t in range(masks.shape[0]):  # under the minimal cell size: neighbours take over (no empty spots)
+        masks[t] = absorb_small_labels(masks[t], min_area=min_area)[0]
     return masks
 
 
@@ -258,6 +266,7 @@ def main(argv=None) -> None:
         eval_kwargs=resolve_params(args.preset, args.params),
         fill_holes=args.fill_holes,
         min_area=min_cell_area(getattr(cal, "um_per_px", None)),
+        min_radius=min_cell_radius(getattr(cal, "um_per_px", None)),
     )
     save_tiff(out, masks, cal)
     print("wrote", out, "max_label", int(masks.max()), flush=True)

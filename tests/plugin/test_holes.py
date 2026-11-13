@@ -49,3 +49,41 @@ def test_stack_and_max_area():
     out, n = fill_enclosed_holes(stack)
     assert n == 2 and out.shape == stack.shape
     assert fill_enclosed_holes(stack, max_area=100)[1] == 0
+
+
+def _hole_stack():
+    """6 frames of one big cell with carved-out empty areas: a square (a cell), a thin ribbon in frames 0-2 and another in frames 3-4,
+    and a thin U that fails both shape rules in every frame."""
+    st = np.ones((6, 160, 160), np.uint16)
+    st[:, 20:40, 20:40] = 0                      # square, 400 px, radius 10: passes
+    st[0:3, 100:106, 20:80] = 0                  # ribbon 6 px wide: radius 3 (< 5), solid: fails the radius rule only, lasts 3 frames
+    st[3:5, 130:136, 20:80] = 0                  # same ribbon elsewhere, only 2 frames
+    st[:, 20:80, 100:106] = 0                    # U: two legs and a bottom, thin and far from convex: fails both
+    st[:, 20:80, 130:136] = 0
+    st[:, 74:80, 100:136] = 0
+    return st
+
+
+def test_fill_holes_stack_cells_persistence_and_absorption():
+    from napari_tissuekit.core.holes import fill_holes_stack
+
+    out, rep = fill_holes_stack(_hole_stack(), min_area=100, min_radius=5, min_solidity=0.6, min_frames=3)
+    assert rep == dict(candidates=17, cells=6, persistent=3, absorbed_both=6, absorbed_short=2)
+    for t in range(6):
+        sq = out[t, 20:40, 20:40]
+        assert sq.min() == sq.max() and sq[0, 0] not in (0, 1)       # the square is a cell of its own in every frame
+        assert (out[t, 20:80, 100:106] == 1).all() and (out[t, 74:80, 100:136] == 1).all()  # the U is taken over by the surrounding cell
+    for t in range(3):
+        rib = out[t, 100:106, 20:80]
+        assert rib.min() == rib.max() and rib[0, 0] not in (0, 1)    # the ribbon lasts 3 frames: a cell
+    for t in (3, 4):
+        assert (out[t, 130:136, 20:80] == 1).all()                  # the same kind of ribbon for 2 frames: taken over
+    assert not (out == 0).any()                                     # nothing is left empty
+
+
+def test_fill_holes_stack_in_one_frame_a_single_rule_failure_is_taken_over():
+    from napari_tissuekit.core.holes import fill_holes_stack
+
+    out, rep = fill_holes_stack(_hole_stack()[0], min_area=100, min_radius=5)
+    assert rep["cells"] == 1 and rep["persistent"] == 0 and rep["absorbed_short"] == 1 and rep["absorbed_both"] == 1
+    assert (out[100:106, 20:80] == 1).all()
