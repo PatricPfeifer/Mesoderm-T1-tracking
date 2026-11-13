@@ -22,7 +22,7 @@ import numpy as np
 from cellpose import models
 from tifffile import imread, imwrite
 
-from .cell_size import MIN_CELL_AREA, absorb_small_labels
+from .cell_size import absorb_small_labels, min_cell_area
 from .holes import fill_enclosed_holes
 from .outline_io import hand_stack_to_outline
 from .ta_bond_edit import thin_hand_stack
@@ -115,13 +115,18 @@ def segment_stack(
     on_frame: Callable[[int, np.ndarray], None] | None = None,
     eval_kwargs: dict | None = None,
     fill_holes: bool = True,
+    min_area: int | None = None,
 ) -> np.ndarray:
     """Segment each frame with Cellpose cpsam. Shared by the CLI and napari plugin.
+
+    ``min_area`` (px): the smallest cell; None = ``cell_size.min_cell_area()`` (4 um^2 at the movie's pixel size once known).
 
     ``fill_holes`` (on by default): every empty region enclosed by cells (touching no image edge) becomes a cell of its own,
     see :func:`napari_tissuekit.core.holes.fill_enclosed_holes`."""
     img = as_stack(img)
-    eval_kwargs = {"min_size": MIN_CELL_AREA, **(eval_kwargs or {})}  # Cellpose drops regions below min_size px
+    min_area = min_cell_area() if min_area is None else int(min_area)
+    eval_kwargs = dict(eval_kwargs or {})
+    eval_kwargs["min_size"] = max(int(eval_kwargs.get("min_size", 0)), min_area)  # Cellpose drops regions below min_size px
     n_frames, ly, lx = img.shape
     if masks is None:
         masks = np.zeros((n_frames, ly, lx), dtype=np.uint16)
@@ -134,10 +139,10 @@ def segment_stack(
         m = model.eval(img[t], batch_size=batch_size, **eval_kwargs)[0]
         masks[t] = np.asarray(m, dtype=np.uint16)
         if fill_holes:
-            masks[t], n_new = fill_enclosed_holes(masks[t])
+            masks[t], n_new = fill_enclosed_holes(masks[t], min_area=min_area)
             if n_new:
                 print(f"  filled {n_new} enclosed holes as new cells", flush=True)
-        masks[t] = absorb_small_labels(masks[t])[0]  # under the minimal cell size: neighbours take over (no empty spots)
+        masks[t] = absorb_small_labels(masks[t], min_area=min_area)[0]  # under the minimal cell size: neighbours take over (no empty spots)
         if on_frame is not None:
             on_frame(t, masks)
         print(f"  labels={int(masks[t].max())}", flush=True)
@@ -233,6 +238,7 @@ def main(argv=None) -> None:
         on_frame=_checkpoint,
         eval_kwargs=resolve_params(args.preset, args.params),
         fill_holes=args.fill_holes,
+        min_area=min_cell_area(getattr(cal, "um_per_px", None)),
     )
     save_tiff(out, masks, cal)
     print("wrote", out, "max_label", int(masks.max()), flush=True)

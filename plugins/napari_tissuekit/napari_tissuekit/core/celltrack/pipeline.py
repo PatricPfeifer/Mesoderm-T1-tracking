@@ -27,7 +27,7 @@ from .tracks import (
 
 from ..output_names import input_stem, tagged_path  # noqa: E402
 from ..movie_calibration import Calibration, calibration_for, save_tiff  # noqa: E402
-from ..cell_size import MIN_CELL_AREA, absorb_small_labels  # noqa: E402
+from ..cell_size import absorb_small_labels, min_cell_area  # noqa: E402
 
 
 def _stage_progress(progress, lo: int, hi: int, message: str):
@@ -146,6 +146,7 @@ def track_loaded(
     calibration: Calibration | None = None,
     n_jobs: int = 1,
     progress=None,
+    motion: str = "flow",
 ) -> dict[str, Any]:
     """Track a loaded movie. Writes files when ``output_dir`` is set.
 
@@ -156,11 +157,12 @@ def track_loaded(
     cal = calibration
     if cal is None and (intensity_path or masks_path):
         cal = calibration_for(intensity_path, masks_path, stem=stem)
-    small_masks, n_small = absorb_small_labels(movie.masks)  # regions under the minimal cell size are not cells: neighbours take them
+    min_area = min_cell_area(getattr(cal, "um_per_px", None))
+    small_masks, n_small = absorb_small_labels(movie.masks, min_area=min_area)  # regions under the minimal cell size are not cells: neighbours take them
     if n_small:
         movie.masks = small_masks
         if verbose:
-            print(f"Gave {n_small} regions smaller than {MIN_CELL_AREA} px to their neighbouring cells.", flush=True)
+            print(f"Gave {n_small} regions smaller than {min_area} px (4 um^2) to their neighbouring cells.", flush=True)
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -183,6 +185,7 @@ def track_loaded(
             reg,
             depth=pyramidal_depth,
             n_jobs=n_jobs,
+            motion=motion,
             on_progress=_stage_progress(progress, 15, 30, "motion"),
         )
 
@@ -221,7 +224,7 @@ def track_loaded(
             )
             rev_reg = reg[::-1]
             rev_fields = estimate_all_motion(
-                rev_reg, depth=pyramidal_depth, n_jobs=n_jobs
+                rev_reg, depth=pyramidal_depth, n_jobs=n_jobs, motion=motion
             )
             backward_result = track_movie(
                 rev_frames,
@@ -333,6 +336,7 @@ def track_arrays(
     calibration: Calibration | None = None,
     n_jobs: int = 1,
     progress=None,
+    motion: str = "flow",
     fill_holes: bool = False,
 ) -> dict[str, Any]:
     """Track in-memory label (and optional intensity) stacks."""
@@ -362,6 +366,7 @@ def track_arrays(
         calibration=calibration,
         n_jobs=n_jobs,
         progress=progress,
+        motion=motion,
     )
 
 
@@ -389,6 +394,7 @@ def run_tracking(
     min_daughter_frames: int = 3,
     n_jobs: int = 1,
     progress=None,
+    motion: str = "flow",
     fill_holes: bool = False,
 ) -> dict[str, Any]:
     """Track a Cellpose movie and write all outputs under ``output_dir``."""
@@ -425,6 +431,7 @@ def run_tracking(
         min_daughter_frames=min_daughter_frames,
         n_jobs=n_jobs,
         progress=progress,
+        motion=motion,
     )
 
 

@@ -1,4 +1,4 @@
-"""Pyramidal phase-correlation motion fields (TA registration, cleaned up)."""
+"""Motion fields between frames: dense optical flow (default) and the legacy pyramidal phase-correlation tiles (TA registration)."""
 
 from __future__ import annotations
 
@@ -166,6 +166,60 @@ def estimate_motion(
     )
 
 
+class FlowMotionField:
+    """Dense optical-flow motion field t0 -> t1 (every pixel its own displacement, not one shift per tile).
+
+    ``fwd`` is the flow at the t0 positions (where a t0 point goes), used to move centroids; ``bwd`` is the flow found from t1 back to t0, so
+    the pull-warp of ``costs.warp_labels`` (source = destination - dense) reads exactly the right t0 pixel. Same interface as ``MotionField``.
+
+    Flow is smooth (it comes from 31 px windows), so both fields are kept at half the resolution as float16 and enlarged when used: a
+    movie of 100+ full-size frames would otherwise hold several GB of flow (the fields of every frame pair are kept until tracking is done).
+    """
+
+    def __init__(self, fwd: np.ndarray, bwd: np.ndarray):
+        import cv2
+
+        self.shape_yx = fwd.shape[:2]
+        small = (max(1, (self.shape_yx[1] + 1) // 2), max(1, (self.shape_yx[0] + 1) // 2))  # cv2 size = (width, height)
+        self._fwd = cv2.resize(np.ascontiguousarray(fwd, dtype=np.float32), small, interpolation=cv2.INTER_AREA).astype(np.float16)
+        self._bwd = cv2.resize(np.ascontiguousarray(bwd, dtype=np.float32), small, interpolation=cv2.INTER_AREA).astype(np.float16)
+        self.grid_dy, self.grid_dx = self._fwd[..., 0], self._fwd[..., 1]  # for the progress print
+
+    def dense(self) -> np.ndarray:
+        import cv2
+
+        h, w = self.shape_yx
+        return -cv2.resize(self._bwd.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+
+    def sample(self, y: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        sh, sw = self._fwd.shape[:2]
+        iy = np.clip(np.rint(np.asarray(y) / 2.0 - 0.25).astype(np.int32), 0, sh - 1)
+        ix = np.clip(np.rint(np.asarray(x) / 2.0 - 0.25).astype(np.int32), 0, sw - 1)
+        return self._fwd[iy, ix, 0].astype(np.float32), self._fwd[iy, ix, 1].astype(np.float32)
+
+
+def _flow_image(img: np.ndarray) -> np.ndarray:
+    """8 bit, lightly smoothed picture for the flow (stretched per frame so a dim frame still has contrast)."""
+    import cv2
+
+    img = cv2.GaussianBlur(np.asarray(img, dtype=np.float32), (0, 0), 1.5)
+    return cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+def estimate_flow(img_t0: np.ndarray, img_t1: np.ndarray, levels: int = 5, winsize: int = 31) -> FlowMotionField:
+    """Farneback optical flow between two frames (forward and backward) as a ``FlowMotionField``.
+
+    Follows tissue that moves non-uniformly (convergent-extension flow) where one shift per tile fails: the cells of a frame are moved
+    with it before they are matched, so they overlap their own next-frame cell again."""
+    import cv2
+
+    a, b = _flow_image(img_t0), _flow_image(img_t1)
+    kw = dict(pyr_scale=0.5, levels=levels, winsize=winsize, iterations=5, poly_n=7, poly_sigma=1.5, flags=0)
+    fwd = cv2.calcOpticalFlowFarneback(a, b, None, **kw)  # (...,0)=dx, (...,1)=dy: pixel (y,x) of a is at (y+dy, x+dx) in b
+    bwd = cv2.calcOpticalFlowFarneback(b, a, None, **kw)
+    return FlowMotionField(fwd[..., ::-1], bwd[..., ::-1])  # to (dy, dx)
+
+
 def registration_images(
     masks: np.ndarray, intensity: np.ndarray | None
 ) -> np.ndarray:
@@ -190,8 +244,12 @@ def estimate_all_motion(
     median_size: int = 3,
     n_jobs: int = 1,
     on_progress=None,
+    motion: str = "flow",
 ) -> list[MotionField]:
     """Motion fields for consecutive pairs: fields[t] maps frame t -> t+1.
+
+    ``motion``: "flow" = dense optical flow (default; follows non-uniform tissue motion), "phase" = the legacy pyramidal
+    phase-correlation tiles (one shift per tile).
 
     Pairs are independent, so ``n_jobs`` > 1 (or -1 for all cores) runs them
     in parallel with identical results.
@@ -206,6 +264,8 @@ def estimate_all_motion(
             median_size=median_size,
         )
 
+    if motion == "flow":
+        one = lambda t: estimate_flow(reg_images[t], reg_images[t + 1])  # noqa: E731
     fields = pmap(one, range(reg_images.shape[0] - 1), n_jobs, on_progress)
     for t, field in enumerate(fields):
         if (t + 1) % 20 == 0 or t == 0:

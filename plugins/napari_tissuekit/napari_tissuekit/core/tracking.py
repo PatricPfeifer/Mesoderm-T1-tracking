@@ -122,6 +122,19 @@ def parse_args(argv=None) -> argparse.Namespace:
         "(default: 1 = serial; -1 = all cores). Results are identical.",
     )
     p.add_argument(
+        "--divisions",
+        action="store_true",
+        help="Divisions: a dividing cell ends its track and its daughters get new IDs (lineage mode, writes *_lineage.csv). "
+        "Same as the plugin's 'Divisions: new daughter IDs'; use --division-penalty 1.0 with it, as the plugin does.",
+    )
+    p.add_argument(
+        "--motion",
+        choices=("flow", "legacy", "phase"),
+        default="flow",
+        help="How the movement between frames is followed before cells are matched: flow = dense optical flow (default; follows "
+        "tissue that moves non-uniformly), legacy (= phase) = the earlier pyramidal phase-correlation tiles, one shift per 64 px tile.",
+    )
+    p.add_argument(
         "--fill-holes",
         action="store_true",
         help="Give empty areas enclosed by cells a cell id of their own before tracking.",
@@ -189,6 +202,8 @@ def main(argv=None) -> None:
         max_distance=args.max_distance,
         run_backward=args.backward,
         n_jobs=args.n_jobs,
+        motion="phase" if args.motion in ("legacy", "phase") else args.motion,
+        division_mode="lineage" if args.divisions else "legacy",
         fill_holes=args.fill_holes,
         verbose=not args.quiet,
     )

@@ -55,16 +55,19 @@ def test_tracking_on_stored_masks(tmp_path):
 
 
 def test_registration_needs_intensity():
-    """Without the raw image the tracker cannot undo the frame jumps (see README notes)."""
+    """Without the raw image the LEGACY (phase-correlation) tracker cannot undo the frame jumps (see README notes); the optical-flow
+    default registers on the masks as well and is not asked the same (it is checked to be no worse than the legacy tracker below)."""
     from napari_tissuekit.core.celltrack.pipeline import track_arrays
 
     masks = imread(MASKS)
     kw = dict(stem="x", verbose=False, expand=3, pyramidal_depth=3, w_topo=0.75,
               max_iter=3, appear_cost=1.5, disappear_cost=1.5, division_penalty=0.8,
               max_gap=3, gap_close=True, max_distance=50.0)
-    with_int = track_arrays(masks, imread(MOVIE), None, **kw)["qc"]["n_tracks"]
-    without = track_arrays(masks, None, None, **kw)["qc"]["n_tracks"]
+    with_int = track_arrays(masks, imread(MOVIE), None, motion="phase", **kw)["qc"]["n_tracks"]
+    without = track_arrays(masks, None, None, motion="phase", **kw)["qc"]["n_tracks"]
     assert without > with_int * 1.3
+    flow_without = track_arrays(masks, None, None, motion="flow", **kw)["qc"]["n_tracks"]
+    assert flow_without <= without
 
 
 @pytest.mark.slow

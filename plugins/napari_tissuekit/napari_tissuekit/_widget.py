@@ -49,7 +49,7 @@ from qtpy.QtWidgets import (
 from . import __version__
 from .cell_properties import CellPropertiesWidget
 from .region_widget import AnalysisRegionWidget
-from .core.cell_size import MIN_CELL_AREA
+from .core.cell_size import min_cell_area, set_pixel_size
 from .core.project import PER_RUN_STEPS, WorkingFolder, find_results_root, movie_stem
 from .core.region import TRACKING_REQUIRED, burn_region
 from .wrapped_tabs import WrappedTabs
@@ -1654,7 +1654,7 @@ class TissueKitWidget(QWidget):
                 self._seg_base_outlines,
                 edited,
                 frames=frames,
-                min_seed_area=MIN_CELL_AREA - 1,  # the watershed removes regions of up to this many px
+                min_seed_area=min_cell_area() - 1,  # the watershed removes regions of up to this many px (4 um^2)
                 pad=int(self.seg_pad.value()),
             )
         except Exception as exc:
@@ -1954,6 +1954,8 @@ class TissueKitWidget(QWidget):
         cal = self._calibration(self._layer(self.t1_labels.currentText()) if hasattr(self, "t1_labels") else None)
         um = getattr(cal, "um_per_px", None)
         dt = getattr(cal, "s_per_frame", None)
+        if um:
+            set_pixel_size(um)  # the minimum cell area (4 um^2) of outline edits follows the movie's pixel size
         if hasattr(self, "t1_cal_label"):
             parts = [f"{um:.4g} \u00b5m/px" if um else "pixel size not found",
                      f"{dt:.4g} s/frame" if dt else "frame interval not found"]

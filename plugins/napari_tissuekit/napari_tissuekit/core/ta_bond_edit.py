@@ -14,7 +14,7 @@ from skimage.measure import label, regionprops
 from skimage.segmentation import expand_labels, find_boundaries, watershed
 
 from ._wshed import wshed
-from .cell_size import MIN_CELL_AREA
+from .cell_size import min_cell_area
 
 
 def labels_to_hand(labels: np.ndarray) -> np.ndarray:
@@ -38,13 +38,14 @@ def exterior_mask(hand: np.ndarray) -> np.ndarray:
 
 
 def enclosed_background(
-    exterior: np.ndarray, drawn: np.ndarray, min_area: int = MIN_CELL_AREA
+    exterior: np.ndarray, drawn: np.ndarray, min_area: int | None = None
 ) -> np.ndarray:
     """Background pieces cut off by ``drawn`` strokes (new cells).
 
     Each background region split by the strokes keeps its largest piece as
     background; the other pieces (≥ ``min_area`` px) are returned.
     """
+    min_area = min_cell_area() if min_area is None else min_area
     before = label(exterior, connectivity=1)
     after = label(exterior & ~drawn, connectivity=1)
     out = np.zeros(exterior.shape, dtype=bool)
@@ -388,7 +389,7 @@ def merge_slivers(bonds: np.ndarray, before: np.ndarray) -> np.ndarray:
         y0, x0, y1, x1 = r.bbox
         if y0 == 0 or x0 == 0 or y1 == h or x1 == w:
             continue
-        too_small = r.area < MIN_CELL_AREA  # not a cell at all (see cell_size)
+        too_small = r.area < min_cell_area()  # not a cell at all (see cell_size)
         thin = (
             r.area < MAX_SLIVER_AREA
             and r.minor_axis_length < MAX_SLIVER_WIDTH

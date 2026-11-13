@@ -5,14 +5,14 @@ import numpy as np
 from scipy import ndimage as ndi
 from skimage.measure import label
 
-from .cell_size import MIN_CELL_AREA
+from .cell_size import min_cell_area
 
 MIN_HOLE_HALFWIDTH = 2.5  # px: thinner gaps are membrane gaps between neighbours, not missing cells
 
 
 def fill_enclosed_holes(
     labels: np.ndarray,
-    min_area: int = MIN_CELL_AREA,
+    min_area: int | None = None,
     min_halfwidth: float = MIN_HOLE_HALFWIDTH,
     max_area: int | None = None,
 ) -> tuple[np.ndarray, int]:
@@ -24,8 +24,9 @@ def fill_enclosed_holes(
     becomes a cell if it has at least ``min_area`` px and is at least ``min_halfwidth`` px thick
     (distance to the nearest cell), so thin membrane gaps are left to the outline step, and, when
     given, at most ``max_area`` px. New ids follow the highest id of each frame.
-    Returns the copy and the number of new cells.
+    Returns the copy and the number of new cells. ``min_area`` None: ``cell_size.min_cell_area()``.
     """
+    min_area = min_cell_area() if min_area is None else min_area
     out = np.array(labels, copy=True)
     frames = out[np.newaxis] if out.ndim == 2 else out
     added = 0

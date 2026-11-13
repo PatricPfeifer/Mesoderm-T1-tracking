@@ -39,7 +39,7 @@ SPECS: tuple[ParamSpec, ...] = (
               "Pixels above this cell probability count as cell. Lower finds more / larger cells; "
               "higher fewer / smaller ones."),
     ParamSpec("min_size", "Min size (px)", int, MIN_CELL_AREA, MIN_CELL_AREA, 100000, 1,
-              f"Cells with fewer pixels are dropped (at least {MIN_CELL_AREA} px, the plugin's minimum)."),
+              f"Cells with fewer pixels are dropped (at least {MIN_CELL_AREA} px; with the movie's pixel size the minimum is also at least 4 um^2)."),
     ParamSpec("normalize", "Normalize intensity", bool, True,
               tip="Rescale each frame's intensity (1st-99th percentile) before segmentation."),
     # Speed / memory only, not the result: passed to eval as batch_size, not with the settings above.
