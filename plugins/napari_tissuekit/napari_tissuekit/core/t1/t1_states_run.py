@@ -725,10 +725,10 @@ def run_states_cli(*, labels_path: Path, rgb: Path | None, out: Path, stem: str,
                    config: Path | None = None, t_dwell: float | None = None, t_stable: float | None = None, t_end: float | None = None,
                    on_px: float | None = None, off_px: float | None = None, side_rule: bool | None = None,
                    vertex_clause: bool | None = None, tracked_stem: str | None = None, n_jobs: int | None = None,
-                   region: Path | None = None) -> Path:
+                   region: Path | None = None, picker_bundle: bool = False) -> Path:
     """`run_tm_t1.py --classifier states`: classify one movie with the committed definition (DEFINITION; any argument that is not None
     overrides it) and write <stem>_t1_events.csv (legacy columns + new ones), <stem>_qc.json, the junction-length tables of the events
-    (vertex-to-vertex and contact length of the active pair, as the legacy tables), the calibrated twins and the picker-ready bundle.
+    (vertex-to-vertex and contact length of the active pair, as the legacy tables), the calibrated twins and, only with `picker_bundle=True`, the picker-ready bundle (otherwise nothing is copied or linked).
     `region` (analysis_region/region.json from the plugin's Analysis cropping tab): only events whose four cells are inside the kept area at
     the frame of their first swap are written. `config` (YAML) is only read for `expand` and kept for compatibility. `n_jobs`: CPU cores (default: $TISSUEKIT_N_JOBS or all cores of the allocation)."""
     from .calibrated_outputs import write_um_files
@@ -770,7 +770,7 @@ def run_states_cli(*, labels_path: Path, rgb: Path | None, out: Path, stem: str,
     write_um_files(out, stem, cal)
     # picker bundle next to the detection folder ONLY (not the shared output/t1_picker_ready/<stem> mirror that the
     # legacy detector writes: that would overwrite the bundle of the legacy run of the same movie)
-    if rgb is not None and Path(rgb).is_file():
+    if picker_bundle and rgb is not None and Path(rgb).is_file():
         dest = out.parent / "picker_ready" if out.name == "detect" else out / f"{stem}_t1_picker"
         _write_one_picker_dir(dest, stem=stem, events=ev_path, labels=Path(labels_path), rgb_path=Path(rgb),
                               four_path=None, calibration=cal.as_dict() if cal else None)

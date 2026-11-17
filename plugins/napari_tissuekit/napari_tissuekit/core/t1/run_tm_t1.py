@@ -36,7 +36,7 @@ Example:
 
 Step folders under each movie ({stem}_t1/):
   detect/       — this script (events, lengths, overlays)
-  picker_ready/ — Mac/PC picker bundle (written automatically)
+  picker_ready/ — Mac/PC picker bundle (only with --picker-bundle)
   picked/       — headless/GUI select export
 """
 
@@ -1609,6 +1609,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--no-vertex-clause", action="store_true", help="states: switch the return-to-vertex clause off")
     p.add_argument("--region", type=Path, default=None,
                    help="states: analysis_region/region.json from the plugin's Analysis cropping tab; only T1s whose four cells are inside the kept area are written")
+    p.add_argument("--picker-bundle", action="store_true",
+                   help="also write the picker_ready bundle for the Mac/PC T1 picker (events, tracked labels, RGB, script). Off by default: "
+                        "run_tm_t1_picker.py reads the files of the results folder directly (--events/--labels/--rgb)")
     p.add_argument("--bond-cutoff", type=float, default=3.0)
     p.add_argument(
         "--border-rings",
@@ -1768,6 +1771,7 @@ def main(argv=None) -> None:
             on_px=args.on_px, off_px=args.off_px, side_rule=False if args.no_side_rule else None,
             vertex_clause=False if args.no_vertex_clause else None, n_jobs=args.n_jobs,
             region=args.region.expanduser().resolve() if args.region is not None else None,
+            picker_bundle=args.picker_bundle,
         )
         print("Done (states classifier).", flush=True)
         return
@@ -2021,19 +2025,20 @@ def main(argv=None) -> None:
         save_tiff(ov_path, result["overlay"], cal)
         print(f"Wrote {ov_path}", flush=True)
 
-    write_picker_ready(
-        t1_output_dir=out,
-        stem=stem,
-        events=ev_path,
-        labels=args.labels.expanduser().resolve(),
-        rgb=(
-            args.rgb.expanduser().resolve()
-            if args.rgb is not None
-            else None
-        ),
-        fourways=dots_path,
-        calibration=cal.as_dict() if cal else None,
-    )
+    if args.picker_bundle:
+        write_picker_ready(
+            t1_output_dir=out,
+            stem=stem,
+            events=ev_path,
+            labels=args.labels.expanduser().resolve(),
+            rgb=(
+                args.rgb.expanduser().resolve()
+                if args.rgb is not None
+                else None
+            ),
+            fourways=dots_path,
+            calibration=cal.as_dict() if cal else None,
+        )
     print("Done.", flush=True)
 
 

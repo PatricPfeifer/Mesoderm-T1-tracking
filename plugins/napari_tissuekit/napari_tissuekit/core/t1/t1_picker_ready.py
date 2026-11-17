@@ -50,17 +50,13 @@ def picker_ready_dirs(t1_output_dir: Path, stem: str) -> list[Path]:
     Legacy fallback when output-dir is not named ``detect``:
       <t1-output-dir>/<stem>_t1_picker
 
-    Also mirrored under output/t1_picker_ready/<stem>.
     """
     t1_out = Path(t1_output_dir).expanduser().resolve()
     if t1_out.name == "detect":
         local = t1_out.parent / "picker_ready"
     else:
         local = t1_out / f"{stem}_t1_picker"
-    return [
-        local,
-        _ROOT / "output" / "t1_picker_ready" / stem,
-    ]
+    return [local]  # no second copy under output/t1_picker_ready/
 
 
 def picker_ready_dir(t1_output_dir: Path, stem: str) -> Path:
