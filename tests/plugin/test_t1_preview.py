@@ -2,7 +2,7 @@
 import numpy as np
 
 from napari_tissuekit.t1_preview import (
-    CLICK_RADIUS, event_box, event_frames, find_event_at, render_preview_frame, sort_events,
+    CLICK_RADIUS, event_box, event_frames, find_event_at, junction_centre, render_preview_frame, sort_events,
 )
 
 
@@ -75,3 +75,30 @@ def test_render_has_quartet_colours_junctions_and_vertex_and_crops():
     after = render_preview_frame(lab[9], e, 9, None, reach=1, box=box, scale=2)
     colours_a = {tuple(px) for px in after.reshape(-1, 3)}
     assert (0, 220, 255) in colours_a and (255, 140, 0) not in colours_a
+
+
+def test_window_follows_the_junction_every_frame():
+    """The tissue drifts 2 px per frame; the preview window must keep the junction in the middle of every frame it shows."""
+    base = np.pad(labels_2x2(), ((0, 0), (25, 25), (25, 25)))          # 80 x 80, junction at (40, 40) in frame 0
+    lab = np.stack([np.roll(base[t], (2 * t, 2 * t), (0, 1)) for t in range(len(base))])
+    e = ev(y=40.0, x=40.0)
+    four = [{e["quartet"]: (40.0 + 2 * t, 40.0 + 2 * t)} for t in range(len(lab))]
+    for t in range(len(lab)):
+        for fx in (None, four):                                        # with and without the stored four-way vertices
+            cy, cx = junction_centre(lab[t], e, t, fx, reach=1)
+            assert abs(cy - (40 + 2 * t)) <= 4 and abs(cx - (40 + 2 * t)) <= 4, (t, fx is None, cy, cx)
+            img = render_preview_frame(lab[t], e, t, four, reach=1, centre=(cy, cx), size=(40, 40), scale=1)
+            assert img.shape == (40, 40, 3)
+            colours = img[14:26, 14:26].reshape(-1, 3)                 # the junction's rims sit in the middle of the window
+            rims = [(255, 140, 0), (0, 220, 255)]
+            assert any((colours == c).all(axis=1).any() for c in rims), t
+
+
+def test_junction_centre_does_not_jump_to_a_distant_four_way_position():
+    """A stored four-way position that is off the junction (mean of cell centres) must not pull the window away while the pair's rims are visible."""
+    lab = labels_2x2(size=30)
+    e = ev(y=15.0, x=15.0)
+    off = [{e["quartet"]: (4.0, 4.0)} for _ in range(len(lab))]
+    for t in (e["t_start"], 5, e["t_end"]):
+        cy, cx = junction_centre(lab[t], e, t, off, reach=1)
+        assert abs(cy - 15) <= 4 and abs(cx - 15) <= 4, (t, cy, cx)

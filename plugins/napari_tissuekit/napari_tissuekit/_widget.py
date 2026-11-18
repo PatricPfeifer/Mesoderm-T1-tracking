@@ -1374,6 +1374,7 @@ class TissueKitWidget(QWidget):
             ) != QMessageBox.Ok:
                 return
             self.viewer.layers.clear()
+            self._invalidate_t1()
             self._seg_base_masks = None
             self._seg_base_hand = None
             self._seg_run = None
@@ -2782,6 +2783,7 @@ class TissueKitWidget(QWidget):
 
     def _refresh_edited(self, layer, stack: np.ndarray, undos: list[CellUndo]) -> None:
         """Redraw only the cells that were just edited."""
+        self._mark_t1_stale()
         self._recolor_cells(stack, undos)
         layer.refresh()
         data_event = getattr(layer.events, "data", None)
@@ -3289,6 +3291,34 @@ class TissueKitWidget(QWidget):
         preview_inner.addWidget(self.t1_preview_btn)
         preview_box.setLayout(preview_inner)
         layout.addWidget(preview_box)
+        self.t1_select_box = QGroupBox("Select T1s for the saved results (optional)")
+        self.t1_select_box.setCheckable(True)
+        self.t1_select_box.setChecked(False)
+        self.t1_select_box.setToolTip(
+            "Off: every detected T1 is used. On: only the ticked events are written to the saved T1 results "
+            "(events table and junction-length tables). Click a row to show the event in the viewer, double-click to play it."
+        )
+        select_inner = QVBoxLayout()
+        self.t1_select_list = QListWidget()
+        self.t1_select_list.setMinimumHeight(120)
+        self.t1_select_list.currentRowChanged.connect(self._t1_select_row_changed)
+        self.t1_select_list.itemDoubleClicked.connect(self._t1_select_row_open)
+        self.t1_select_list.itemChanged.connect(lambda _item: self._t1_select_count())
+        select_inner.addWidget(self.t1_select_list)
+        select_btns = QHBoxLayout()
+        self.t1_select_all = QPushButton("All")
+        self.t1_select_none = QPushButton("None")
+        self.t1_select_save = QPushButton("Save selected T1s")
+        self.t1_select_all.clicked.connect(lambda: self._t1_select_set_all(True))
+        self.t1_select_none.clicked.connect(lambda: self._t1_select_set_all(False))
+        self.t1_select_save.clicked.connect(self._t1_select_save)
+        for b in (self.t1_select_all, self.t1_select_none, self.t1_select_save):
+            select_btns.addWidget(b)
+        select_inner.addLayout(select_btns)
+        self.t1_select_info = QLabel("")
+        select_inner.addWidget(self.t1_select_info)
+        self.t1_select_box.setLayout(select_inner)
+        layout.addWidget(self.t1_select_box)
         export_box = QGroupBox("3 · Export")
         export_inner = QVBoxLayout()
         self.t1_export = QPushButton("Export TIFF")
@@ -3346,7 +3376,11 @@ class TissueKitWidget(QWidget):
         self._start(work, self._t1_done)
 
     def _t1_done(self, result: dict) -> None:
+        self._reset_t1_dialog()  # a preview window left open would keep playing the old events
+        result["tracked_run"] = self._tracked_run  # which tracking these events belong to (a click on another one is refused)
+        result["stale"] = False
         self._t1_result = result
+        self._fill_t1_selector(result)
         self._autosave_t1(result)
         self._region_changed()
         self._refresh_layers()
@@ -3355,9 +3389,105 @@ class TissueKitWidget(QWidget):
         if note:
             self.status.setText(f"{self.status.text()} {note}")
 
+    # ---- T1 state: dropped or flagged when its inputs change -----------------------------------------------
+    def _reset_t1_dialog(self) -> None:
+        d = self._t1_dialog
+        self._t1_dialog = None
+        if d is not None:
+            try:
+                d.close()
+            except Exception:
+                pass
+
+    def _invalidate_t1(self, reason: str = "") -> None:
+        """The tracked labels the T1 events were made from are gone or replaced (re-tracking, another run, another egg): drop the
+        events, the two T1 layers, the selection and the preview window, so nothing keeps working on the old stack."""
+        had = self._t1_result is not None or any(n in self.viewer.layers for n in ("T1 overlay", "T1 four-ways"))
+        self._t1_result = None
+        self._t1_shown = []
+        self._reset_t1_dialog()
+        for name in ("T1 overlay", "T1 four-ways"):
+            if name in self.viewer.layers:
+                self.viewer.layers.remove(name)
+        if hasattr(self, "t1_select_list"):
+            self._fill_t1_selector(None)
+        if had and reason:
+            self.status.setText(f"{self.status.text()} T1 results cleared ({reason}): run T1 again.")
+
+    def _t1_stale(self) -> bool:
+        """T1 events that no longer match the tracked labels in the viewer (track edits since the run, or another tracking)."""
+        r = self._t1_result
+        return bool(r) and (bool(r.get("stale")) or r.get("tracked_run") != self._tracked_run)
+
+    def _mark_t1_stale(self) -> None:
+        if self._t1_result and not self._t1_result.get("stale"):
+            self._t1_result["stale"] = True
+            self.status.setText(f"{self.status.text()} The T1 overlay is now out of date: run T1 again.")
+
+    # ---- optional T1 selection (which events go into the saved results) -------------------------------------
+    def _fill_t1_selector(self, result: dict | None) -> None:
+        lst = self.t1_select_list
+        lst.blockSignals(True)
+        lst.clear()
+        for i, e in enumerate((result or {}).get("events") or []):
+            q = ",".join(str(c) for c in (e.get("A"), e.get("B"), e.get("C"), e.get("D")))
+            item = QListWidgetItem(f"#{i}  {e.get('type', '')}  frame {int(e['t_first_swap']) + 1}  cells {q}")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            lst.addItem(item)
+        lst.blockSignals(False)
+        self._t1_select_count()
+
+    def _t1_select_count(self) -> None:
+        n = self.t1_select_list.count()
+        k = len(self._t1_checked())
+        self.t1_select_info.setText(f"{k} of {n} T1s ticked" if n else "Run T1 first.")
+
+    def _t1_checked(self) -> list[int]:
+        lst = self.t1_select_list
+        return [i for i in range(lst.count()) if lst.item(i).checkState() == Qt.Checked]
+
+    def _t1_selection(self, n_events: int) -> list[int] | None:
+        """Event indices to save, or None for all (selector off, or every event ticked)."""
+        if not self.t1_select_box.isChecked() or self.t1_select_list.count() != n_events:
+            return None
+        sel = self._t1_checked()
+        return None if len(sel) == n_events else sel
+
+    def _t1_select_set_all(self, on: bool) -> None:
+        lst = self.t1_select_list
+        lst.blockSignals(True)
+        for i in range(lst.count()):
+            lst.item(i).setCheckState(Qt.Checked if on else Qt.Unchecked)
+        lst.blockSignals(False)
+        self._t1_select_count()
+
+    def _t1_select_row_changed(self, row: int) -> None:
+        events = (self._t1_result or {}).get("events") or []
+        if 0 <= row < len(events) and not self._t1_stale():
+            self._t1_preview_moved(events[row])
+
+    def _t1_select_row_open(self, item) -> None:
+        events = (self._t1_result or {}).get("events") or []
+        row = self.t1_select_list.row(item)
+        if self._t1_stale():
+            self.status.setText("The T1 results are out of date: run T1 again.")
+        elif 0 <= row < len(events):
+            self._open_t1_preview(events[row], start_frame=max(0, int(events[row]["t_start"]) - int(self._t1_result["pre"])))
+
+    def _t1_select_save(self) -> None:
+        if not self._t1_result or not (self._t1_result.get("events") or []):
+            self.status.setText("Run T1 first.")
+        elif self._t1_stale():
+            self.status.setText("The T1 results are out of date: run T1 again before saving a selection.")
+        else:
+            self._autosave_t1(self._t1_result)
+
     # ---- T1 preview (click an event on the overlay) -------------------------------------------------------
     def _t1_click_active(self) -> bool:
         if not self.t1_click_preview.isChecked() or not self._t1_result or not self._t1_shown:
+            return False
+        if self._t1_stale():
             return False
         active = self.viewer.layers.selection.active
         if active is None or active.name not in ("T1 overlay", "T1 four-ways"):
@@ -3398,6 +3528,9 @@ class TissueKitWidget(QWidget):
         if not self._t1_result or not self._t1_shown:
             self.status.setText("Run T1 first (and make sure the filter shows events).")
             return
+        if self._t1_stale():
+            self.status.setText("The T1 results are out of date (tracking or edits changed): run T1 again.")
+            return
         self._open_t1_preview(None)
 
     def _open_t1_preview(self, ev, start_frame: int | None = None) -> None:
@@ -3418,10 +3551,17 @@ class TissueKitWidget(QWidget):
     def _t1_preview_moved(self, ev) -> None:
         """Jump the napari view to the event the preview shows."""
         try:
-            self.viewer.dims.set_point(0, int(ev["t_first_swap"]))
+            from .t1_preview import junction_centre
+
+            t = int(ev["t_first_swap"])
+            self.viewer.dims.set_point(0, t)
             layer = self.viewer.layers["T1 overlay"] if "T1 overlay" in self.viewer.layers else None
             if layer is not None:
-                w = layer.data_to_world([int(ev["t_first_swap"]), float(ev["y"]), float(ev["x"])])
+                cy, cx = float(ev["y"]), float(ev["x"])
+                result = self._t1_result
+                if result and 0 <= t < len(result["stack"]):  # the junction on the frame of the first swap, as the preview window
+                    cy, cx = junction_centre(result["stack"][t], ev, t, result.get("four_xy"), int(result.get("expand", 3)))
+                w = layer.data_to_world([t, cy, cx])
                 self.viewer.camera.center = (0.0, float(w[-2]), float(w[-1]))
         except Exception:
             pass
@@ -3664,6 +3804,9 @@ class TissueKitWidget(QWidget):
         events = result.get("events") or []
         if wf is None or not events:
             return
+        sel = self._t1_selection(len(events))  # optional T1 selection: None = all events
+        if sel is not None:
+            events = [events[i] for i in sel]
         try:
             import json
 
@@ -3697,8 +3840,14 @@ class TissueKitWidget(QWidget):
                 "analysis_region_hash": self._t1_region_hash or "", "expand": int(result.get("expand", 3)),
                 "labels": str(labels_path) if labels_path.is_file() else "",
             }
+            if sel is not None:
+                qc["t1_selection"] = {"selected_event_index": sel, "n_detected": len(result.get("events") or [])}
             (out / f"{stem}_qc.json").write_text(json.dumps(qc, indent=2, default=str) + "\n", encoding="utf-8")
             traces = result.get("length_traces")
+            if sel is not None and traces is not None:  # event_id = row in the events table: keep the ticked ones and renumber
+                remap = {o: n for n, o in enumerate(sel)}
+                traces = traces[traces["event_id"].isin(list(remap))].copy()
+                traces["event_id"] = traces["event_id"].map(remap)
             if traces is not None:
                 write_length_tables(None, pd.DataFrame(events), out, stem, traces=traces)
             write_um_files(out, stem, cal, log=lambda *_: None)  # adds the calibration to the qc file as well
@@ -3842,8 +3991,7 @@ class TissueKitWidget(QWidget):
         self._keep_ids = []
         self._keep_changed()
         self._division_ids = set()
-        self._t1_result = None
-        self._t1_shown = []
+        self._invalidate_t1("tracking removed")
 
     # ---- segmentation runs -------------------------------------------------------
     def _next_run_name(self, base: str) -> str:
@@ -3987,6 +4135,7 @@ class TissueKitWidget(QWidget):
 
     def _replace_labels(self, name: str, data: np.ndarray) -> None:
         if name == "Tracked":  # new tracks: old undo steps and protection are stale
+            self._invalidate_t1("tracks replaced")
             self._track_undo.clear()
             self._protect_log.clear()
             if self._keep_ids:  # new tracks: the IDs in the list may mean other cells now

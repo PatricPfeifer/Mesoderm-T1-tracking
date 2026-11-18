@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .core.t1.run_tm_t1 import TYPE_COLORS, TYPE_SORT_ORDER, paint_pair
+from .core.t1.run_tm_t1 import TYPE_COLORS, TYPE_SORT_ORDER, paint_pair, pair_outline_mask
 
 OUTLINE = (90, 90, 90)
 QUARTET_PALETTE = ((170, 130, 190), (130, 175, 155), (130, 155, 195), (195, 150, 140))  # as the picker
@@ -83,15 +83,57 @@ def event_box(ev: dict, labels_stack, margin: int = 14, min_size: int = 70):
     return y0, min(int(y1), h), x0, min(int(x1), w)
 
 
+def junction_centre(labels: np.ndarray, ev: dict, t: int, four_xy=None, reach: int = 3) -> tuple[float, float]:
+    """(y, x) of the T1 junction on frame `t`, so the preview can be centred on it in every frame it shows.
+
+    The centre of the facing rims of the active pair (breaking pair before and during the swap, building pair after it) is used on
+    every frame, so the window does not jump between the frames before, during and after the event. Where the pair is not visible
+    (the four cells meet at a point) the position of the four cells on that frame is used, then the centre of the four cells, and
+    as a last resort the event's own position."""
+    t0, t1 = int(ev["t_start"]), int(ev["t_end"])
+    pairs = (ev["pair_after"], ev["pair_before"]) if t > t1 else (ev["pair_before"], ev["pair_after"])
+    for pair in pairs:  # the pair that is expected on this frame first, then the other one (the swap can fall inside the event)
+        a, b = tuple(pair)
+        ys, xs = np.nonzero(np.isin(labels, [a, b]))
+        if not len(ys):
+            continue
+        pad = reach + 3
+        y0, x0 = max(int(ys.min()) - pad, 0), max(int(xs.min()) - pad, 0)
+        sub = np.asarray(labels[y0 : int(ys.max()) + pad + 1, x0 : int(xs.max()) + pad + 1])
+        my, mx = np.nonzero(pair_outline_mask(sub, a, b, reach))
+        if len(my):
+            return float(my.mean()) + y0, float(mx.mean()) + x0
+    if t0 <= t <= t1 and four_xy and 0 <= t < len(four_xy):
+        p = four_xy[t].get(ev["quartet"])
+        if p is not None:
+            return float(p[0]), float(p[1])
+    ys, xs = np.nonzero(np.isin(labels, list(ev["quartet"])))
+    if len(ys):
+        return float(ys.mean()), float(xs.mean())
+    return float(ev["y"]), float(ev["x"])
+
+
 def render_preview_frame(labels: np.ndarray, ev: dict, t: int, four_xy=None, *, reach: int = 3, box=None,
-                         scale: int | None = None) -> np.ndarray:
-    """One preview frame (RGB uint8): outlines, the four quartet cells filled, the breaking / building junctions and the vertex."""
+                         centre=None, size=None, scale: int | None = None) -> np.ndarray:
+    """One preview frame (RGB uint8): outlines, the four quartet cells filled, the breaking / building junctions and the vertex.
+
+    `box` = (y0, y1, x0, x1) crops a fixed window. `centre` = (y, x) with `size` = (h, w) crops a window of that size centred on that
+    point instead (outside the image it is empty background), so the junction stays in the middle of every frame."""
     from skimage.draw import disk
 
-    if box is None:
-        box = (0, labels.shape[0], 0, labels.shape[1])
-    y0, y1, x0, x1 = box
-    lab = np.asarray(labels[y0:y1, x0:x1])
+    if centre is not None and size is not None:
+        h, w = (int(v) for v in size)
+        y0, x0 = int(round(centre[0])) - h // 2, int(round(centre[1])) - w // 2
+        y1, x1 = y0 + h, x0 + w
+        lab = np.zeros((h, w), dtype=labels.dtype)
+        sy0, sx0, sy1, sx1 = max(y0, 0), max(x0, 0), min(y1, labels.shape[0]), min(x1, labels.shape[1])
+        if sy1 > sy0 and sx1 > sx0:
+            lab[sy0 - y0 : sy1 - y0, sx0 - x0 : sx1 - x0] = labels[sy0:sy1, sx0:sx1]
+    else:
+        if box is None:
+            box = (0, labels.shape[0], 0, labels.shape[1])
+        y0, y1, x0, x1 = box
+        lab = np.asarray(labels[y0:y1, x0:x1])
     out = np.zeros((*lab.shape, 3), np.uint8)
     for i, cid in enumerate(sorted(ev["quartet"])):
         out[lab == cid] = QUARTET_PALETTE[i % len(QUARTET_PALETTE)]
@@ -150,7 +192,7 @@ class T1PreviewDialog(QDialog):
         self.index = 0
         self.frames: range = range(0)
         self.t = 0
-        self._box = None
+        self._size = None  # (h, w) of the preview window; it is centred on the junction in every frame
         self.image = QLabel(alignment=Qt.AlignCenter)
         self.image.setMinimumSize(320, 320)
         self.info = QLabel("")
@@ -194,7 +236,8 @@ class T1PreviewDialog(QDialog):
         self.index = index % len(self.events)
         ev = self.events[self.index]
         self.frames = event_frames(ev, self.pre, self.post, self.stack.shape[0])
-        self._box = event_box(ev, self.stack)
+        y0, y1, x0, x1 = event_box(ev, self.stack)
+        self._size = (y1 - y0, x1 - x0)
         self.slider.blockSignals(True)
         self.slider.setRange(self.frames.start, self.frames.stop - 1)
         self.slider.blockSignals(False)
@@ -211,7 +254,9 @@ class T1PreviewDialog(QDialog):
     def _set_frame(self, t: int) -> None:
         self.t = int(t)
         ev = self.events[self.index]
-        img = np.ascontiguousarray(render_preview_frame(self.stack[self.t], ev, self.t, self.four_xy, reach=self.reach, box=self._box))
+        centre = junction_centre(self.stack[self.t], ev, self.t, self.four_xy, self.reach)
+        img = np.ascontiguousarray(render_preview_frame(self.stack[self.t], ev, self.t, self.four_xy, reach=self.reach,
+                                                        centre=centre, size=self._size))
         h, w = img.shape[:2]
         self._img = img  # keep the buffer alive for the QImage
         self.image.setPixmap(QPixmap.fromImage(QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()))
