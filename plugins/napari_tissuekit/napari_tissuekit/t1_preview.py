@@ -15,6 +15,35 @@ QUARTET_PALETTE = ((170, 130, 190), (130, 175, 155), (130, 155, 195), (195, 150,
 CLICK_RADIUS = 15  # pixels: a click this close to an event's four-way vertex counts as on the event
 
 
+# ---- preview length in minutes, event types ---------------------------------------------------------------------------
+PREVIEW_MINUTES = (3, 5)  # the two preview lengths offered: this many minutes before and after the event
+EVENT_TYPES = (("clean", "Clean"), ("flicker_resolved", "Flicker resolved"), ("flicker_aborted", "Flicker aborted"))
+
+
+def minutes_to_frames(minutes: float, dt_s) -> int | None:
+    """Frames that span `minutes` at a frame interval of `dt_s` seconds (at least 1), or None when the interval is unknown."""
+    try:
+        dt = float(dt_s)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(dt) or dt <= 0:
+        return None
+    return max(1, int(round(float(minutes) * 60.0 / dt)))
+
+
+def event_type_key(ev: dict) -> str:
+    """The type of an event as the T1 filter names it: clean / flicker_resolved / flicker_aborted (the state classifier's t1_class;
+    older events carry only `type`, where "completed" means clean)."""
+    k = ev.get("t1_class") or ev.get("type") or "clean"
+    return "clean" if k == "completed" else str(k)
+
+
+def events_of_types(events, keys) -> list[int]:
+    """Indices (in the given order) of the events whose type is in `keys`."""
+    keys = set(keys)
+    return [i for i, e in enumerate(events) if event_type_key(e) in keys]
+
+
 # ---- finding and ordering events -----------------------------------------------------------------------------------
 def event_frames(ev: dict, pre: int, post: int, n_frames: int) -> range:
     """Frames the preview of an event plays: from `pre` frames before the event to `post` frames after it."""

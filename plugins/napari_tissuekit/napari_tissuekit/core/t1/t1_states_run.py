@@ -696,7 +696,7 @@ def run_states_stack(stack: np.ndarray, *, um_per_px: float, dt_s: float, rgb: n
     return {"classifier": "states", "definition": d, "stack": stack, "frame_indices": np.arange(n), "events": events, "events_shown": events,
             "four_xy": four_xy, "adj": [], "present": [], "overlay": overlay, "dots": dots, "overlay_base": overlay_base, "n_frames": n,
             "n_t1_confirmed": len(events), "n_excluded_events": n_excluded, "n_outside_region": n_outside, "classes": classes, "dropped": reasons, "swap_note": note,
-            "expand": int(d["expand"]), "pre": pre, "post": post, "length_traces": length_traces}
+            "expand": int(d["expand"]), "pre": pre, "post": post, "dt_s": float(dt_s), "length_traces": length_traces}
 
 
 def load_config(path) -> dict:

@@ -54,7 +54,7 @@ from .core.cell_size import get_min_area_um2, min_cell_area, set_min_area_um2, s
 from .core.project import PER_RUN_STEPS, WorkingFolder, find_results_root, movie_stem
 from .core.region import TRACKING_REQUIRED, burn_region
 from .wrapped_tabs import WrappedTabs
-from .t1_preview import T1PreviewDialog, find_event_at
+from .t1_preview import EVENT_TYPES, PREVIEW_MINUTES, T1PreviewDialog, event_type_key, find_event_at, minutes_to_frames
 from .remote_widget import RemoteRunner
 from .track_edit import (
     CellUndo,
@@ -188,7 +188,7 @@ HELP_HTML = """
 
 <h3>T1 tab</h3>
 <ul>
-<li><b>Preview events</b>: after a run, select the <i>T1 overlay</i> layer and click a cell or junction of an event (or press <b>Preview first event</b>). A window plays the event with the four cells filled; <i>Previous</i>/<i>Next event</i> step through all shown events and the napari view follows.</li>
+<li><b>Preview events</b>: after a run, select the <i>T1 overlay</i> layer and click a cell or junction of an event (or press <b>Preview first event</b>). A window plays the event with the four cells filled, from 3 or 5 minutes before it to 3 or 5 minutes after it (your choice under <i>Preview length</i>, converted to frames with the movie's frame interval); <i>Previous</i>/<i>Next event</i> step through all shown events and the napari view follows.</li>
 <li><b>Labels</b>: the Tracked layer. <b>RGB</b>: the Tracked RGB image used for the overlay.</li>
 <li><b>Run T1</b>: detect T1 transitions. Needs the pixel size and frame interval. They are read from the movie or from the results files (also ones made on a server); the line under <i>RGB</i> shows what was found. If a value is missing, type it in the boxes.</li>
 <li><b>T1 filter</b>: show all counted events, only clean ones, flicker resolved, or flicker aborted.</li>
@@ -3287,7 +3287,25 @@ class TissueKitWidget(QWidget):
         self.t1_preview_btn = QPushButton("Preview first event")
         self.t1_preview_btn.setToolTip("Open the preview on the first event shown (completed events first).")
         self.t1_preview_btn.clicked.connect(self._preview_first_t1)
+        self.t1_prev_group = QButtonGroup(self)
+        self.t1_prev_minutes: dict[int, QRadioButton] = {}
+        prev_row = QHBoxLayout()
+        prev_row.addWidget(QLabel("Preview length:"))
+        for minutes in PREVIEW_MINUTES:
+            rb = QRadioButton(f"{minutes} min")
+            rb.setToolTip(
+                f"The preview starts {minutes} minutes before the event and ends {minutes} minutes after it, whatever the frame "
+                "interval of the movie (rounded to whole frames). Without a frame interval the 'Overlay pre / post' frames are used. "
+                "The T1 overlay layer in the viewer keeps using 'Overlay pre / post'."
+            )
+            self.t1_prev_group.addButton(rb)
+            self.t1_prev_minutes[minutes] = rb
+            prev_row.addWidget(rb)
+        self.t1_prev_minutes[PREVIEW_MINUTES[0]].setChecked(True)
+        prev_row.addWidget(QLabel("before and after the event"))
+        prev_row.addStretch(1)
         preview_inner.addWidget(self.t1_click_preview)
+        preview_inner.addLayout(prev_row)
         preview_inner.addWidget(self.t1_preview_btn)
         preview_box.setLayout(preview_inner)
         layout.addWidget(preview_box)
@@ -3299,6 +3317,19 @@ class TissueKitWidget(QWidget):
             "(events table and junction-length tables). Click a row to show the event in the viewer, double-click to play it."
         )
         select_inner = QVBoxLayout()
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("Show types:"))
+        self.t1_type_checks: dict[str, QCheckBox] = {}
+        for key, label in EVENT_TYPES:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.setToolTip("Untick to hide this type from the list below. Hidden events are not saved by 'Save selected T1s'; "
+                          "All / None act on the rows shown.")
+            cb.toggled.connect(lambda _on: self._t1_apply_type_filter())
+            self.t1_type_checks[key] = cb
+            type_row.addWidget(cb)
+        type_row.addStretch(1)
+        select_inner.addLayout(type_row)
         self.t1_select_list = QListWidget()
         self.t1_select_list.setMinimumHeight(120)
         self.t1_select_list.currentRowChanged.connect(self._t1_select_row_changed)
@@ -3434,18 +3465,36 @@ class TissueKitWidget(QWidget):
             item = QListWidgetItem(f"#{i}  {e.get('type', '')}  frame {int(e['t_first_swap']) + 1}  cells {q}")
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
+            item.setData(Qt.UserRole, event_type_key(e))
             lst.addItem(item)
         lst.blockSignals(False)
+        self._t1_apply_type_filter()
+
+    def _t1_apply_type_filter(self) -> None:
+        """Hide the list rows whose event type is unticked (pre-filter); the counts next to the boxes are those of the last run."""
+        lst = self.t1_select_list
+        counts = {k: 0 for k, _ in EVENT_TYPES}
+        keep = {k for k, cb in self.t1_type_checks.items() if cb.isChecked()}
+        for i in range(lst.count()):
+            key = lst.item(i).data(Qt.UserRole)
+            counts[key] = counts.get(key, 0) + 1
+            lst.item(i).setHidden(key not in keep)
+        for key, label in EVENT_TYPES:
+            self.t1_type_checks[key].setText(f"{label} ({counts.get(key, 0)})" if lst.count() else label)
         self._t1_select_count()
 
     def _t1_select_count(self) -> None:
         n = self.t1_select_list.count()
+        shown = [i for i in range(n) if not self.t1_select_list.item(i).isHidden()]
         k = len(self._t1_checked())
-        self.t1_select_info.setText(f"{k} of {n} T1s ticked" if n else "Run T1 first.")
+        hidden = n - len(shown)
+        self.t1_select_info.setText(
+            (f"{k} of {len(shown)} T1s ticked" + (f" ({hidden} hidden by the type filter, not saved)" if hidden else "")) if n else "Run T1 first.")
 
     def _t1_checked(self) -> list[int]:
+        """Ticked rows that are shown (rows hidden by the type filter do not count)."""
         lst = self.t1_select_list
-        return [i for i in range(lst.count()) if lst.item(i).checkState() == Qt.Checked]
+        return [i for i in range(lst.count()) if lst.item(i).checkState() == Qt.Checked and not lst.item(i).isHidden()]
 
     def _t1_selection(self, n_events: int) -> list[int] | None:
         """Event indices to save, or None for all (selector off, or every event ticked)."""
@@ -3458,7 +3507,8 @@ class TissueKitWidget(QWidget):
         lst = self.t1_select_list
         lst.blockSignals(True)
         for i in range(lst.count()):
-            lst.item(i).setCheckState(Qt.Checked if on else Qt.Unchecked)
+            if not lst.item(i).isHidden():
+                lst.item(i).setCheckState(Qt.Checked if on else Qt.Unchecked)
         lst.blockSignals(False)
         self._t1_select_count()
 
@@ -3473,7 +3523,7 @@ class TissueKitWidget(QWidget):
         if self._t1_stale():
             self.status.setText("The T1 results are out of date: run T1 again.")
         elif 0 <= row < len(events):
-            self._open_t1_preview(events[row], start_frame=max(0, int(events[row]["t_start"]) - int(self._t1_result["pre"])))
+            self._open_t1_preview(events[row], start_frame=max(0, int(events[row]["t_start"]) - self._preview_pre_post()[0]))
 
     def _t1_select_save(self) -> None:
         if not self._t1_result or not (self._t1_result.get("events") or []):
@@ -3522,7 +3572,7 @@ class TissueKitWidget(QWidget):
         if ev is None:
             self.status.setText("No T1 event here on this frame.")
             return
-        self._open_t1_preview(ev, start_frame=max(frame, int(ev["t_start"]) - int(result["pre"])))
+        self._open_t1_preview(ev, start_frame=max(frame, int(ev["t_start"]) - self._preview_pre_post()[0]))
 
     def _preview_first_t1(self) -> None:
         if not self._t1_result or not self._t1_shown:
@@ -3533,14 +3583,24 @@ class TissueKitWidget(QWidget):
             return
         self._open_t1_preview(None)
 
+    def _preview_pre_post(self) -> tuple[int, int]:
+        """Frames before and after an event that the preview plays: the chosen minutes (3 or 5) at the movie's frame interval;
+        the 'Overlay pre / post' frames when the interval is unknown."""
+        result = self._t1_result or {}
+        minutes = next((m for m, rb in self.t1_prev_minutes.items() if rb.isChecked()), PREVIEW_MINUTES[0])
+        n = minutes_to_frames(minutes, result.get("dt_s"))
+        if n is None:
+            return int(result.get("pre", 3)), int(result.get("post", 3))
+        return n, n
+
     def _open_t1_preview(self, ev, start_frame: int | None = None) -> None:
         result = self._t1_result
+        pre, post = self._preview_pre_post()
         if self._t1_dialog is None:
             self._t1_dialog = T1PreviewDialog(self)
             self._t1_dialog.event_changed.connect(self._t1_preview_moved)
         d = self._t1_dialog
-        d.set_data(self._t1_shown, result["stack"], result.get("four_xy"), result["pre"], result["post"],
-                   int(result.get("expand", 3)))
+        d.set_data(self._t1_shown, result["stack"], result.get("four_xy"), pre, post, int(result.get("expand", 3)))
         if ev is None:
             d.show_event(0)
         else:

@@ -2,7 +2,8 @@
 import numpy as np
 
 from napari_tissuekit.t1_preview import (
-    CLICK_RADIUS, event_box, event_frames, find_event_at, junction_centre, render_preview_frame, sort_events,
+    CLICK_RADIUS, PREVIEW_MINUTES, event_box, event_frames, event_type_key, events_of_types, find_event_at, junction_centre,
+    minutes_to_frames, render_preview_frame, sort_events,
 )
 
 
@@ -102,3 +103,23 @@ def test_junction_centre_does_not_jump_to_a_distant_four_way_position():
     for t in (e["t_start"], 5, e["t_end"]):
         cy, cx = junction_centre(lab[t], e, t, off, reach=1)
         assert abs(cy - 15) <= 4 and abs(cx - 15) <= 4, (t, cy, cx)
+
+
+def test_preview_minutes_are_converted_with_the_frame_interval():
+    assert PREVIEW_MINUTES == (3, 5)
+    assert minutes_to_frames(3, 30.0) == 6 and minutes_to_frames(5, 30.0) == 10      # Chironomus-like
+    assert minutes_to_frames(3, 60.0) == 3 and minutes_to_frames(5, 60.0) == 5       # Hermetia-like
+    assert minutes_to_frames(3, 90.0) == 2 and minutes_to_frames(5, 90.0) == 3       # Mab-like (rounded to whole frames)
+    assert minutes_to_frames(3, 1e6) == 1                                            # never zero frames
+    assert minutes_to_frames(3, None) is None and minutes_to_frames(3, 0) is None and minutes_to_frames(3, float("nan")) is None
+
+
+def test_event_type_key_and_type_prefilter():
+    a, b, c = ev(typ="completed"), ev(typ="flicker_resolved"), ev(typ="flicker_aborted")
+    b["t1_class"], c["t1_class"] = "flicker_resolved", "flicker_aborted"
+    old = {"type": "completed"}                                                      # event without t1_class
+    assert [event_type_key(e) for e in (a, b, c, old)] == ["clean", "flicker_resolved", "flicker_aborted", "clean"]
+    events = [a, b, c, old]
+    assert events_of_types(events, {"clean"}) == [0, 3]
+    assert events_of_types(events, {"flicker_resolved", "flicker_aborted"}) == [1, 2]
+    assert events_of_types(events, set()) == []
